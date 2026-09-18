@@ -46,6 +46,11 @@ def test_douyin_native_record_extracts_gallery_and_cover():
     assert extract_media_urls("douyin", cover) == ["https://img.test/cover.jpg"]
 
 
+def test_douyin_native_record_accepts_image_list_alias():
+    record = {"aweme_id": "2", "image_list": [{"url_list": ["https://img.test/alias.jpg"]}]}
+    assert extract_media_urls("douyin", record) == ["https://img.test/alias.jpg"]
+
+
 def test_douyin_native_record_extracts_original_video_when_requested():
     record = {"aweme_id": "44", "video": {"play_addr": {"url_list": ["https://cdn.test/video.mp4"]}}}
     assert extract_video_urls("douyin", record) == ["https://cdn.test/video.mp4"]

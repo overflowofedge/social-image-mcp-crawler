@@ -114,7 +114,12 @@ function Stop-IsolatedBrowser {
     foreach ($item in $processes) {
         $process = Get-Process -Id $item.ProcessId -ErrorAction SilentlyContinue
         if ($process -and $process.MainWindowHandle -ne 0) {
-            $null = $process.CloseMainWindow()
+            try {
+                $null = $process.CloseMainWindow()
+            } catch {
+                # The browser may have closed itself after the user pressed
+                # Enter. A vanished process is already in the desired state.
+            }
         }
     }
     Start-Sleep -Seconds 2
@@ -146,17 +151,33 @@ function Merge-PlatformCookieFiles {
 function Test-GalleryMediaOutput {
     param([object[]]$Lines)
 
-    foreach ($line in $Lines) {
-        try {
-            $value = $line | ConvertFrom-Json -ErrorAction Stop
-            if ($value.Count -ge 3 -and [int]$value[0] -eq 3 -and [string]$value[1] -match '^https?://') {
+    function Test-MediaValue {
+        param([object]$Value)
+        if ($null -eq $Value) { return $false }
+        if ($Value -is [System.Array]) {
+            if ($Value.Count -ge 3 -and [int]$Value[0] -eq 3 -and [string]$Value[1] -match '^https?://') {
                 return $true
             }
-        } catch {
-            continue
+            foreach ($child in $Value) {
+                if (Test-MediaValue $child) { return $true }
+            }
         }
+        return $false
     }
-    return $false
+
+    # gallery-dl --dump-json emits pretty-printed JSON across many lines;
+    # stderr arrives as ErrorRecord objects through PowerShell's 2>&1 merge.
+    $jsonText = (@($Lines | Where-Object { $_ -is [string] }) -join "`n").Trim()
+    if (-not $jsonText) { return $false }
+    try {
+        $value = $jsonText | ConvertFrom-Json -ErrorAction Stop
+        if (Test-MediaValue $value) { return $true }
+    } catch {
+        # Windows PowerShell may split gallery-dl's pretty JSON into records
+        # and prepend native stderr. The media record itself still has a
+        # stable `[3, "https://..."]` prefix, so accept that verified shape.
+    }
+    return $jsonText -match '(?m)^\s*\[\s*3\s*,\s*["'']https?://'
 }
 
 function Test-BridgeMediaOutput {
@@ -242,7 +263,16 @@ if ($galleryExitCode -ne 0 -or -not (Test-GalleryMediaOutput $output)) {
 }
 
 Merge-PlatformCookieFiles $cookieFile
-Set-ProjectEnvironmentValue "GALLERY_DL_COOKIES_FROM_BROWSER" ""
-Set-ProjectEnvironmentValue "GALLERY_DL_COOKIES_FILE" ".cache/gallery-dl-cookies.txt"
-Write-Output "$Platform returned real media metadata through gallery-dl. Its isolated session was merged into the MCP cookie file under .cache."
+if ($Platform -eq "x") {
+    # Recent Edge builds may not allow gallery-dl to export the encrypted
+    # Twitter cookies to Netscape format. Keep the closed isolated profile
+    # and let gallery-dl decrypt it directly on every request instead.
+    Set-ProjectEnvironmentValue "GALLERY_DL_COOKIES_FROM_BROWSER" $browserSession
+    Set-ProjectEnvironmentValue "GALLERY_DL_COOKIES_FILE" ""
+    Write-Output "$Platform returned real media metadata through gallery-dl. The isolated browser profile is configured for direct cookie reading."
+} else {
+    Set-ProjectEnvironmentValue "GALLERY_DL_COOKIES_FROM_BROWSER" ""
+    Set-ProjectEnvironmentValue "GALLERY_DL_COOKIES_FILE" ".cache/gallery-dl-cookies.txt"
+    Write-Output "$Platform returned real media metadata through gallery-dl. Its isolated session was merged into the MCP cookie file under .cache."
+}
 Write-Output "Open a new Codex task before testing the MCP."

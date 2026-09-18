@@ -7,7 +7,7 @@ from urllib.parse import parse_qs, urlparse
 
 
 _TOKEN_RE = re.compile(r"[a-z0-9_]+|[\u4e00-\u9fff]+")
-_PLATFORM_PREFIX = re.compile(r"^(douyin|xhs|xiaohongshu|weibo|bilibili|bili|b站|x|twitter|instagram|ins)(-user|-name|-nickname)?[:：]([\w.\-\u4e00-\u9fff]+)$", re.I)
+_PLATFORM_PREFIX = re.compile(r"^(douyin|抖音|xhs|小红书|xiaohongshu|weibo|微博|bilibili|bili|b站|x|twitter|instagram|ins)(-user|-name|-nickname|昵称|博主)?[:：]([\w.\-\u4e00-\u9fff]+)$", re.I)
 _URL_ID_PATTERNS = {
     "douyin": re.compile(r"/video/(\d+)|/note/(\w+)", re.I),
     "xhs": re.compile(r"/explore/([\w-]+)|/discovery/item/([\w-]+)", re.I),
@@ -36,6 +36,26 @@ _ALIASES = {
     "食物": {"food", "dish", "meal"},
     "饮品": {"drink", "beverage", "coffee"},
 }
+
+_CN_DIGITS = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+
+
+def requested_media_limit(query: str, default: int = 20, maximum: int = 100) -> int:
+    """Honor explicit quantity words in a natural-language request.
+
+    Examples: ``最多3张`` and ``只要两张``.  The value never increases the
+    caller's configured limit for numeric requests; ``全部/完整图集`` opts
+    into the API maximum.
+    """
+    text = _norm(query)
+    match = re.search(r"(?:最多|不超过|只要|仅要|取前|下载)\s*(\d+|[一二两三四五六七八九十])\s*(?:张|个|条|份|幅|张图)?", text)
+    if match:
+        raw = match.group(1)
+        value = int(raw) if raw.isdigit() else _CN_DIGITS.get(raw, default)
+        return max(1, min(default, value))
+    if re.search(r"(?:全部|所有|完整|整组)\s*(?:图集|作品|媒体|图片|视频)?", text):
+        return maximum
+    return default
 
 
 @dataclass(frozen=True)
@@ -87,12 +107,16 @@ def parse_intent(query: str) -> Intent:
     match = _PLATFORM_PREFIX.match(raw)
     if match:
         platform_name = match.group(1).lower()
-        identifier_platform = {"xiaohongshu": "xhs", "twitter": "x", "ins": "instagram", "bili": "bilibili", "b站": "bilibili"}.get(platform_name, platform_name)
+        identifier_platform = {"抖音": "douyin", "小红书": "xhs", "微博": "weibo", "xiaohongshu": "xhs", "twitter": "x", "ins": "instagram", "bili": "bilibili", "b站": "bilibili"}.get(platform_name, platform_name)
         suffix = (match.group(2) or "").lower()
-        identifier_scope = "creator_name" if suffix in {"-name", "-nickname"} else ("creator" if suffix else "post")
+        identifier_scope = "creator_name" if suffix in {"-name", "-nickname", "昵称", "博主"} else ("creator" if suffix else "post")
         identifier = match.group(3)
     elif re.fullmatch(r"@[A-Za-z0-9_.-]+", raw):
         identifier = raw[1:]
+        identifier_platform = "x"
+        identifier_scope = "creator"
+    elif re.fullmatch(r"from:[A-Za-z0-9_.-]+", raw, re.I):
+        identifier = raw.split(":", 1)[1]
         identifier_platform = "x"
         identifier_scope = "creator"
     elif re.fullmatch(r"\d{6,}|[A-Za-z0-9_-]{10,}", raw):
@@ -112,6 +136,8 @@ def parse_intent(query: str) -> Intent:
             identifier_platform = "weibo"
         elif host in {"bilibili.com", "www.bilibili.com", "b23.tv", "www.b23.tv", "space.bilibili.com"}:
             identifier_platform = "bilibili"
+        else:
+            identifier_platform = "other"
         if identifier_platform and identifier_platform in _URL_ID_PATTERNS:
             found = _URL_ID_PATTERNS[identifier_platform].search(urlparse(url).path)
             if found:
@@ -119,7 +145,7 @@ def parse_intent(query: str) -> Intent:
                 identifier_scope = "post"
         parsed_path = urlparse(url).path
         if identifier_platform == "douyin":
-            creator_match = re.search(r"/user/([^/?]+)", parsed_path, re.I)
+            creator_match = re.search(r"/(?:share/)?user/([^/?]+)", parsed_path, re.I)
             if creator_match and not re.search(r"/(?:video|note)/", parsed_path, re.I):
                 identifier = creator_match.group(1)
                 identifier_scope = "creator"
@@ -137,6 +163,18 @@ def parse_intent(query: str) -> Intent:
             modal = parse_qs(urlparse(url).query).get("modal_id", [""])[0]
             if modal.isdigit():
                 identifier, identifier_scope = modal, "post"
+        elif identifier_platform == "x":
+            profile = re.fullmatch(r"/([A-Za-z0-9_.-]+)/?", parsed_path)
+            if profile and profile.group(1).lower() not in {"home", "explore", "search", "settings", "i"}:
+                identifier, identifier_scope = profile.group(1), "creator"
+        elif identifier_platform == "instagram":
+            profile = re.fullmatch(r"/([A-Za-z0-9_.-]+)/?", parsed_path)
+            if profile and profile.group(1).lower() not in {"explore", "accounts", "direct"}:
+                identifier, identifier_scope = profile.group(1), "creator"
+        elif identifier_platform == "xhs":
+            profile = re.fullmatch(r"/user/profile/([A-Za-z0-9_-]+)/?", parsed_path, re.I)
+            if profile:
+                identifier, identifier_scope = profile.group(1), "creator"
 
     negative: list[str] = []
     # Capture comma/顿号 separated exclusion lists, e.g. "排除风景、建筑、纯场景图".

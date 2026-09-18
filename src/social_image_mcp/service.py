@@ -74,13 +74,20 @@ class SocialImageService:
     async def search(self, request: SearchRequest) -> dict:
         await self.start()
         intent = parse_intent(request.query)
-        if intent.identifier_scope == "creator":
+        webpage = request.platforms == [Platform.OTHER] or intent.identifier_platform == "other"
+        if webpage:
+            request = request.model_copy(update={"platforms": [Platform.OTHER]})
+            if not intent.url:
+                raise ValueError("其他平台需要输入完整的 http(s) 网页网址")
+            if request.media_type == "videos":
+                raise ValueError("其他平台目前支持提取网页图片，请选择图片")
+        if intent.identifier_scope == "creator" and not webpage:
             return await self.fetch_creator(CreatorFetchRequest(
                 platform=Platform(intent.identifier_platform), creator_id=intent.identifier,
                 max_images=request.max_results, min_width=request.min_width, min_height=request.min_height,
                 safe_mode=request.safe_mode, download=False,
             ))
-        if intent.identifier_scope == "creator_name":
+        if intent.identifier_scope == "creator_name" and not webpage:
             return await self.fetch_creator(CreatorFetchRequest(
                 platform=Platform(intent.identifier_platform), creator_name=intent.identifier,
                 max_images=request.max_results, min_width=request.min_width, min_height=request.min_height,
@@ -135,12 +142,16 @@ class SocialImageService:
     async def _search(self, request: SearchRequest) -> dict:
         intent = parse_intent(request.query)
         platforms = self._target_platforms(request, intent.identifier_platform)
-        key = self.cache.key("search-v2-keywords-only", request.model_dump(mode="json"), intent.normalized) if request.use_cache else None
+        # Bump the namespace when relevance rules change so old low-quality
+        # keyword results are never served from the persistent cache.
+        key = self.cache.key("search-v3-relevance-gated", request.model_dump(mode="json"), intent.normalized) if request.use_cache else None
         if key and (cached := self.cache.get(key)) is not None:
             return await self._refresh_cached_status(cached, platforms, request, key)
 
         async def search_one(platform: Platform):
             adapter = self.adapters[platform]
+            requested_total = self._requested_media_total(request)
+            source_limit = 100 if intent.identifier_scope == "post" else requested_total * 2
             candidates: list[ImageCandidate] = []
             errors: list[dict[str, str]] = []
 
@@ -163,30 +174,37 @@ class SocialImageService:
                         self._verified_adapters.discard(platform)
                     errors.append({"code": "unexpected_error", "message": f"{label}: {exc}"})
 
+            if platform == Platform.OTHER:
+                await collect("webpage", adapter.search(intent, requested_total, request.safe_mode))
+                if not candidates and errors:
+                    first = errors[0]
+                    return platform, [], {"code": first["code"], "message": first["message"]}
+                return platform, candidates, None
+
             if request.retrieval_mode in ("discovery", "hybrid"):
-                await collect("discovery", self.discovery.search(platform, intent, request.max_results * 2))
+                await collect("discovery", self.discovery.search(platform, intent, requested_total * 2))
             if request.retrieval_mode in ("sources", "hybrid"):
                 if platform in (Platform.BILIBILI, Platform.WEIBO):
                     media_crawler = getattr(self.sources, "media_crawler", None)
                     if platform == Platform.WEIBO and getattr(media_crawler, "command_template", None):
                         # Prefer an already configured authenticated source;
                         # the public mobile endpoint is frequently rate limited.
-                        await collect("sources", self.sources.search(platform, intent, request.max_results * 2))
+                        await collect("sources", self.sources.search(platform, intent, source_limit))
                         if not candidates:
-                            await collect("platform", adapter.search(intent, request.max_results * 2, request.safe_mode))
+                            await collect("platform", adapter.search(intent, requested_total * 2, request.safe_mode))
                     else:
                         # Bilibili's bounded public API is the recommended source.
-                        await collect("platform", adapter.search(intent, request.max_results * 2, request.safe_mode))
+                        await collect("platform", adapter.search(intent, requested_total * 2, request.safe_mode))
                 else:
-                    await collect("sources", self.sources.search(platform, intent, request.max_results * 2))
+                    await collect("sources", self.sources.search(platform, intent, source_limit))
                 if platform not in (Platform.BILIBILI, Platform.WEIBO) and request.retrieval_mode == "sources" and getattr(adapter.status, "mode", "") == "browser-fallback":
-                    await collect("browser", adapter.search(intent, request.max_results, request.safe_mode))
+                    await collect("browser", adapter.search(intent, requested_total, request.safe_mode))
             if request.retrieval_mode == "platform" or (request.retrieval_mode == "hybrid" and platform not in (Platform.BILIBILI, Platform.WEIBO)):
-                await collect("platform", adapter.search(intent, request.max_results, request.safe_mode))
+                await collect("platform", adapter.search(intent, requested_total, request.safe_mode))
             elif request.retrieval_mode == "sources" and platform in (Platform.X, Platform.INSTAGRAM) and adapter.status.configured and not candidates:
                 # Official X/Instagram APIs are a usable download source when
                 # the user supplied a token, even if gallery-dl is not set up.
-                await collect("platform", adapter.search(intent, request.max_results, request.safe_mode))
+                await collect("platform", adapter.search(intent, requested_total, request.safe_mode))
 
             # In hybrid mode, preserve useful candidates and expose partial
             # failures as warnings. An error is fatal only when every channel
@@ -227,40 +245,58 @@ class SocialImageService:
         semantic_applied = False
         semantic_deferred = False
         vision_deferred = False
+        requested_total = self._requested_media_total(request)
         if intent.is_keyword:
-            ranked = rank_candidates(all_candidates, intent, min(request.max_results * 3, 100), request.min_width, request.min_height)
+            target_limit = requested_total
+            ranked = rank_candidates(all_candidates, intent, min(target_limit * 3, 200), request.min_width, request.min_height, require_match=True)
             ranked = [item.model_copy(update={"score": round(item.score + self.feedback.bias(intent, item), 4)}) for item in ranked]
             ranked.sort(key=lambda item: item.score, reverse=True)
             if self.reranker.enabled:
                 try:
                     ranked = await asyncio.wait_for(
-                        self.reranker.rerank(ranked, intent, min(request.max_results * 2, 100)),
+                        self.reranker.rerank(ranked, intent, min(target_limit * 2, 100)),
                         timeout=max(0.05, float(getattr(self.settings, "semantic_timeout_seconds", 4))),
                     )
                     semantic_applied = bool(getattr(self.reranker, "_last_applied", False))
                 except asyncio.TimeoutError:
                     semantic_deferred = True
-                    ranked = ranked[:min(request.max_results * 2, 100)]
+                    ranked = ranked[:min(target_limit * 2, 100)]
             else:
-                ranked = ranked[:min(request.max_results * 2, 100)]
+                ranked = ranked[:min(target_limit * 2, 100)]
             # Starting CLIP is intentionally asynchronous. A cold model can
             # take longer than the useful request budget, so only use it when
             # the worker is already ready; later requests get visual ranking
             # without paying the cold-start penalty.
             if self.vision.status.get("enabled"):
                 try:
-                    ranked = await asyncio.wait_for(
-                        self.vision.rerank(ranked, intent, request.max_results),
+                    # Fetching and classifying hundreds of remote images can
+                    # exceed the request budget.  Visually rerank the lexical
+                    # shortlist, then keep the remaining candidates behind it
+                    # so the top results are actually on-topic.
+                    vision_pool = ranked[: min(32, len(ranked))]
+                    vision_ranked = await asyncio.wait_for(
+                        self.vision.rerank(vision_pool, intent, min(target_limit, len(vision_pool))),
                         timeout=max(1, self.settings.vision_timeout_seconds),
                     )
+                    ranked = vision_ranked + ranked[len(vision_pool):]
                 except asyncio.TimeoutError:
                     self.vision.mark_timeout(self.settings.vision_timeout_seconds)
-                    ranked = ranked[:request.max_results]
+                    ranked = ranked[:target_limit]
             else:
                 vision_deferred = bool(self.vision.status.get("loading"))
-                ranked = ranked[:request.max_results]
+                ranked = ranked[:target_limit]
         else:
-            ranked = self._direct_items(all_candidates, request.max_results, request.min_width, request.min_height)
+            ranked = self._direct_items(all_candidates, requested_total, request.min_width, request.min_height)
+        ranked = self._apply_media_limits(ranked, request)
+        # Report the same count the caller receives in ``items``.  The source
+        # adapters intentionally fetch a larger shortlist for ranking, so the
+        # pre-ranking candidate count can otherwise exceed the requested total
+        # and make the UI look as if it downloaded more files than requested.
+        delivered_counts = {platform.value: 0 for platform in platforms}
+        for item in ranked:
+            delivered_counts[item.platform.value] = delivered_counts.get(item.platform.value, 0) + 1
+        for platform_name, entry in platform_status.items():
+            entry["count"] = delivered_counts.get(platform_name, 0)
         payload = {"query": request.query, "intent": {"tokens": intent.tokens, "negative_tokens": intent.negative_tokens, "identifier": intent.identifier, "identifier_platform": intent.identifier_platform, "identifier_scope": intent.identifier_scope, "orientation": intent.orientation, "quality_preference": intent.quality_preference, "exclude_watermark": intent.exclude_watermark, "exclude_text_overlay": intent.exclude_text_overlay}, "items": [item.model_dump(mode="json") for item in ranked], "platforms": platform_status, "retrieval": {"mode": request.retrieval_mode, "sources": self.sources.statuses(), "provider": self.discovery.status if request.retrieval_mode in ("discovery", "hybrid") else None, "semantic": self.reranker.status, "vision": self.vision.status}, "cached": False}
         payload["retrieval"]["semantic_applied"] = semantic_applied
         payload["retrieval"]["semantic_deferred"] = semantic_deferred
@@ -280,9 +316,15 @@ class SocialImageService:
         payload = {**cached, "cached": True}
         current_status = {item["platform"]: item for item in self.statuses()}
         platform_payload = dict(payload.get("platforms") or {})
+        delivered_counts: dict[str, int] = {}
+        for item in payload.get("items") or []:
+            if isinstance(item, dict) and item.get("platform"):
+                name = str(item["platform"])
+                delivered_counts[name] = delivered_counts.get(name, 0) + 1
         for platform in platforms:
             entry = dict(platform_payload.get(platform.value) or {})
             entry["status"] = current_status.get(platform.value)
+            entry["count"] = delivered_counts.get(platform.value, 0)
             platform_payload[platform.value] = entry
         payload["platforms"] = platform_payload
 
@@ -352,7 +394,7 @@ class SocialImageService:
             return request.platforms
         if identifier_platform:
             return [Platform(identifier_platform)]
-        return list(Platform)
+        return [platform for platform in Platform if platform != Platform.OTHER]
 
     async def inspect(self, platform: Platform, item_id: str) -> dict:
         await self.start()
@@ -372,6 +414,16 @@ class SocialImageService:
         return {"platform": platform.value, "item_id": item_id, "items": [item.model_dump(mode="json") for item in ranked], "errors": errors}
 
     @staticmethod
+    def _requested_media_total(request: SearchRequest) -> int:
+        image_limit = request.image_limit or request.max_results
+        video_limit = request.video_limit if request.video_limit is not None else request.max_results
+        if request.media_type == "videos":
+            return video_limit
+        if request.media_type == "all":
+            return image_limit + video_limit
+        return image_limit
+
+    @staticmethod
     def _direct_items(items: list[ImageCandidate], limit: int, min_width: int = 0, min_height: int = 0) -> list[ImageCandidate]:
         result = []
         seen = set()
@@ -383,6 +435,34 @@ class SocialImageService:
             if len(result) >= limit:
                 break
         return result
+
+    @staticmethod
+    def _apply_media_limits(items: list[ImageCandidate], request: SearchRequest) -> list[ImageCandidate]:
+        image_limit = request.image_limit or request.max_results
+        video_limit = request.video_limit if request.video_limit is not None else request.max_results
+        per_post_limit = request.per_post_limit
+        counts = {"image": 0, "video": 0}
+        posts: dict[str, int] = {}
+        selected: list[ImageCandidate] = []
+        for item in items:
+            if request.media_type == "images" and item.media_type != "image":
+                continue
+            if request.media_type == "videos" and item.media_type != "video":
+                continue
+            post = item.post_id or item.id
+            if per_post_limit is not None and posts.get(post, 0) >= per_post_limit:
+                continue
+            limit = image_limit if item.media_type == "image" else video_limit
+            if counts[item.media_type] >= limit:
+                continue
+            counts[item.media_type] += 1
+            posts[post] = posts.get(post, 0) + 1
+            selected.append(item)
+            if request.media_type != "all" and len(selected) >= request.max_results:
+                break
+            if request.media_type == "all" and counts["image"] >= image_limit and counts["video"] >= video_limit:
+                break
+        return selected
 
     async def fetch_creator(self, request: CreatorFetchRequest) -> dict:
         await self.start()

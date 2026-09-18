@@ -555,7 +555,7 @@ class GalleryDlSource:
         self.cookies_from_browser = cookies_from_browser
         self.cookies_file = str(Path(cookies_file).expanduser()) if cookies_file else None
         self.failure_cooldown_seconds = max(0, failure_cooldown_seconds)
-        self.platforms = (Platform.X, Platform.INSTAGRAM, Platform.WEIBO)
+        self.platforms = (Platform.X, Platform.INSTAGRAM, Platform.WEIBO, Platform.XHS)
         self._verified = False
         self._last_error: str | None = None
         self._verified_platforms: set[str] = set()
@@ -674,6 +674,8 @@ class GalleryDlSource:
             return [f"https://x.com/search?q={quote(query)}&src=typed_query"]
         if platform == Platform.INSTAGRAM:
             return [f"https://www.instagram.com/explore/tags/{quote(tag)}/" for tag in self._instagram_tags(intent)]
+        if platform == Platform.XHS:
+            return [intent.url] if intent.url else [f"https://www.xiaohongshu.com/search_result?keyword={quote(intent.raw)}"]
         return [f"https://s.weibo.com/weibo?q={quote(intent.raw)}"]
 
     def _target(self, platform: Platform, intent: Intent) -> str:
@@ -747,7 +749,7 @@ class GalleryDlSource:
         returns authenticated media URLs, so adapt its records into the same
         creator envelope used by the other platforms.
         """
-        if request.platform != Platform.X:
+        if request.platform not in (Platform.X, Platform.INSTAGRAM, Platform.XHS):
             raise SourceUnavailable(f"gallery-dl creator retrieval does not support {request.platform.value}")
         target = request.creator_name or request.creator_id or request.profile_url or ""
         target = target.strip().lstrip("@")
@@ -756,9 +758,20 @@ class GalleryDlSource:
             target = path.split("/", 1)[0] if path else target
         if not target:
             raise SourceError("X creator username is required")
-        profile_url = f"https://x.com/{target}"
-        intent = Intent(raw=profile_url, normalized=profile_url.lower(), tokens=(target.lower(),), negative_tokens=(), url=profile_url, identifier_platform="x")
-        candidates = await self.search(Platform.X, intent, max(request.max_images, request.max_posts * 10))
+        if request.platform == Platform.INSTAGRAM:
+            profile_url = request.profile_url or f"https://www.instagram.com/{target}/"
+            media_url = profile_url
+        elif request.platform == Platform.XHS:
+            profile_url = request.profile_url or target
+            media_url = profile_url
+        else:
+            profile_url = f"https://x.com/{target}"
+            media_url = f"https://x.com/{target}/media"
+        # The bare profile URL is only a timeline directory. The media
+        # subpage is required for gallery-dl to emit downloadable records.
+        media_url = f"https://x.com/{target}/media"
+        intent = Intent(raw=media_url, normalized=media_url.lower(), tokens=(target.lower(),), negative_tokens=(), url=media_url, identifier_platform=request.platform.value)
+        candidates = await self.search(request.platform, intent, max(request.max_images, request.max_videos or 0, request.max_posts * 10))
         items: list[ImageCandidate] = []
         post_ids: list[str] = []
         seen_posts: set[str] = set()
@@ -781,7 +794,7 @@ class GalleryDlSource:
             }))
             if len(items) >= request.max_images:
                 break
-        identity = CreatorIdentity(platform=Platform.X, requested_id=target, canonical_id=target, name=target, profile_url=profile_url, source="gallery-dl", matched_by="username")
+        identity = CreatorIdentity(platform=request.platform, requested_id=target, canonical_id=target, name=target, profile_url=profile_url, source="gallery-dl", matched_by="profile_url")
         return CreatorSourceResult(identity=identity, items=items, posts_fetched=len(post_ids), post_ids=tuple(post_ids), pages_fetched=1, next_cursor=None)
 
 
@@ -821,7 +834,7 @@ class SourceHub:
             return await self.media_crawler.fetch_creator(request)
         if request.platform == Platform.BILIBILI:
             raise SourceUnavailable("Bilibili creator retrieval uses the native public API")
-        if request.platform == Platform.X:
+        if request.platform in (Platform.X, Platform.INSTAGRAM, Platform.XHS):
             return await self.gallery_dl.fetch_creator(request)
         raise SourceUnavailable("creator retrieval currently supports only douyin and weibo")
 

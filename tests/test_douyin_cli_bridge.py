@@ -21,6 +21,9 @@ _browser_profile = _MODULE._browser_profile
 _browser_user_matches = _MODULE._browser_user_matches
 _browser_post_cursor = _MODULE._browser_post_cursor
 _browser_items_from_payload = _MODULE._browser_items_from_payload
+_looks_like_douyin_creator_url = _MODULE._looks_like_douyin_creator_url
+_creator_items_from_profile_share = _MODULE._creator_items_from_profile_share
+_fetch_creator_via_browser = _MODULE._fetch_creator_via_browser
 
 
 def test_dy_cli_search_records_extract_aweme_info():
@@ -56,6 +59,23 @@ def test_dy_cli_cache_reuses_only_recent_exact_ids(tmp_path, monkeypatch):
 def test_dy_cli_relative_cache_is_anchored_to_project(monkeypatch):
     monkeypatch.setenv("DY_CLI_RESULT_CACHE", ".cache/custom-results.json")
     assert _cache_path() == Path(__file__).resolve().parents[1] / ".cache" / "custom-results.json"
+
+
+def test_douyin_creator_url_detection_distinguishes_profile_paths():
+    assert _looks_like_douyin_creator_url("https://www.douyin.com/user/sec-1")
+    assert _looks_like_douyin_creator_url("https://v.douyin.com/abc/") is False
+    assert _looks_like_douyin_creator_url("https://www.douyin.com/video/123") is False
+
+
+def test_douyin_profile_share_is_resolved_before_creator_collection(monkeypatch):
+    class FakeClient:
+        def resolve_creator_share_url(self, url):
+            assert url == "https://v.douyin.com/home/"
+            return "https://www.douyin.com/user/sec-1"
+
+    candidate = {"id": "post:1", "image_url": "https://img.test/1.jpg"}
+    monkeypatch.setattr(_MODULE, "_fetch_creator_with_fallback", lambda client, request, account=None: {"items": [candidate]})
+    assert _creator_items_from_profile_share(FakeClient(), "https://v.douyin.com/home/", 3) == [candidate]
 
 
 def test_browser_response_helpers_extract_profile_and_endpoint():

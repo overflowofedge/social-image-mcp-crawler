@@ -14,18 +14,22 @@ class Platform(str, Enum):
     BILIBILI = "bilibili"
     X = "x"
     INSTAGRAM = "instagram"
+    OTHER = "other"
 
 
 class SearchRequest(BaseModel):
     query: str = Field(min_length=1, max_length=500)
     platforms: list[Platform] | None = None
-    max_results: int = Field(default=20, ge=1, le=100)
+    max_results: int = Field(default=20, ge=1, le=200)
     min_width: int = Field(default=0, ge=0, le=20000)
     min_height: int = Field(default=0, ge=0, le=20000)
     safe_mode: bool = True
     use_cache: bool = True
     retrieval_mode: str = Field(default="sources", pattern="^(sources|discovery|hybrid|platform)$")
     media_type: str = Field(default="images", pattern="^(images|videos|all)$")
+    image_limit: int | None = Field(default=None, ge=1, le=200)
+    video_limit: int | None = Field(default=None, ge=1, le=200)
+    per_post_limit: int | None = Field(default=None, ge=1, le=50)
 
 
 class CreatorSort(str, Enum):
@@ -41,6 +45,8 @@ class CreatorFetchRequest(BaseModel):
     profile_url: str | None = Field(default=None, min_length=1, max_length=2000)
     max_posts: int = Field(default=20, ge=1, le=100)
     max_images: int = Field(default=50, ge=1, le=200)
+    max_videos: int | None = Field(default=None, ge=1, le=200)
+    per_post_limit: int | None = Field(default=None, ge=1, le=50)
     cursor: str | None = Field(default=None, max_length=1000)
     since: datetime | None = None
     until: datetime | None = None
@@ -67,10 +73,10 @@ class CreatorFetchRequest(BaseModel):
             self.creator_name, self.creator_id = self.creator_id, None
         if self.platform == Platform.X and self.creator_id:
             self.creator_id = self.creator_id.strip().lstrip("@")
-        if self.platform not in (Platform.DOUYIN, Platform.WEIBO, Platform.BILIBILI, Platform.X):
-            raise ValueError("creator media download currently supports douyin, weibo, bilibili and x")
-        if self.creator_name and self.platform not in (Platform.DOUYIN, Platform.BILIBILI, Platform.X):
-            raise ValueError("creator_name lookup is currently supported only for douyin, bilibili and x")
+        if self.platform not in (Platform.DOUYIN, Platform.WEIBO, Platform.BILIBILI, Platform.X, Platform.INSTAGRAM, Platform.XHS):
+            raise ValueError("unsupported creator platform")
+        if self.creator_name and self.platform not in (Platform.DOUYIN, Platform.WEIBO, Platform.BILIBILI, Platform.X, Platform.INSTAGRAM):
+            raise ValueError("creator_name lookup is not supported for this platform; use a profile URL")
         targets = [bool(self.creator_id), bool(self.creator_name), bool(self.profile_url)]
         if sum(targets) != 1:
             raise ValueError("provide exactly one of creator_id, creator_name or profile_url")
@@ -128,7 +134,7 @@ class ImageCandidate(BaseModel):
 
 
 class DownloadRequest(BaseModel):
-    items: list[ImageCandidate] = Field(min_length=1, max_length=100)
+    items: list[ImageCandidate] = Field(min_length=1, max_length=400)
     output_dir: str | None = None
     max_concurrency: int = Field(default=5, ge=1, le=20)
     min_width: int = Field(default=0, ge=0)

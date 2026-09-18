@@ -531,6 +531,7 @@ class WeiboAdapter(PlatformAdapter):
         return await self.search(Intent(raw=item_id, normalized=item_id.lower(), tokens=(item_id.lower(),), negative_tokens=(), identifier=item_id, identifier_platform="weibo"), 20, True)
 
 def build_adapters(settings: Settings, client: httpx.AsyncClient) -> dict[Platform, PlatformAdapter]:
+    from ..webpage import WebPageAdapter
     if settings.douyin_native_skill and settings.douyin_cookie and not settings.douyin_search_endpoint and not settings.douyin_item_endpoint:
         douyin_adapter: PlatformAdapter = DouyinSkillAdapter(client, settings.douyin_cookie, settings.douyin_skill_path)
     else:
@@ -554,4 +555,5 @@ def build_adapters(settings: Settings, client: httpx.AsyncClient) -> dict[Platfo
         Platform.BILIBILI: BilibiliAdapter(client, settings.bilibili_cookie, settings.native_api_timeout_seconds),
         Platform.X: BrowserSearchAdapter(client, Platform.X, "https://x.com/search?q={query}&src=typed_query", headless=settings.browser_headless, timeout_ms=settings.browser_timeout_ms, cdp_url=settings.browser_cdp_url, user_data_dir=settings.browser_user_data_dir, channel=settings.browser_channel) if settings.browser_fallback and not settings.x_bearer_token else XAdapter(client, settings.x_bearer_token),
         Platform.INSTAGRAM: BrowserSearchAdapter(client, Platform.INSTAGRAM, "https://www.instagram.com/explore/tags/{query}/", headless=settings.browser_headless, timeout_ms=settings.browser_timeout_ms, cdp_url=settings.browser_cdp_url, user_data_dir=settings.browser_user_data_dir, channel=settings.browser_channel) if settings.browser_fallback and not settings.instagram_access_token else InstagramAdapter(client, settings.instagram_access_token, settings.instagram_user_id, settings.meta_graph_version),
+        Platform.OTHER: WebPageAdapter(client),
     }

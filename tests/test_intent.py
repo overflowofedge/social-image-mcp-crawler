@@ -1,5 +1,11 @@
-from social_image_mcp.intent import parse_intent, visual_contrast_prompts, visual_prompt
+from social_image_mcp.intent import parse_intent, requested_media_limit, visual_contrast_prompts, visual_prompt
 from social_image_mcp.object_semantics import ObjectObservation, decide_observation, parse_content_spec
+
+
+def test_explicit_media_limit_is_honored():
+    assert requested_media_limit("抖音作品 最多三张", 20) == 3
+    assert requested_media_limit("只要2张图片", 20) == 2
+    assert requested_media_limit("完整图集", 20) == 100
 
 
 def test_keyword_intent_extracts_orientation_and_negative_terms():
@@ -49,6 +55,13 @@ def test_at_handle_is_treated_as_x_creator():
     assert intent.identifier_scope == "creator"
 
 
+def test_x_from_filter_is_treated_as_creator_when_it_is_the_whole_query():
+    intent = parse_intent("from:jwj180")
+    assert intent.identifier == "jwj180"
+    assert intent.identifier_platform == "x"
+    assert intent.identifier_scope == "creator"
+
+
 def test_creator_name_prefix_routes_to_creator_lookup():
     intent = parse_intent("douyin-name:放学小野猪")
     assert intent.identifier == "放学小野猪"
@@ -63,6 +76,19 @@ def test_creator_profile_urls_are_creator_targets():
     assert douyin.identifier == "MS4wLjABAAAAabc"
     assert weibo.identifier_scope == "creator"
     assert weibo.identifier == "5756404150"
+
+
+def test_douyin_homepage_short_link_stays_on_douyin_platform():
+    intent = parse_intent("https://v.douyin.com/abc123/")
+    assert intent.identifier_platform == "douyin"
+    assert intent.identifier_platform != "other"
+
+
+def test_douyin_share_user_profile_url_is_creator_target():
+    intent = parse_intent("https://www.douyin.com/share/user/MS4wLjABAAAAabc")
+    assert intent.identifier_platform == "douyin"
+    assert intent.identifier_scope == "creator"
+    assert intent.identifier == "MS4wLjABAAAAabc"
 
 
 def test_interior_intent_builds_closeup_and_outdoor_distractors():

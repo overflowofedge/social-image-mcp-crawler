@@ -153,6 +153,67 @@ def test_platform_specific_id_only_queries_its_platform(tmp_path):
     asyncio.run(run())
 
 
+def test_platform_counts_match_delivered_items_after_limits(tmp_path):
+    class Sources:
+        def statuses(self):
+            return [{"name": "fake", "configured": True, "verified": True,
+                     "verified_platforms": ["douyin"], "ready_platforms": ["douyin"],
+                     "mode": "test", "detail": "", "platforms": ["douyin"]}]
+
+        async def search(self, platform, intent, limit):
+            return [
+                ImageCandidate(id="one", platform=platform, image_url="https://cdn.test/one.jpg"),
+                ImageCandidate(id="two", platform=platform, image_url="https://cdn.test/two.jpg"),
+            ]
+
+    async def run():
+        service = SocialImageService(Settings(cache_path=str(tmp_path / "cache.sqlite3"), vision_model=None))
+        await service.start()
+        service.sources = Sources()
+        result = await service.search(SearchRequest(
+            query="https://v.douyin.com/example/", platforms=[Platform.DOUYIN],
+            max_results=1, image_limit=1, use_cache=False, retrieval_mode="sources",
+        ))
+        assert len(result["items"]) == 1
+        assert result["platforms"]["douyin"]["count"] == 1
+        await service.close()
+
+    asyncio.run(run())
+
+
+def test_video_and_all_limits_drive_source_fetch_budget(tmp_path):
+    class Sources:
+        def __init__(self):
+            self.limits = []
+
+        def statuses(self):
+            return [{"name": "fake", "configured": True, "verified": True,
+                     "verified_platforms": ["douyin"], "ready_platforms": ["douyin"],
+                     "mode": "test", "detail": "", "platforms": ["douyin"]}]
+
+        async def search(self, platform, intent, limit):
+            self.limits.append(limit)
+            return []
+
+    async def run():
+        service = SocialImageService(Settings(cache_path=str(tmp_path / "cache.sqlite3"), vision_model=None))
+        await service.start()
+        sources = Sources()
+        service.sources = sources
+        await service.search(SearchRequest(
+            query="猫 视频", platforms=[Platform.DOUYIN], max_results=3,
+            image_limit=3, video_limit=7, media_type="videos", use_cache=False, retrieval_mode="sources",
+        ))
+        await service.search(SearchRequest(
+            query="猫 图片和视频", platforms=[Platform.DOUYIN], max_results=3,
+            image_limit=3, video_limit=7, media_type="all", use_cache=False, retrieval_mode="sources",
+        ))
+        assert sources.limits == [14, 20]
+        await service.close()
+
+    asyncio.run(run())
+
+
 def test_cache_hit_refreshes_current_source_verification_status(tmp_path):
     class DynamicSources:
         def __init__(self):

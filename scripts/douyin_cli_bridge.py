@@ -149,6 +149,39 @@ def _fetch_creator(client: Any, request: CreatorFetchRequest) -> dict[str, Any]:
     return collector.result()
 
 
+def _looks_like_douyin_creator_url(url: str) -> bool:
+    """Return true for explicit Douyin profile/share URLs.
+
+    ``v.douyin.com`` is also used for作品 shares, so short links are only
+    treated as creator links after ``resolve_share_url`` has identified them
+    as a homepage. Full ``/user`` and ``/share/user`` links are unambiguous.
+    """
+    parsed = urlparse(url)
+    if (parsed.hostname or "").lower() not in {"douyin.com", "www.douyin.com", "v.douyin.com"}:
+        return False
+    path = parsed.path.rstrip("/").lower()
+    return path.startswith("/user/") or path.startswith("/share/user/")
+
+
+def _creator_items_from_profile_share(client: Any, url: str, limit: int, account: str | None = None) -> list[dict[str, Any]]:
+    """Resolve a homepage share and expose creator images to search callers."""
+    resolver = getattr(client, "resolve_creator_share_url", None)
+    if not callable(resolver):
+        raise RuntimeError("当前 dy-cli 不支持抖音主页短链接解析，请更新桌面应用后重试")
+    profile_url = str(resolver(url))
+    request = CreatorFetchRequest(
+        platform="douyin",
+        profile_url=profile_url,
+        max_posts=max(20, min(100, max(1, limit))),
+        max_images=max(1, min(200, limit)),
+        media_type="images",
+        download=False,
+    )
+    result = _fetch_creator_with_fallback(client, request, account)
+    items = [item for item in result.get("items", []) if isinstance(item, dict)]
+    return items[: max(1, limit)]
+
+
 def _browser_storage_state(account: str | None = None) -> Path | None:
     """Locate the Playwright storage state produced by dy-cli login."""
     configured = os.getenv("DOUYIN_BROWSER_STORAGE_STATE") or os.getenv("DY_CLI_STORAGE_STATE")
@@ -331,6 +364,15 @@ async def _fetch_creator_via_browser(request: CreatorFetchRequest, account: str 
                     break
                 await page.wait_for_timeout(max(100, int(os.getenv("DOUYIN_BROWSER_POLL_MS", "400"))))
 
+            # A canonical sec_uid came from the signed API identity lookup or
+            # from the resolved profile URL. Recent Douyin web responses may
+            # omit the profile object entirely (or return it in a shape that
+            # no longer exposes sec_uid), but the account identifier remains
+            # authoritative. Continue with that ID so the post timeline can
+            # still be captured instead of failing during identity discovery.
+            if not identity_data and target.startswith("MS4w"):
+                identity_data = {"sec_uid": target, "nickname": ""}
+
             if not identity_data and not target.startswith("MS4w"):
                 captured.clear()
                 search_url = f"https://www.douyin.com/search/{quote(target, safe='')}?type=user"
@@ -418,6 +460,11 @@ def _fetch_creator_with_fallback(client: Any, request: CreatorFetchRequest, acco
     except Exception as exc:
         http_error = exc
 
+    # A completed exact lookup is authoritative. Browser fallback cannot
+    # disambiguate a duplicate nickname or turn zero exact matches into one.
+    if http_error and "creator_identity_unresolved:" in str(http_error):
+        raise http_error
+
     # The browser route is intentionally attempted after the native client. It
     # is slower, but can still work when the API client's manually signed
     # request is rejected with 403 or a stale web signature.
@@ -451,6 +498,27 @@ def _sync_fetch(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, An
             if not client.cookie:
                 raise RuntimeError("dy-cli login is required for creator retrieval")
             return _fetch_creator_with_fallback(client, request, args.account)
+        profile_share_url: str | None = None
+        if args.url:
+            # A homepage share is intentionally not accepted by
+            # ``resolve_share_url`` (that method is for one作品). Remember
+            # this case and route it through the creator collector below.
+            try:
+                client.resolve_share_url(args.url)
+            except Exception:
+                if _looks_like_douyin_creator_url(args.url):
+                    profile_share_url = args.url
+                else:
+                    # Short homepage links do not have a stable path. Let the
+                    # dedicated resolver confirm them instead of relying on
+                    # the wording of the作品 resolver's exception.
+                    try:
+                        client.resolve_creator_share_url(args.url)
+                    except Exception:
+                        pass
+                    else:
+                        profile_share_url = args.url
+
         if args.item_id or args.url:
             # A recent exact result is safe to reuse even if the login cookie
             # has temporarily expired; no new platform request is made.
@@ -460,11 +528,17 @@ def _sync_fetch(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, An
                     cached_id = client.resolve_share_url(args.url)
                 except Exception:
                     cached_id = None
-            if cached_id and (cached := _load_cached_items(cached_id)):
-                return cached[: max(1, args.limit)]
+            if cached_id and (cached := _load_cached_items(cached_id)) and len(cached) >= max(1, args.limit):
+                # The service applies the user's final media limit. Keep the
+                # complete cached gallery here so an exact post can be
+                # traversed without silently dropping later frames.
+                return cached
 
         if not client.cookie:
             raise RuntimeError("dy-cli 未检测到抖音登录态，请先运行 scripts\\douyin_login.ps1 完成一次扫码登录")
+
+        if profile_share_url:
+            return _creator_items_from_profile_share(client, profile_share_url, args.limit, args.account)
 
         if args.item_id or args.url:
             item_id = args.item_id or client.resolve_share_url(args.url)
@@ -486,17 +560,30 @@ def _sync_fetch(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, An
                     ) from detail_error
             if not isinstance(record, dict):
                 return []
-            result = normalize_native_record("douyin", record, "dy-cli")[: max(1, args.limit)]
+            result = normalize_native_record("douyin", record, "dy-cli")
             _save_cached_items(result)
             return result
 
         if not args.query.strip():
             raise RuntimeError("关键词不能为空；请传入 --query 或 --item-id/--url")
+        # Prefer atlas (image-text) search, but Douyin may return
+        # ``verify_check`` or an empty atlas page while ordinary search still
+        # works.  Falling back to general search lets us return video covers
+        # and any image-text records instead of reporting a misleading zero.
         payload = client.search(args.query, search_type="atlas", count=max(1, min(args.limit, 50)))
         galleries = [normalize_native_record("douyin", record, "dy-cli") for record in _records(payload)]
         galleries = [gallery for gallery in galleries if gallery]
         if not galleries:
-            _raise_for_empty_search(payload)
+            fallback = client.search(args.query, search_type="general", count=max(1, min(args.limit, 50)))
+            fallback_galleries = [normalize_native_record("douyin", record, "dy-cli") for record in _records(fallback)]
+            fallback_galleries = [gallery for gallery in fallback_galleries if gallery]
+            if fallback_galleries:
+                payload = fallback
+                galleries = fallback_galleries
+            else:
+                # Report the more useful verification error if both routes
+                # failed; otherwise retain the native empty-search message.
+                _raise_for_empty_search(payload if payload.get("search_nil_info") else fallback)
 
         # Round-robin preserves post diversity before adding extra frames from
         # large galleries, giving the reranker meaningfully different choices.

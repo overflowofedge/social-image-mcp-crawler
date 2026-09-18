@@ -9,7 +9,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from .models import CreatorFetchRequest, DownloadRequest, Platform, SearchRequest
-from .intent import parse_intent
+from .intent import parse_intent, requested_media_limit
 from .service import SocialImageService
 
 service = SocialImageService()
@@ -41,22 +41,37 @@ def _configure_stdio() -> None:
             pass
 
 
-@mcp.tool(description="Search social platforms by a keyword, content ID, or post URL. Set media_type=images (default), videos, or all to choose downloadable media. Creator queries such as douyin-user:<handle> or douyin-name:<nickname> route to exact account retrieval; media_type=videos can return original video files for creator queries.")
-async def search_images(query: str, platforms: list[str] | None = None, max_results: int = 20, min_width: int = 0, min_height: int = 0, safe_mode: bool = True, use_cache: bool = True, download: bool = False, output_dir: str | None = None, retrieval_mode: str = "sources", content_query: str | None = None, filter_mode: str = "off", quality_mode: str = "fast", media_type: str = "images") -> dict[str, Any]:
+@mcp.tool(description="Search social platforms by a keyword, content ID, or post URL. Set media_type=images (default), videos, or all to choose downloadable media. Paste a full non-social http(s) webpage URL and select platform=other to extract images from that page for download. For an X creator, use @username, from:username, or x-user:username so the request uses the user's media timeline; do not use a plain X keyword search for a creator timeline. Douyin queries such as douyin-user:<handle> or douyin-name:<nickname> route to exact account retrieval; media_type=videos can return original video files for creator queries.")
+async def search_images(query: str, platforms: list[str] | None = None, max_results: int = 20, min_width: int = 0, min_height: int = 0, safe_mode: bool = True, use_cache: bool = True, download: bool = False, output_dir: str | None = None, retrieval_mode: str = "sources", content_query: str | None = None, filter_mode: str = "off", quality_mode: str = "fast", media_type: str = "images", creator_name: str | None = None, creator_id: str | None = None, image_limit: int | None = None, video_limit: int | None = None, per_post_limit: int | None = None, max_posts: int = 20) -> dict[str, Any]:
     intent = parse_intent(query)
-    if intent.identifier_scope in {"creator", "creator_name"}:
+    max_results = requested_media_limit(query, max_results)
+    if creator_name or creator_id:
+        if not platforms or len(platforms) != 1:
+            raise ValueError("按昵称采集时请只选择一个平台")
+        return await service.fetch_creator(CreatorFetchRequest(
+            platform=Platform(platforms[0]), creator_name=creator_name, creator_id=creator_id,
+            max_images=image_limit or max_results, max_videos=video_limit,
+            max_posts=max_posts,
+            per_post_limit=per_post_limit, media_type=media_type,
+            content_query=content_query, filter_mode=filter_mode,
+            quality_mode=quality_mode, download=download, output_dir=output_dir,
+        ))
+    if intent.identifier_scope in {"creator", "creator_name"} and platforms != ["other"]:
         if platforms and platforms != [intent.identifier_platform]:
             raise ValueError("creator platform conflicts with platforms; use fetch_creator_images")
         return await service.fetch_creator(CreatorFetchRequest(
             platform=Platform(intent.identifier_platform),
-            creator_id=intent.identifier if intent.identifier_scope == "creator" else None,
+            creator_id=intent.identifier if intent.identifier_scope == "creator" and intent.identifier_platform not in {"xhs", "instagram"} else None,
             creator_name=intent.identifier if intent.identifier_scope == "creator_name" else None,
-            max_images=max_results, min_width=min_width, min_height=min_height,
+            profile_url=intent.url if intent.identifier_scope == "creator" and intent.identifier_platform in {"xhs", "instagram"} else None,
+            max_posts=max_posts,
+            max_images=image_limit or max_results, max_videos=video_limit,
+            per_post_limit=per_post_limit, min_width=min_width, min_height=min_height,
             safe_mode=safe_mode, content_query=content_query, filter_mode=filter_mode,
             quality_mode=quality_mode, media_type=media_type, download=download, output_dir=output_dir,
         ))
     selected = [Platform(value) for value in platforms] if platforms else None
-    request = SearchRequest(query=query, platforms=selected, max_results=max_results, min_width=min_width, min_height=min_height, safe_mode=safe_mode, use_cache=use_cache, retrieval_mode=retrieval_mode, media_type=media_type)
+    request = SearchRequest(query=query, platforms=selected, max_results=max_results, min_width=min_width, min_height=min_height, safe_mode=safe_mode, use_cache=use_cache, retrieval_mode=retrieval_mode, media_type=media_type, image_limit=image_limit, video_limit=video_limit, per_post_limit=per_post_limit)
     result = await service.search(request)
     if download and result["items"]:
         download_request = DownloadRequest(items=result["items"], output_dir=output_dir, min_width=min_width, min_height=min_height)
@@ -69,6 +84,7 @@ async def search_images(query: str, platforms: list[str] | None = None, max_resu
 @mcp.tool(description="Download creator media from Douyin, Weibo, Bilibili or X, NOT a post ID. Douyin accepts an exact account handle/UID/sec_uid via creator_id, an exact nickname via creator_name, or a full profile URL via profile_url. If a Douyin handle or nickname cannot be found, retry with the complete https://www.douyin.com/user/<sec_uid> profile URL because it is more stable. X accepts a username such as jwj180 or a full https://x.com/<username> profile URL; X requires a Bearer Token or authenticated gallery-dl cookie. Weibo and Bilibili accept numeric UID or full profile URL. media_type=images downloads image galleries, media_type=videos downloads original video files, and media_type=all returns both. By default this is fast account-only retrieval with no semantic or visual filtering. To keep only a content theme, provide content_query; the service classifies coarse objects such as person, clothing, landscape, scene, architecture and body regions, then applies include/exclude/required rules. Use filter_mode=optional to fall back when the local model is unavailable, or required to fail closed. Downloads are bounded by max_posts and max_images. Repeat with resume=true and the same options to continue pending media.")
 async def fetch_creator_images(platform: str, creator_id: str | None = None, creator_name: str | None = None, profile_url: str | None = None,
                                max_posts: int = 20, max_images: int = 50, since: str | None = None,
+                               max_videos: int | None = None, per_post_limit: int | None = None,
                                until: str | None = None, sort: str = "recent", include_video_covers: bool = False,
                                media_type: str = "images",
                                content_query: str | None = None, filter_mode: str = "off", quality_mode: str = "fast",
@@ -76,7 +92,7 @@ async def fetch_creator_images(platform: str, creator_id: str | None = None, cre
                                cursor: str | None = None, min_width: int = 0, min_height: int = 0,
                                max_concurrency: int = 5, safe_mode: bool = True) -> dict[str, Any]:
     request = CreatorFetchRequest(platform=platform, creator_id=creator_id, creator_name=creator_name, profile_url=profile_url,
-                                  max_posts=max_posts, max_images=max_images, since=since, until=until, sort=sort,
+                                  max_posts=max_posts, max_images=max_images, max_videos=max_videos, per_post_limit=per_post_limit, since=since, until=until, sort=sort,
                                   include_video_covers=include_video_covers, content_query=content_query,
                                   media_type=media_type,
                                   filter_mode=filter_mode, quality_mode=quality_mode, download=download, output_dir=output_dir,

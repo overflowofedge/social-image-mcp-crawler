@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>社交媒体图片采集器</title>
+<style>body{font-family:system-ui,"Microsoft YaHei",sans-serif;background:#f5f7fb;color:#1f2937;max-width:1100px;margin:auto;padding:24px}.card{background:#fff;border-radius:14px;padding:20px;margin:16px 0;box-shadow:0 2px 10px #0001}label{display:block;margin:8px 0 4px}input,select{box-sizing:border-box;width:100%;padding:9px;border:1px solid #ccd3df;border-radius:7px;font-size:15px}.checks{display:flex;gap:15px;flex-wrap:wrap}.checks label{display:inline-block;width:auto}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.hint{color:#64748b;font-size:13px}button{background:#2563eb;color:#fff;border:0;border-radius:8px;padding:11px 22px;font-size:15px}.status{white-space:pre-wrap;background:#111827;color:#e5e7eb;border-radius:8px;padding:14px;max-height:300px;overflow:auto}.items{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px}.item{border:1px solid #e5e7eb;border-radius:8px;overflow:hidden}.item img{width:100%;height:180px;object-fit:cover}.item p{padding:8px;margin:0;font-size:13px}@media(max-width:700px){.grid{grid-template-columns:1fr}}</style>
+</head>
+<body>
+<h1>社交媒体图片采集器</h1>
+<p class="hint">输入关键词、账号昵称或完整网址，程序会自动选择对应的检索方式。</p>
+<div class="card">
+<form id="form">
+<label>关键词、账号昵称或网页网址</label>
+<input id="query" required placeholder="例如：放学小野猪、@jwj180，或 https://example.com/gallery">
+<label>平台</label>
+<div class="checks">
+<label>
+<input type="radio" name="platform" value="douyin" checked> 抖音</label>
+<label>
+<input type="radio" name="platform" value="weibo"> 微博</label>
+<label>
+<input type="radio" name="platform" value="x"> X</label>
+<label>
+<input type="radio" name="platform" value="xhs"> 小红书</label>
+<label>
+<input type="radio" name="platform" value="bilibili"> B站</label>
+<label>
+<input type="radio" name="platform" value="instagram"> Instagram</label>
+<label>
+<input type="radio" name="platform" value="other"> 其他平台</label>
+</div>
+<p class="hint">选择“其他平台”后粘贴网页网址，程序会提取该网页中的主图和图片链接。</p>
+<div class="grid">
+<div>
+<label>内容类型</label>
+<select id="media_type">
+<option value="images">只下载图片</option>
+<option value="videos">只下载视频</option>
+<option value="all">图片和视频</option>
+</select>
+</div>
+<div>
+<label>图片总数</label>
+<input id="image_limit" type="number" min="1" max="200" value="20">
+</div>
+<div>
+<label>视频总数</label>
+<input id="video_limit" type="number" min="1" max="200" placeholder="选择视频后填写">
+</div>
+</div>
+<div class="grid">
+<div>
+<label>每个图文作品最多下载张数</label>
+<input id="per_post_limit" type="number" min="1" max="50" value="3">
+</div>
+<div>
+<label>最大作品数</label>
+<input id="max_posts" type="number" min="1" max="100" value="20">
+</div>
+<div>
+<label>
+<input id="download" type="checkbox" checked> 下载文件</label>
+</div>
+</div>
+<p class="hint">图片和视频分别计数；每篇图文作品按“每篇最多”限制。</p>
+<label>内容筛选（可选）</label>
+<input id="content_query" placeholder="例如：只要人物穿搭，排除风景">
+<div class="grid">
+<div>
+<label>筛选模式</label>
+<select id="filter_mode">
+<option value="off">关闭</option>
+<option value="optional">尽量筛选</option>
+<option value="required">严格匹配</option>
+</select>
+</div>
+<div>
+<label>质量</label>
+<select id="quality_mode">
+<option value="fast">快速</option>
+<option value="balanced">均衡</option>
+<option value="strict">严格</option>
+</select>
+</div>
+<div>
+<label>&nbsp;</label>
+<button id="submit">开始采集</button>
+</div>
+</div>
+</form>
+</div>
+<div class="card">
+<h3>运行状态</h3>
+<div id="status" class="status">等待任务…</div>
+</div>
+<div class="card">
+<h3>结果预览</h3>
+<div id="items" class="items">
+</div>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>

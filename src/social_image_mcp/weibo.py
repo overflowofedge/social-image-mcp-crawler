@@ -109,7 +109,42 @@ class WeiboApi:
         return result
 
     async def resolve_identity(self, request: CreatorFetchRequest) -> CreatorIdentity:
-        requested = request.profile_url or request.creator_id or ""
+        requested = request.profile_url or request.creator_id or request.creator_name or ""
+        if request.creator_name:
+            payload = await self._get(
+                "/api/container/getIndex",
+                {"containerid": f"100103type=3&q={request.creator_name.strip()}", "page_type": "searchall", "page": 1},
+            )
+            data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+            users: list[dict[str, Any]] = []
+            def collect(value: Any) -> None:
+                if isinstance(value, dict):
+                    user = value.get("user")
+                    if isinstance(user, dict) and (user.get("id") or user.get("idstr")):
+                        users.append(user)
+                    if value.get("screen_name") and (value.get("id") or value.get("idstr")):
+                        users.append(value)
+                    for child in value.values():
+                        collect(child)
+                elif isinstance(value, list):
+                    for child in value:
+                        collect(child)
+            collect(data.get("cards"))
+            unique = {}
+            for user in users:
+                name = _text(user.get("screen_name") or user.get("name"))
+                uid = str(user.get("id") or user.get("idstr") or "")
+                if name == request.creator_name.strip() and uid:
+                    unique[uid] = user
+            if len(unique) != 1:
+                raise WeiboError(f"creator_identity_unresolved: exact nickname matched {len(unique)} users")
+            uid = next(iter(unique))
+            profile = unique[uid]
+            return CreatorIdentity(
+                platform=Platform.WEIBO, requested_id=requested, canonical_id=uid,
+                name=_text(profile.get("screen_name") or profile.get("name")),
+                profile_url=f"https://weibo.com/u/{uid}", source="weibo-public-api", matched_by="exact_account_name",
+            )
         uid = creator_target("weibo", requested)
         payload = await self._get(
             "/api/container/getIndex",

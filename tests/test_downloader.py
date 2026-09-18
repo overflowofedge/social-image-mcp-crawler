@@ -28,6 +28,30 @@ def test_downloader_validates_and_writes_manifest(tmp_path):
     asyncio.run(run())
 
 
+def test_weibo_image_download_sends_page_referer(tmp_path):
+    buffer = io.BytesIO()
+    Image.new("RGB", (32, 20), "red").save(buffer, format="JPEG")
+    payload = buffer.getvalue()
+    seen = {}
+
+    def handler(request):
+        seen["referer"] = request.headers.get("referer")
+        return httpx.Response(200, headers={"content-type": "image/jpeg"}, content=payload, request=request)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            item = ImageCandidate(
+                id="wb-1:1", platform=Platform.WEIBO,
+                image_url="https://wx2.sinaimg.cn/mw2000/a.jpg",
+                permalink="https://m.weibo.cn/detail/123",
+            )
+            record = (await ImageDownloader(client).download_many([item], tmp_path))[0]
+            assert record.status == "downloaded"
+            assert seen["referer"] == "https://m.weibo.cn/detail/123"
+
+    asyncio.run(run())
+
+
 def test_downloader_deduplicates_near_identical_images(tmp_path):
     first = io.BytesIO()
     second = io.BytesIO()

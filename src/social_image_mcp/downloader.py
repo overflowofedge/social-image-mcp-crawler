@@ -91,6 +91,14 @@ class ImageDownloader:
                         # X media hosts occasionally reject clients without a
                         # browser-like referer, even though the URL is public.
                         headers["Referer"] = "https://x.com/"
+                    elif item.platform.value == "weibo":
+                        # Sina image hosts reject direct requests without a
+                        # Weibo page referer, even when the image URL is
+                        # public. Use the mobile page because creator results
+                        # and share links both resolve through m.weibo.cn.
+                        headers["Referer"] = item.permalink or "https://m.weibo.cn/"
+                    elif item.platform.value == "other" and item.permalink:
+                        headers["Referer"] = item.permalink
                     response = await self.client.get(item.image_url, headers=headers, follow_redirects=True, timeout=30)
                     response.raise_for_status()
                     break

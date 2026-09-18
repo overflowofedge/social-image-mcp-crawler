@@ -6,6 +6,12 @@
 
 下面按顺序复制命令即可完成安装。第一次使用只需要安装 Python 和 Git；不会写代码也可以使用。
 
+### 不使用 Codex：双击启动本地应用
+
+安装依赖并完成平台登录后，直接双击项目根目录的 `启动应用.bat`（英文文件名为 `start_app.bat` 也可以）。程序会启动本机网页界面并自动打开浏览器；在页面中输入提示词或平台链接，选择抖音/微博/X、图片或视频以及是否下载即可。文件默认保存到项目下的 `downloads` 文件夹。
+
+应用只监听本机 `127.0.0.1:8765`，关闭黑色 PowerShell 窗口即可停止服务。它使用与 MCP 相同的采集、相关性筛选和下载代码，不需要打开 Codex，也不会消耗对话 token。
+
 ### 第 1 步：安装 Python
 
 从 [python.org](https://www.python.org/downloads/) 安装 Python 3.10 或更高版本。安装界面第一页一定勾选 **Add Python to PATH**。安装完成后打开 PowerShell，输入：
@@ -158,11 +164,13 @@ X 的公开搜索接口通常只给图片缩略图；视频还必须从 `media.v
 
 只有 `url` 或 `media_url` 指向 `pbs.twimg.com`、`video.twimg.com` 的真实媒体时才会下载；X 返回的网页链接、转发页面和受保护账号不会被当成媒体文件。Bearer Token 只能访问 API 允许的公开内容，不能绕过私密账号、付费内容或平台限流。
 
-按 X 博主抓取时可以直接使用 `@用户名`、`x-user:用户名`，或调用 `fetch_creator_images` 时填写 `platform: "x"` 和 `creator_id`。例如：
+按 X 博主抓取时可以直接使用 `@用户名`、`from:用户名`、`x-user:用户名`，或调用 `fetch_creator_images` 时填写 `platform: "x"` 和 `creator_id`。例如：
 
 ```text
 抓取 X 博主 @jwj180 最近 20 条含媒体的帖子并下载图片。
 ```
+
+`from:jwj180` 也会被识别为博主时间线。X 的普通关键词搜索接口近期经常返回 404，因此不要把博主名当作普通关键词检索。
 
 该账号路径由 gallery-dl 读取 X 登录态；如果只配置 Bearer Token 而没有 gallery-dl Cookie，搜索 API 可以工作，但博主时间线下载可能因 X 权限限制返回空结果。
 
@@ -171,13 +179,14 @@ X 的公开搜索接口通常只给图片缩略图；视频还必须从 `media.v
 ## 能力
 
 - `search_images`：默认走“推荐采集项目召回 + 本地语义重排”，支持抖音、小红书、微博、B 站、X 和 Instagram 的关键词、平台内容 ID、帖子/笔记/视频 URL；多平台并发检索后统一排序，可通过 `download=true` 直接下载。配置本地 CLIP 后会追加视觉重排；`retrieval_mode=hybrid` 才会额外叠加公共索引或旧平台适配器。
+- 其他网页图片：在本地应用选择“其他平台”并粘贴完整的 `http(s)` 网页地址，或在 `search_images` 中传入 `platforms: ["other"]`，服务会提取网页主图、`img`、懒加载图片和 `srcset` 图片并交给统一下载器。普通平台链接仍按对应平台处理；其他平台目前只提取图片，不下载视频。
 - `fetch_creator_images`：按抖音、微博或 B 站博主账号抓取主页作品图片或视频。抖音支持 `creator_id`、`creator_name`（昵称）和完整 `profile_url`；微博与 B 站支持数字 UID 或完整主页链接。`media_type=images|videos|all` 分别获取图片、原视频或两者；分页、日期范围、作品/媒体上限和断点续传保持一致。
 - 账号内容筛选：只有提供 `content_query` 才启用。对象要求会先按人物、穿搭、风景、场景、建筑、食物、饮品、包和身体部位等类别做粗粒度视觉分类，再按 include/exclude/required 规则过滤；没有可用模型时 `optional` 回退账号结果，`required` 失败关闭。
 - `inspect_item`：按平台和 ID 获取单条内容的图片候选。
 - `download_images`：按候选结果下载原图，自动重试、校验图片尺寸、按内容哈希去重并写入 `manifest.jsonl`。
 - `list_platforms`：查看平台能力、凭据和配置状态。
 - 轻量语义理解：中英文分词、同义词扩展、否定词、ID 精确匹配、方向偏好和质量加权。
-- 可选视觉语义重排：对召回图的缩略图/原图运行 CLIP 图文相似度，减少“文字相关但画面不对”的结果；默认关闭，保证 MCP stdio 首次调用稳定快速。
+- 可选视觉语义重排：对召回图的缩略图/原图运行 CLIP 图文相似度，减少“文字相关但画面不对”的结果；普通关键词请求按候选短名单执行，账号请求一旦提供 `content_query` 即会进行视觉相关性校验（即使 `quality_mode=fast`），避免抖音/微博只凭文案误下载。
 - 推荐来源项目：dy-cli（抖音关键词/图集/详情）、MediaCrawler（小红书/微博）、gallery-dl（X/Instagram/微博）、XHS-Downloader（小红书高分辨率）。来源项目只做候选召回，排序和下载由本项目统一完成。
 - SQLite 查询缓存，降低重复检索延迟。
 - 可选本地语义重排：设置 `SEMANTIC_MODEL` 后启用 `sentence-transformers`，默认不下载模型、不增加启动成本。

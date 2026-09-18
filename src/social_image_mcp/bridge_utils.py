@@ -112,7 +112,17 @@ def extract_media_urls(platform: str, record: Any, include_video_covers: bool = 
         return urls or _urls_from_mapping(record)
 
     if platform == "douyin":
-        images = record.get("images") or []
+        # Douyin has used several field names for image-text posts over time.
+        # Keep all known variants so a schema change does not turn a valid
+        # result into an empty candidate list.
+        images = (
+            record.get("images")
+            or record.get("image_list")
+            or record.get("imageList")
+            or record.get("image_infos")
+            or record.get("imageInfos")
+            or []
+        )
         urls = _urls_from_items(images, ("url_list", "urlList", "origin_url", "url"))
         # Video posts still have a useful cover image when no gallery exists.
         if not urls and include_video_covers:

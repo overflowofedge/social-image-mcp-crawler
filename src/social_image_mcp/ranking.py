@@ -66,13 +66,19 @@ def score_candidate(candidate: ImageCandidate, intent: Intent) -> tuple[float, l
     return score, matched
 
 
-def rank_candidates(candidates: Iterable[ImageCandidate], intent: Intent, max_results: int, min_width: int = 0, min_height: int = 0) -> list[ImageCandidate]:
+def rank_candidates(candidates: Iterable[ImageCandidate], intent: Intent, max_results: int, min_width: int = 0, min_height: int = 0, require_match: bool = False) -> list[ImageCandidate]:
     ranked: list[ImageCandidate] = []
     for candidate in candidates:
         if (candidate.width and candidate.width < min_width) or (candidate.height and candidate.height < min_height):
             continue
         score, matched = score_candidate(candidate, intent)
         if score < 0:
+            continue
+        # A keyword result must have at least one textual/metadata hit.  The
+        # old quality-only fallback let unrelated large images (score ~0.15)
+        # outrank genuinely relevant but smaller posts, especially on Douyin
+        # and Weibo where search feeds contain broad recommendations.
+        if require_match and intent.is_keyword and not matched:
             continue
         ranked.append(candidate.model_copy(update={"score": round(score, 4), "matched_terms": matched}))
     ranked.sort(key=lambda item: (item.score, (item.width or 0) * (item.height or 0), "?" not in item.image_url), reverse=True)

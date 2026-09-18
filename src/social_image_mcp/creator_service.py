@@ -146,7 +146,7 @@ class CreatorImageService:
                 try:
                     source_result = await native_api.fetch_creator(source_request)
                 except (BilibiliError, WeiboError) as exc:
-                    if request.platform.value == "bilibili":
+                    if request.platform.value == "bilibili" or request.creator_name:
                         raise SourceError(str(exc)) from exc
                     # Weibo's mobile endpoint is rate limited in some
                     # regions; retain MediaCrawler as an authenticated,
@@ -205,7 +205,9 @@ class CreatorImageService:
                           "cursor": source_result.next_cursor, "exhausted": source_result.next_cursor is None})
             state["warnings"].extend(warnings)
             self.store.save(key, state)
-        selected = [ImageCandidate.model_validate(item) for item in state["pending"][:request.max_images]]
+        selected = self._select_with_quotas(
+            [ImageCandidate.model_validate(item) for item in state["pending"]], request
+        )
         records = []
         if request.download and selected:
             records = await self.downloader.download_many(selected, output, request.max_concurrency, request.min_width, request.min_height, resume=request.resume)
@@ -234,6 +236,9 @@ class CreatorImageService:
                 "filter_mode": request.filter_mode,
                 "quality_mode": request.quality_mode,
                 "media_type": request.media_type,
+                "image_limit": request.max_images,
+                "video_limit": request.max_videos,
+                "per_post_limit": request.per_post_limit,
                 "semantic_requested": bool(request.content_query),
                 "semantic_applied": bool(state.get("semantic_applied")),
                 "vision_applied": bool(state.get("vision_applied")),
@@ -247,6 +252,39 @@ class CreatorImageService:
                 "object_decisions": state.get("object_decisions") or {},
                 "object_rejected": int(state.get("object_rejected") or 0),
                 "object_unverified": int(state.get("object_unverified") or 0)}
+
+    @staticmethod
+    def _select_with_quotas(items: list[ImageCandidate], request: CreatorFetchRequest) -> list[ImageCandidate]:
+        """Apply total image/video and per-post limits deterministically."""
+        selected: list[ImageCandidate] = []
+        images = videos = 0
+        video_limit = request.max_videos if request.max_videos is not None else request.max_images
+        per_post: dict[str, int] = {}
+        for item in items:
+            if request.media_type == "images" and item.media_type != "image":
+                continue
+            if request.media_type == "videos" and item.media_type != "video":
+                continue
+            post = item.post_id or item.id
+            if request.per_post_limit is not None and per_post.get(post, 0) >= request.per_post_limit:
+                continue
+            if item.media_type == "image":
+                if images >= request.max_images:
+                    continue
+                images += 1
+            else:
+                if videos >= video_limit:
+                    continue
+                videos += 1
+            per_post[post] = per_post.get(post, 0) + 1
+            selected.append(item)
+            if request.media_type == "images" and images >= request.max_images:
+                break
+            if request.media_type == "videos" and videos >= video_limit:
+                break
+            if request.media_type == "all" and images >= request.max_images and videos >= video_limit:
+                break
+        return selected
                 
 
     async def _filter_content(self, items: list[ImageCandidate], request: CreatorFetchRequest) -> tuple[list[ImageCandidate], dict]:
@@ -302,16 +340,22 @@ class CreatorImageService:
         if self.semantic and self.semantic.enabled and ranked and request.quality_mode != "fast":
             ranked = await self.semantic.rerank(ranked, intent, len(ranked))
             semantic_applied = bool(getattr(self.semantic, "_model", None) is not None)
-        # Object classification already compares each requested concept. A
-        # second full CLIP pass is redundant in fast mode and was the main
-        # source of cold-request latency for creator jobs.
-        if self.vision and self.vision.enabled and ranked and request.quality_mode != "fast":
+        # Object classification compares explicit include/exclude concepts;
+        # the CLIP pass below additionally scores the complete natural-language
+        # brief (needed when no object detector is configured).
+        if self.vision and self.vision.enabled and ranked:
             self.vision.start_loading()
             try:
-                ranked = await asyncio.wait_for(
-                    self.vision.rerank(ranked, intent, len(ranked)),
+                # Even fast creator jobs with an explicit content_query need
+                # a visual relevance check; lexical captions alone are not
+                # reliable for Douyin/Weibo. Limit the CLIP pass to a bounded
+                # shortlist to keep large jobs responsive.
+                vision_pool = ranked[: min(32, len(ranked))]
+                vision_ranked = await asyncio.wait_for(
+                    self.vision.rerank(vision_pool, intent, len(vision_pool)),
                     timeout=max(1, int(getattr(self.settings, "vision_timeout_seconds", 8))),
                 )
+                ranked = vision_ranked + ranked[len(vision_pool):]
                 vision_applied = any("vision_similarity" in item.source_payload for item in ranked)
             except asyncio.TimeoutError:
                 warning = "visual content filtering timed out; optional account results were retained"
@@ -330,7 +374,11 @@ class CreatorImageService:
                         "object_decisions": object_decisions, "object_rejected": object_rejected, "object_unverified": object_unverified}
         if vision_applied:
             threshold = 0.08 if request.quality_mode == "strict" else 0.0
-            filtered = [item for item in ranked if float(item.source_payload.get("vision_margin", 0.0)) >= threshold]
+            # Do not let the unclassified tail pass merely because its default
+            # margin is zero.  That would reintroduce unrelated posts when a
+            # large account request is truncated to a visual shortlist.
+            visual_items = [item for item in ranked if "vision_similarity" in item.source_payload]
+            filtered = [item for item in visual_items if float(item.source_payload.get("vision_margin", 0.0)) >= threshold]
             if not filtered and request.filter_mode == "optional" and not object_detection_applied:
                 filtered = items
                 warning = warning or "no image cleared the visual threshold; optional account results were retained"

@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Verify creator media retrieval through the current MCP stdio server")
-    parser.add_argument("--platform", required=True, choices=("douyin", "weibo", "bilibili"))
+    parser.add_argument("--platform", required=True, choices=("douyin", "weibo", "bilibili", "x"))
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument("--creator-id", help="Douyin handle/sec_uid or numeric Weibo UID")
     target.add_argument("--creator-name", help="Exact Douyin nickname")

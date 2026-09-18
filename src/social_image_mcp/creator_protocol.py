@@ -22,10 +22,12 @@ def creator_target(platform: str, value: str) -> str:
         value = value[prefix.end():]
     if value.startswith(("https://", "http://")):
         url = urlparse(value)
-        allowed = {"douyin": {"douyin.com", "www.douyin.com"},
+        allowed = {"douyin": {"douyin.com", "www.douyin.com", "v.douyin.com"},
                    "weibo": {"weibo.com", "www.weibo.com", "m.weibo.cn"},
                    "bilibili": {"space.bilibili.com", "www.bilibili.com", "bilibili.com"},
-                   "x": {"x.com", "www.x.com", "twitter.com", "www.twitter.com"}}
+                   "x": {"x.com", "www.x.com", "twitter.com", "www.twitter.com"},
+                   "instagram": {"instagram.com", "www.instagram.com"},
+                   "xhs": {"xiaohongshu.com", "www.xiaohongshu.com", "xhslink.com"}}
         if url.hostname not in allowed.get(platform, set()) or url.username or url.port:
             raise ValueError("use the full creator profile URL on the selected platform")
         if platform == "douyin":
@@ -34,13 +36,17 @@ def creator_target(platform: str, value: str) -> str:
             pattern = r"/(?:u/)?(\d+)/?"
         elif platform == "x":
             pattern = r"/([A-Za-z0-9_.-]+)/?"
+        elif platform == "instagram":
+            pattern = r"/([A-Za-z0-9_.-]+)/?"
+        elif platform == "xhs":
+            pattern = r"/user/profile/([A-Za-z0-9_-]+)/?"
         else:
             pattern = r"/(?:u/|profile/)?(\d+)/?"
         match = re.fullmatch(pattern, unquote(url.path))
         if not match:
             raise ValueError("this is not a supported creator profile URL; provide the account ID or full profile URL")
         value = match.group(1)
-    pattern = r"[A-Za-z0-9_.-]+" if platform in ("douyin", "x") else r"\d+"
+    pattern = r"[A-Za-z0-9_.-]+" if platform in ("douyin", "x", "instagram", "xhs") else r"\d+"
     if not re.fullmatch(pattern, value) or len(value) > 200:
         raise ValueError("invalid creator ID; Douyin accepts a handle/UID/sec_uid, Weibo and Bilibili require a numeric UID")
     return value
