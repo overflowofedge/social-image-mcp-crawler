@@ -142,7 +142,7 @@ class SocialImageService:
         platforms = self._target_platforms(request, intent.identifier_platform)
         # Bump the namespace when relevance rules change so old low-quality
         # keyword results are never served from the persistent cache.
-        namespace = "search-v5-web-originals" if platforms == [Platform.OTHER] else "search-v3-relevance-gated"
+        namespace = "search-v5-web-originals" if platforms == [Platform.OTHER] else "search-v4-media-limits"
         key = self.cache.key(namespace, request.model_dump(mode="json"), intent.normalized) if request.use_cache else None
         if key and (cached := self.cache.get(key)) is not None:
             return await self._refresh_cached_status(cached, platforms, request, key)
@@ -450,7 +450,7 @@ class SocialImageService:
             if request.media_type == "videos" and item.media_type != "video":
                 continue
             post = item.post_id or item.id
-            limit_post = not (item.platform == Platform.OTHER and item.media_type == "video")
+            limit_post = item.media_type == "image"
             if limit_post and per_post_limit is not None and posts.get(post, 0) >= per_post_limit:
                 continue
             limit = image_limit if item.media_type == "image" else video_limit

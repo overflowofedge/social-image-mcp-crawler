@@ -4,38 +4,58 @@ const button = $("submit");
 const status = $("status");
 const itemsBox = $("items");
 const mediaType = $("media_type");
+const imageLimit = $("image_limit");
 const videoLimit = $("video_limit");
+const perPostLimit = $("per_post_limit");
+
+function updateDownloadSummary() {
+  const count = input => input.value || "—";
+  const limits = [];
+  if (mediaType.value !== "videos") {
+    limits.push(`最多 ${count(imageLimit)} 张图片（每个作品最多 ${count(perPostLimit)} 张）`);
+  }
+  if (mediaType.value !== "images") {
+    limits.push(`最多 ${count(videoLimit)} 个视频`);
+  }
+  $("download_summary").textContent = `本次下载：${limits.join("，")}。实际数量以找到的可下载内容为准。`;
+}
 
 function syncMediaLimits() {
-  const videosSelected = mediaType.value === "videos" || mediaType.value === "all";
-  videoLimit.disabled = !videosSelected;
+  const imagesSelected = mediaType.value !== "videos";
+  const videosSelected = mediaType.value !== "images";
+  $("image_settings").disabled = !imagesSelected;
+  $("video_settings").disabled = !videosSelected;
+  imageLimit.required = imagesSelected;
+  perPostLimit.required = imagesSelected;
   videoLimit.required = videosSelected;
-  if (!videosSelected) videoLimit.value = "";
+  updateDownloadSummary();
 }
 
 mediaType.addEventListener("change", syncMediaLimits);
+[imageLimit, videoLimit, perPostLimit].forEach(input => input.addEventListener("input", updateDownloadSummary));
 syncMediaLimits();
 
 form.addEventListener("submit", async event => {
   event.preventDefault();
+  if (!form.reportValidity()) return;
   button.disabled = true;
   itemsBox.innerHTML = "";
-  status.textContent = "正在采集，请稍候…";
+  status.textContent = "正在采集并下载，请稍候…";
   const platform = document.querySelector('input[name="platform"]:checked').value;
-  const imageLimit = Number($("image_limit").value);
-  const videoLimitValue = videoLimit.value ? Number(videoLimit.value) : null;
   const mediaTypeValue = mediaType.value;
-  const maxResults = mediaTypeValue === "all" ? imageLimit + (videoLimitValue || imageLimit) : (mediaTypeValue === "videos" ? (videoLimitValue || imageLimit) : imageLimit);
+  const imageLimitValue = mediaTypeValue !== "videos" ? Number(imageLimit.value) : null;
+  const videoLimitValue = mediaTypeValue !== "images" ? Number(videoLimit.value) : null;
+  const maxResults = (imageLimitValue || 0) + (videoLimitValue || 0);
   const body = {
     query: $("query").value,
     platforms: [platform],
     max_results: maxResults,
     media_type: mediaTypeValue,
-    image_limit: imageLimit,
+    image_limit: imageLimitValue,
     video_limit: videoLimitValue,
-    per_post_limit: Number($("per_post_limit").value),
+    per_post_limit: mediaTypeValue !== "videos" ? Number(perPostLimit.value) : null,
     max_posts: Number($("max_posts").value),
-    download: $("download").checked,
+    download: true,
     content_query: $("content_query").value || null,
     filter_mode: $("filter_mode").value,
     quality_mode: $("quality_mode").value

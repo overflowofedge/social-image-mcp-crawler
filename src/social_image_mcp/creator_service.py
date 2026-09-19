@@ -255,7 +255,7 @@ class CreatorImageService:
 
     @staticmethod
     def _select_with_quotas(items: list[ImageCandidate], request: CreatorFetchRequest) -> list[ImageCandidate]:
-        """Apply total image/video and per-post limits deterministically."""
+        """Apply separate media quotas and an image limit per post."""
         selected: list[ImageCandidate] = []
         images = videos = 0
         video_limit = request.max_videos if request.max_videos is not None else request.max_images
@@ -266,17 +266,17 @@ class CreatorImageService:
             if request.media_type == "videos" and item.media_type != "video":
                 continue
             post = item.post_id or item.id
-            if request.per_post_limit is not None and per_post.get(post, 0) >= request.per_post_limit:
+            if item.media_type == "image" and request.per_post_limit is not None and per_post.get(post, 0) >= request.per_post_limit:
                 continue
             if item.media_type == "image":
                 if images >= request.max_images:
                     continue
                 images += 1
+                per_post[post] = per_post.get(post, 0) + 1
             else:
                 if videos >= video_limit:
                     continue
                 videos += 1
-            per_post[post] = per_post.get(post, 0) + 1
             selected.append(item)
             if request.media_type == "images" and images >= request.max_images:
                 break
