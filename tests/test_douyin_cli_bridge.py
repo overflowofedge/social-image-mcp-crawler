@@ -75,6 +75,38 @@ def test_dy_cli_cache_reuses_only_recent_exact_ids(tmp_path, monkeypatch):
     assert _load_cached_items("1234") == []
 
 
+def test_image_only_cache_cannot_satisfy_a_video_request(tmp_path, monkeypatch):
+    monkeypatch.setenv("DY_CLI_RESULT_CACHE", str(tmp_path / "results.json"))
+    items = [{"id": "123", "image_url": "https://img.test/a.jpg"}]
+    _save_cached_items(items)
+    assert _load_cached_items("123", media_type="all") == []
+    assert _load_cached_items("123", media_type="videos") == []
+
+
+def test_profile_share_preserves_requested_media_and_later_videos(monkeypatch):
+    from social_image_mcp.models import SearchRequest
+
+    class Client:
+        def resolve_creator_share_url(self, url):
+            return "https://www.douyin.com/user/sec-1"
+
+    items = [{"id": str(i), "media_type": "image"} for i in range(8)]
+    items.append({"id": "clip", "media_type": "video"})
+
+    def fetch(client, request, account=None):
+        assert request.media_type == "all"
+        assert request.max_posts == 17
+        assert request.max_images == 2
+        assert request.max_videos == 1
+        assert request.per_post_limit == 1
+        return {"items": items}
+
+    monkeypatch.setattr(_MODULE, "_fetch_creator_with_fallback", fetch)
+    request = SearchRequest(query="https://v.douyin.com/home/", media_type="all", image_limit=2,
+                            video_limit=1, per_post_limit=1, max_posts=17)
+    assert _creator_items_from_profile_share(Client(), request.query, 3, search_request=request) == items
+
+
 def test_dy_cli_relative_cache_is_anchored_to_project(monkeypatch):
     monkeypatch.setenv("DY_CLI_RESULT_CACHE", ".cache/custom-results.json")
     assert _cache_path() == Path(__file__).resolve().parents[1] / ".cache" / "custom-results.json"

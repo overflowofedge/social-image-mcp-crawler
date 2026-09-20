@@ -59,7 +59,7 @@ def test_search_has_server_side_deadline(tmp_path):
                 "platforms": ["douyin"],
             }]
 
-        async def search(self, platform, intent, limit):
+        async def search(self, platform, intent, limit, *, request=None):
             await asyncio.sleep(10)
             return []
 
@@ -103,7 +103,7 @@ def test_platform_timeout_keeps_other_platform_candidates(tmp_path):
                 "platforms": ["douyin", "xhs"],
             }]
 
-        async def search(self, platform, intent, limit):
+        async def search(self, platform, intent, limit, *, request=None):
             if platform is Platform.DOUYIN:
                 await asyncio.sleep(10)
             return [ImageCandidate(
@@ -154,7 +154,7 @@ def test_platform_specific_id_only_queries_its_platform(tmp_path):
                 "platforms": [platform.value for platform in Platform],
             }]
 
-        async def search(self, platform, intent, limit):
+        async def search(self, platform, intent, limit, *, request=None):
             self.called.append(platform)
             return [ImageCandidate(
                 id="123456789:1",
@@ -190,7 +190,7 @@ def test_platform_counts_match_delivered_items_after_limits(tmp_path):
                      "verified_platforms": ["douyin"], "ready_platforms": ["douyin"],
                      "mode": "test", "detail": "", "platforms": ["douyin"]}]
 
-        async def search(self, platform, intent, limit):
+        async def search(self, platform, intent, limit, *, request=None):
             return [
                 ImageCandidate(id="one", platform=platform, image_url="https://cdn.test/one.jpg"),
                 ImageCandidate(id="two", platform=platform, image_url="https://cdn.test/two.jpg"),
@@ -221,7 +221,7 @@ def test_video_and_all_limits_drive_source_fetch_budget(tmp_path):
                      "verified_platforms": ["douyin"], "ready_platforms": ["douyin"],
                      "mode": "test", "detail": "", "platforms": ["douyin"]}]
 
-        async def search(self, platform, intent, limit):
+        async def search(self, platform, intent, limit, *, request=None):
             self.limits.append(limit)
             return []
 
@@ -270,7 +270,7 @@ def test_cache_hit_refreshes_current_source_verification_status(tmp_path):
                 },
             }]
 
-        async def search(self, platform, intent, limit):
+        async def search(self, platform, intent, limit, *, request=None):
             self.calls += 1
             return [ImageCandidate(
                 id="cached-xhs",
@@ -320,7 +320,7 @@ def test_keyword_search_does_not_wait_for_cold_visual_worker(tmp_path):
                 "mode": "test", "detail": "", "platforms": ["xhs"],
             }]
 
-        async def search(self, platform, intent, limit):
+        async def search(self, platform, intent, limit, *, request=None):
             self.calls += 1
             return [ImageCandidate(
                 id="cold-visual", platform=platform,
@@ -385,7 +385,7 @@ def test_keyword_search_bounds_cold_semantic_reranker(tmp_path):
                      "verified_platforms": ["xhs"], "ready_platforms": ["xhs"],
                      "mode": "test", "detail": "", "platforms": ["xhs"]}]
 
-        async def search(self, platform, intent, limit):
+        async def search(self, platform, intent, limit, *, request=None):
             return [ImageCandidate(id="semantic-cold", platform=platform,
                                    image_url="https://cdn.test/semantic.jpg", title="咖啡店")]
 

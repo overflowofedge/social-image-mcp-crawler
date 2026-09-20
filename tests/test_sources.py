@@ -1,10 +1,11 @@
 import asyncio
+import json
 import os
 import sys
 
 import pytest
 
-from social_image_mcp.models import CreatorFetchRequest, Platform
+from social_image_mcp.models import CreatorFetchRequest, Platform, SearchRequest
 from social_image_mcp.sources import ExternalJsonSource, GalleryDlSource, SourceError, SourceHub, SourceVerificationStore, _decode_process_output, _embedded_error, normalize_source_output
 from social_image_mcp.feedback import FeedbackStore
 from social_image_mcp.intent import parse_intent
@@ -27,6 +28,45 @@ def test_gallery_dl_video_record_keeps_video_media_type():
     assert len(items) == 1
     assert items[0].media_type == "video"
     assert items[0].image_url.startswith("https://video.twimg.com/")
+
+
+def test_normalized_video_keeps_its_type_without_a_file_extension():
+    output = json.dumps({"id": "clip", "media_type": "video", "image_url": "https://cdn.test/play?id=1",
+                         "thumbnail_url": "https://cdn.test/cover.jpg", "url": "https://site.test/post/1"})
+    items = normalize_source_output(Platform.DOUYIN, output, "dy-cli", 10)
+    assert [(item.media_type, item.image_url) for item in items] == [("video", "https://cdn.test/play?id=1")]
+    assert items[0].thumbnail_url == "https://cdn.test/cover.jpg"
+
+
+def test_source_pool_reserves_space_for_later_videos():
+    output = json.dumps([
+        {"id": "photo-1", "image_url": "https://cdn.test/1.jpg"},
+        {"id": "photo-2", "image_url": "https://cdn.test/2.jpg"},
+        {"id": "clip", "media_type": "video", "image_url": "https://cdn.test/play?id=1"},
+    ])
+    assert [item.id for item in normalize_source_output(Platform.DOUYIN, output, "dy-cli", 1, "all")] == ["photo-1", "clip"]
+    assert [item.id for item in normalize_source_output(Platform.DOUYIN, output, "dy-cli", 1, "videos")] == ["clip"]
+
+
+def test_source_hub_passes_mixed_request_to_the_bridge(tmp_path):
+    script = tmp_path / "source.py"
+    script.write_text('''import json, os
+request = json.loads(os.environ["SOCIAL_IMAGE_SEARCH_REQUEST"])
+assert request["media_type"] == "all"
+assert request["max_posts"] == 17
+assert request["video_limit"] == 2
+print(json.dumps({"id":"v1", "media_type":"video", "image_url":"https://cdn.test/play?id=1"}))
+''', encoding="utf-8")
+
+    async def run():
+        source = SourceHub(None, None, "not-installed-gallery", None,
+                           douyin_source_command=f'"{sys.executable}" "{script}"',
+                           verification_path=str(tmp_path / "verification.json"))
+        request = SearchRequest(query="https://v.douyin.com/home/", media_type="all", max_posts=17, video_limit=2)
+        items = await source.search(Platform.DOUYIN, parse_intent(request.query), 4, request=request)
+        assert [(item.id, item.media_type) for item in items] == [("v1", "video")]
+
+    asyncio.run(run())
 
 
 def test_source_process_output_decodes_utf8_and_windows_gb18030():

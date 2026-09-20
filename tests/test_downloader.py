@@ -52,6 +52,25 @@ def test_weibo_image_download_sends_page_referer(tmp_path):
     asyncio.run(run())
 
 
+def test_douyin_video_download_sends_site_referer(tmp_path):
+    seen = {}
+
+    def handler(request):
+        seen.update(request.headers)
+        return httpx.Response(200, content=b"video", headers={"content-type": "video/mp4"})
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            item = ImageCandidate(id="v1", platform=Platform.DOUYIN, image_url="https://cdn.test/play", media_type="video")
+            record = (await ImageDownloader(client).download_many([item], tmp_path))[0]
+            assert record.status == "downloaded"
+
+    asyncio.run(run())
+    assert seen["referer"] == "https://www.douyin.com/"
+    assert seen["origin"] == "https://www.douyin.com"
+    assert "Chrome/" in seen["user-agent"]
+
+
 def test_downloader_deduplicates_near_identical_images(tmp_path):
     first = io.BytesIO()
     second = io.BytesIO()

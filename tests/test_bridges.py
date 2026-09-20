@@ -69,6 +69,16 @@ def test_douyin_media_type_all_keeps_image_and_video_records():
     assert {item["media_type"] for item in items} == {"image", "video"}
 
 
+def test_douyin_video_extraction_drops_music_track_urls():
+    record = {"aweme_id": "45", "video": {
+        "play_addr": {"url_list": ["https://cdn.test/audio.mp3"]},
+        "bit_rate": [{"play_addr": {"url_list": ["https://cdn.test/video?id=45"]}}],
+    }}
+    assert extract_video_urls("douyin", record) == ["https://cdn.test/video?id=45"]
+    del record["video"]["bit_rate"]
+    assert extract_video_urls("douyin", record) == []
+
+
 def test_gallery_candidates_have_unique_ids_and_keep_post_id():
     record = {
         "aweme_id": "42",

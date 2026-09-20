@@ -30,7 +30,7 @@ if str(SRC) not in sys.path:
 
 from social_image_mcp.bridge_utils import normalize_native_record
 from social_image_mcp.creator_protocol import CreatorCollector, douyin_identity
-from social_image_mcp.models import CreatorFetchRequest
+from social_image_mcp.models import CreatorFetchRequest, SearchRequest
 
 
 def _configure_stdio() -> None:
@@ -58,12 +58,14 @@ def _cache_path() -> Path:
     return path if path.is_absolute() else ROOT / path
 
 
-def _load_cached_items(item_id: str, max_age_seconds: int = 6 * 60 * 60) -> list[dict[str, Any]]:
+def _load_cached_items(item_id: str, max_age_seconds: int = 6 * 60 * 60, *, media_type: str = "images") -> list[dict[str, Any]]:
     path = _cache_path()
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         entry = payload.get(item_id) if isinstance(payload, dict) else None
         if not isinstance(entry, dict) or time.time() - float(entry.get("saved_at", 0)) > max_age_seconds:
+            return []
+        if entry.get("media_type", "images") != media_type:
             return []
         items = entry.get("items")
         return items if isinstance(items, list) and all(isinstance(item, dict) for item in items) else []
@@ -71,7 +73,7 @@ def _load_cached_items(item_id: str, max_age_seconds: int = 6 * 60 * 60) -> list
         return []
 
 
-def _save_cached_items(items: list[dict[str, Any]]) -> None:
+def _save_cached_items(items: list[dict[str, Any]], *, media_type: str = "images") -> None:
     grouped: dict[str, list[dict[str, Any]]] = {}
     for item in items:
         post_id = str(item.get("post_id") or item.get("id") or "")
@@ -87,7 +89,7 @@ def _save_cached_items(items: list[dict[str, Any]]) -> None:
             existing = {}
         now = time.time()
         for post_id, post_items in grouped.items():
-            existing[post_id] = {"saved_at": now, "items": post_items}
+            existing[post_id] = {"saved_at": now, "items": post_items, "media_type": media_type}
         # Keep the file bounded while retaining the newest exact-ID entries.
         existing = dict(sorted(existing.items(), key=lambda pair: float(pair[1].get("saved_at", 0)), reverse=True)[:500])
         temporary = path.with_suffix(path.suffix + ".tmp")
@@ -163,8 +165,8 @@ def _looks_like_douyin_creator_url(url: str) -> bool:
     return path.startswith("/user/") or path.startswith("/share/user/")
 
 
-def _creator_items_from_profile_share(client: Any, url: str, limit: int, account: str | None = None) -> list[dict[str, Any]]:
-    """Resolve a homepage share and expose creator images to search callers."""
+def _creator_items_from_profile_share(client: Any, url: str, limit: int, account: str | None = None, *, search_request: SearchRequest | None = None) -> list[dict[str, Any]]:
+    """Resolve a homepage share while preserving the requested media types."""
     resolver = getattr(client, "resolve_creator_share_url", None)
     if not callable(resolver):
         raise RuntimeError("当前 dy-cli 不支持抖音主页短链接解析，请更新桌面应用后重试")
@@ -172,14 +174,18 @@ def _creator_items_from_profile_share(client: Any, url: str, limit: int, account
     request = CreatorFetchRequest(
         platform="douyin",
         profile_url=profile_url,
-        max_posts=max(20, min(100, max(1, limit))),
-        max_images=max(1, min(200, limit)),
-        media_type="images",
+        max_posts=search_request.max_posts if search_request else max(20, min(100, max(1, limit))),
+        max_images=(search_request.image_limit or min(200, search_request.max_results)) if search_request else max(1, min(200, limit)),
+        max_videos=search_request.video_limit if search_request else None,
+        per_post_limit=search_request.per_post_limit if search_request else None,
+        media_type=search_request.media_type if search_request else "images",
         download=False,
     )
     result = _fetch_creator_with_fallback(client, request, account)
     items = [item for item in result.get("items", []) if isinstance(item, dict)]
-    return items[: max(1, limit)]
+    # The source normalizer and service apply separate image/video quotas.
+    # Slicing this gallery first can remove every later video in the account.
+    return items if search_request else items[: max(1, limit)]
 
 
 def _browser_storage_state(account: str | None = None) -> Path | None:
@@ -507,6 +513,9 @@ def _sync_fetch(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, An
             if not client.cookie:
                 raise RuntimeError("dy-cli login is required for creator retrieval")
             return _fetch_creator_with_fallback(client, request, args.account)
+        search_json = os.getenv("SOCIAL_IMAGE_SEARCH_REQUEST")
+        search_request = SearchRequest.model_validate_json(search_json) if search_json else None
+        media_type = search_request.media_type if search_request else "images"
         profile_share_url: str | None = None
         if args.url:
             # A homepage share is intentionally not accepted by
@@ -537,7 +546,7 @@ def _sync_fetch(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, An
                     cached_id = client.resolve_share_url(args.url)
                 except Exception:
                     cached_id = None
-            if cached_id and (cached := _load_cached_items(cached_id)) and len(cached) >= max(1, args.limit):
+            if cached_id and (cached := _load_cached_items(cached_id, media_type=media_type)) and len(cached) >= max(1, args.limit):
                 # The service applies the user's final media limit. Keep the
                 # complete cached gallery here so an exact post can be
                 # traversed without silently dropping later frames.
@@ -547,7 +556,7 @@ def _sync_fetch(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, An
             raise RuntimeError("dy-cli 未检测到抖音登录态，请先运行 scripts\\douyin_login.ps1 完成一次扫码登录")
 
         if profile_share_url:
-            return _creator_items_from_profile_share(client, profile_share_url, args.limit, args.account)
+            return _creator_items_from_profile_share(client, profile_share_url, args.limit, args.account, search_request=search_request)
 
         if args.item_id or args.url:
             item_id = args.item_id or client.resolve_share_url(args.url)
@@ -558,7 +567,7 @@ def _sync_fetch(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, An
                 # Retry through search only with an exact aweme_id match; never
                 # return a merely similar result for an ID request.
                 try:
-                    payload = client.search(item_id, search_type="atlas", count=20)
+                    payload = client.search(item_id, search_type="atlas" if media_type == "images" else "general", count=20)
                     record = _exact_record(_records(payload), item_id)
                 except DouyinAPIError:
                     record = None
@@ -569,8 +578,8 @@ def _sync_fetch(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, An
                     ) from detail_error
             if not isinstance(record, dict):
                 return []
-            result = normalize_native_record("douyin", record, "dy-cli")
-            _save_cached_items(result)
+            result = normalize_native_record("douyin", record, "dy-cli", media_type=media_type, include_video_covers=media_type == "images")
+            _save_cached_items(result, media_type=media_type)
             return result
 
         if not args.query.strip():
@@ -579,12 +588,12 @@ def _sync_fetch(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, An
         # ``verify_check`` or an empty atlas page while ordinary search still
         # works.  Falling back to general search lets us return video covers
         # and any image-text records instead of reporting a misleading zero.
-        payload = client.search(args.query, search_type="atlas", count=max(1, min(args.limit, 50)))
-        galleries = [normalize_native_record("douyin", record, "dy-cli") for record in _records(payload)]
+        payload = client.search(args.query, search_type="atlas" if media_type == "images" else "general", count=max(1, min(args.limit, 50)))
+        galleries = [normalize_native_record("douyin", record, "dy-cli", media_type=media_type, include_video_covers=media_type == "images") for record in _records(payload)]
         galleries = [gallery for gallery in galleries if gallery]
         if not galleries:
             fallback = client.search(args.query, search_type="general", count=max(1, min(args.limit, 50)))
-            fallback_galleries = [normalize_native_record("douyin", record, "dy-cli") for record in _records(fallback)]
+            fallback_galleries = [normalize_native_record("douyin", record, "dy-cli", media_type=media_type, include_video_covers=media_type == "images") for record in _records(fallback)]
             fallback_galleries = [gallery for gallery in fallback_galleries if gallery]
             if fallback_galleries:
                 payload = fallback
@@ -610,7 +619,7 @@ def _sync_fetch(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, An
                 break
             image_index += 1
         result = result[: max(1, args.limit)]
-        _save_cached_items(result)
+        _save_cached_items(result, media_type=media_type)
         return result
     except DouyinAPIError as exc:
         raise RuntimeError(f"dy-cli 抖音请求失败: {exc}") from exc

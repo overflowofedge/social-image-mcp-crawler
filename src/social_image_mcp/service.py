@@ -142,7 +142,7 @@ class SocialImageService:
         platforms = self._target_platforms(request, intent.identifier_platform)
         # Bump the namespace when relevance rules change so old low-quality
         # keyword results are never served from the persistent cache.
-        namespace = "search-v5-web-originals" if platforms == [Platform.OTHER] else "search-v4-media-limits"
+        namespace = "search-v5-web-originals" if platforms == [Platform.OTHER] else "search-v5-source-media"
         key = self.cache.key(namespace, request.model_dump(mode="json"), intent.normalized) if request.use_cache else None
         if key and (cached := self.cache.get(key)) is not None:
             return await self._refresh_cached_status(cached, platforms, request, key)
@@ -189,14 +189,14 @@ class SocialImageService:
                     if platform == Platform.WEIBO and getattr(media_crawler, "command_template", None):
                         # Prefer an already configured authenticated source;
                         # the public mobile endpoint is frequently rate limited.
-                        await collect("sources", self.sources.search(platform, intent, source_limit))
+                        await collect("sources", self.sources.search(platform, intent, source_limit, request=request))
                         if not candidates:
                             await collect("platform", adapter.search(intent, requested_total * 2, request.safe_mode))
                     else:
                         # Bilibili's bounded public API is the recommended source.
                         await collect("platform", adapter.search(intent, requested_total * 2, request.safe_mode))
                 else:
-                    await collect("sources", self.sources.search(platform, intent, source_limit))
+                    await collect("sources", self.sources.search(platform, intent, source_limit, request=request))
                 if platform not in (Platform.BILIBILI, Platform.WEIBO) and request.retrieval_mode == "sources" and getattr(adapter.status, "mode", "") == "browser-fallback":
                     await collect("browser", adapter.search(intent, requested_total, request.safe_mode))
             if request.retrieval_mode == "platform" or (request.retrieval_mode == "hybrid" and platform not in (Platform.BILIBILI, Platform.WEIBO)):
@@ -286,7 +286,9 @@ class SocialImageService:
                 vision_deferred = bool(self.vision.status.get("loading"))
                 ranked = ranked[:target_limit]
         else:
-            ranked = self._direct_items(all_candidates, requested_total, request.min_width, request.min_height)
+            # De-duplicate and validate the pool before applying separate
+            # quotas; an early combined cap can be filled entirely by images.
+            ranked = self._direct_items(all_candidates, len(all_candidates), request.min_width, request.min_height)
         ranked = self._apply_media_limits(ranked, request)
         # Report the same count the caller receives in ``items``.  The source
         # adapters intentionally fetch a larger shortlist for ranking, so the

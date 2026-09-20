@@ -9,12 +9,12 @@ class FakeSources:
     def statuses(self):
         return [{"name": "fake-source", "configured": True, "mode": "test", "detail": "", "platforms": ["xhs"]}]
 
-    async def search(self, platform, intent, limit):
+    async def search(self, platform, intent, limit, *, request=None):
         return [ImageCandidate(id="n1", platform=platform, image_url="https://cdn.test/n1.jpg", title="极简咖啡店室内", width=1600, height=900)]
 
 
 class FailingSources(FakeSources):
-    async def search(self, platform, intent, limit):
+    async def search(self, platform, intent, limit, *, request=None):
         raise RuntimeError("source unavailable")
 
 
@@ -50,3 +50,28 @@ def test_hybrid_keeps_discovery_candidates_when_source_fails(tmp_path):
 
 async def _discovery_candidate(platform):
     return [ImageCandidate(id="discovery", platform=platform, image_url="https://cdn.test/discovery.jpg", title="咖啡店")]
+
+
+def test_mixed_share_request_keeps_video_after_a_large_gallery(tmp_path):
+    class MixedSources(FakeSources):
+        async def search(self, platform, intent, limit, *, request=None):
+            assert request.media_type == "all"
+            assert request.max_posts == 17
+            images = [ImageCandidate(id=f"photo-{i}", platform=platform, image_url=f"https://cdn.test/{i}.jpg")
+                      for i in range(8)]
+            return images + [ImageCandidate(id="clip", platform=platform, image_url="https://cdn.test/play", media_type="video")]
+
+    async def run():
+        service = SocialImageService(Settings(cache_path=str(tmp_path / "cache.sqlite3"), vision_model=None))
+        await service.start()
+        try:
+            service.sources = MixedSources()
+            result = await service.search(SearchRequest(
+                query="https://v.douyin.com/share/", media_type="all", max_results=3,
+                image_limit=2, video_limit=1, max_posts=17, use_cache=False,
+            ))
+            assert [item["id"] for item in result["items"]] == ["photo-0", "photo-1", "clip"]
+        finally:
+            await service.close()
+
+    asyncio.run(run())

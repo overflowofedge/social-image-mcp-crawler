@@ -18,7 +18,7 @@ from typing import Any
 from urllib.parse import quote, urlparse
 
 from .intent import Intent, expand_token
-from .models import CreatorFetchRequest, CreatorIdentity, ImageCandidate, Platform
+from .models import CreatorFetchRequest, CreatorIdentity, ImageCandidate, Platform, SearchRequest
 
 
 class SourceError(RuntimeError):
@@ -264,6 +264,8 @@ def _number(value: Any, default: float = 0.0) -> float:
 
 def _media_type(metadata: dict[str, Any], image_url: str) -> str:
     """Infer whether a gallery-dl record is an image or downloadable video."""
+    if metadata.get("media_type") in {"image", "video"}:
+        return metadata["media_type"]
     values = [
         metadata.get("media_type"), metadata.get("mimetype"), metadata.get("mime_type"),
         metadata.get("content_type"), metadata.get("extension"), metadata.get("ext"),
@@ -308,8 +310,9 @@ def _candidate(platform: Platform, record: Any, image_url: str, index: int, sour
     )
 
 
-def normalize_source_output(platform: Platform, output: str, source_name: str, limit: int) -> list[ImageCandidate]:
+def normalize_source_output(platform: Platform, output: str, source_name: str, limit: int, media_type: str | None = None) -> list[ImageCandidate]:
     candidates: list[ImageCandidate] = []
+    counts = {"image": 0, "video": 0}
     for value in _json_values(output):
         for index, record in enumerate(_records(value)):
             # gallery-dl's [type, media_url, metadata] uses metadata.url for
@@ -319,11 +322,21 @@ def normalize_source_output(platform: Platform, output: str, source_name: str, l
                 if record[0] != 3 or len(record) <= 1:
                     continue
                 image_urls = _urls(record[1])
+            elif isinstance(record, dict) and record.get("image_url"):
+                # Normalized records carry a single media URL. The permalink
+                # and video thumbnail are metadata, not additional downloads.
+                image_urls = _urls(record["image_url"])
             else:
                 image_urls = _urls(record)
             for image_url in image_urls:
-                candidates.append(_candidate(platform, record, image_url, len(candidates) + index, source_name))
-                if len(candidates) >= limit:
+                item = _candidate(platform, record, image_url, len(candidates) + index, source_name)
+                if media_type in {"images", "videos"} and item.media_type != media_type[:-1]:
+                    continue
+                if media_type == "all" and counts[item.media_type] >= limit:
+                    continue
+                candidates.append(item)
+                counts[item.media_type] += 1
+                if media_type != "all" and len(candidates) >= limit:
                     return candidates
     return candidates
 
@@ -487,7 +500,7 @@ class ExternalJsonSource:
             self._failed(request.platform, detail, scope)
             raise SourceError(detail) from exc
 
-    async def search(self, platform: Platform, intent: Intent, limit: int) -> list[ImageCandidate]:
+    async def search(self, platform: Platform, intent: Intent, limit: int, *, request: SearchRequest | None = None) -> list[ImageCandidate]:
         if platform not in self.platforms:
             raise SourceUnavailable(f"{self.name} does not support {platform.value}")
         self._check_cooldown(platform)
@@ -504,6 +517,8 @@ class ExternalJsonSource:
             "PYTHONIOENCODING": "utf-8",
             "PYTHONUTF8": "1",
         })
+        if request is not None:
+            env["SOCIAL_IMAGE_SEARCH_REQUEST"] = request.model_dump_json()
         process: asyncio.subprocess.Process | None = None
         try:
             process = await asyncio.create_subprocess_exec(
@@ -534,7 +549,7 @@ class ExternalJsonSource:
             detail = _decode_process_output(stderr).strip()[-1000:]
             self._failed(platform, detail or f"exited with code {process.returncode}")
             raise SourceError(f"{self.name} exited with code {process.returncode}: {detail}")
-        candidates = normalize_source_output(platform, _decode_process_output(stdout), self.name, limit)
+        candidates = normalize_source_output(platform, _decode_process_output(stdout), self.name, limit, request.media_type if request else None)
         if not candidates:
             self._failed(platform, f"no image candidates returned for {platform.value}")
             raise SourceError(
@@ -693,7 +708,7 @@ class GalleryDlSource:
         command.extend(self._targets(platform, intent))
         return command
 
-    async def search(self, platform: Platform, intent: Intent, limit: int) -> list[ImageCandidate]:
+    async def search(self, platform: Platform, intent: Intent, limit: int, *, request: SearchRequest | None = None) -> list[ImageCandidate]:
         if platform not in self.platforms:
             raise SourceUnavailable(f"gallery-dl does not support {platform.value} in this integration")
         if not self.status.configured:
@@ -731,7 +746,7 @@ class GalleryDlSource:
         if error := _embedded_error(values):
             self._failed(platform, error)
             raise SourceError(f"gallery-dl {platform.value} request failed: {error}")
-        candidates = normalize_source_output(platform, output, "gallery-dl", limit)
+        candidates = normalize_source_output(platform, output, "gallery-dl", limit, request.media_type if request else None)
         if not candidates:
             self._failed(platform, f"no images returned for {platform.value}")
             raise SourceError(
@@ -838,7 +853,7 @@ class SourceHub:
             return await self.gallery_dl.fetch_creator(request)
         raise SourceUnavailable("creator retrieval currently supports only douyin and weibo")
 
-    async def search(self, platform: Platform, intent: Intent, limit: int) -> list[ImageCandidate]:
+    async def search(self, platform: Platform, intent: Intent, limit: int, *, request: SearchRequest | None = None) -> list[ImageCandidate]:
         sources: list[Any] = []
         if platform == Platform.DOUYIN and self.douyin_source.command_template:
             sources.append(self.douyin_source)
@@ -850,7 +865,7 @@ class SourceHub:
             sources.append(self.gallery_dl)
         if not sources:
             raise SourceUnavailable(f"No recommended source configured for {platform.value}; configure MediaCrawler/XHS-Downloader/gallery-dl")
-        results = await asyncio.gather(*(source.search(platform, intent, limit) for source in sources), return_exceptions=True)
+        results = await asyncio.gather(*(source.search(platform, intent, limit, request=request) for source in sources), return_exceptions=True)
         candidates: list[ImageCandidate] = []
         errors: list[str] = []
         for result in results:

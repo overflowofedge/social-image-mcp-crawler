@@ -99,6 +99,12 @@ class ImageDownloader:
                         # public. Use the mobile page because creator results
                         # and share links both resolve through m.weibo.cn.
                         headers["Referer"] = item.permalink or "https://m.weibo.cn/"
+                    elif item.platform.value == "douyin":
+                        # Douyin's signed play URL redirects to a CDN that
+                        # rejects direct clients without the site referer.
+                        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36"
+                        headers["Referer"] = item.permalink or "https://www.douyin.com/"
+                        headers["Origin"] = "https://www.douyin.com"
                     elif item.platform.value == "other" and item.permalink:
                         headers["Referer"] = item.permalink
                     response = await self.client.get(item.image_url, headers=headers, follow_redirects=True, timeout=30)
