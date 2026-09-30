@@ -42,6 +42,41 @@ def _configure_stdio() -> None:
             pass
 
 
+def _configure_browser_runtime() -> None:
+    """Use an installed Edge channel when Playwright's bundled Chromium is absent."""
+    channel = os.getenv("DOUYIN_BROWSER_CHANNEL") or os.getenv("BROWSER_CHANNEL")
+    executable = os.getenv("DOUYIN_BROWSER_PATH") or os.getenv("MEDIA_CRAWLER_BROWSER_PATH")
+    if not channel and not (executable and Path(executable).is_file()):
+        return
+    try:
+        import dy_cli.utils.signature as signature
+        from playwright.async_api import async_playwright
+    except Exception:
+        return
+    if getattr(signature, "_codex_browser_runtime", False):
+        return
+
+    async def get_sign_page():
+        if signature._SIGN_PAGE and not signature._SIGN_PAGE.is_closed():
+            return signature._SIGN_PAGE
+        signature._SIGN_PW = await async_playwright().start()
+        options: dict[str, Any] = {"headless": True}
+        if channel:
+            options["channel"] = channel
+        elif executable:
+            options["executable_path"] = executable
+        browser = await signature._SIGN_PW.chromium.launch(**options)
+        context = await browser.new_context()
+        page = await context.new_page()
+        await page.goto("https://www.douyin.com/", wait_until="domcontentloaded")
+        await page.wait_for_timeout(1200)
+        signature._SIGN_PAGE = page
+        return page
+
+    signature.get_sign_page = get_sign_page
+    signature._codex_browser_runtime = True
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="dy-cli JSON bridge")
     parser.add_argument("--query", default="")
@@ -49,6 +84,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--url", default="")
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--account", default=None)
+    parser.add_argument("--health-check", action="store_true", help="Run a lightweight authenticated source check")
     return parser
 
 
@@ -496,6 +532,7 @@ def _fetch_creator_with_fallback(client: Any, request: CreatorFetchRequest, acco
 
 
 def _sync_fetch(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, Any]:
+    _configure_browser_runtime()
     from dy_cli.engines.api_client import DouyinAPIClient, DouyinAPIError
     from dy_cli.utils.signature import close_sign_page
 
@@ -515,6 +552,16 @@ def _sync_fetch(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, An
             return _fetch_creator_with_fallback(client, request, args.account)
         search_json = os.getenv("SOCIAL_IMAGE_SEARCH_REQUEST")
         search_request = SearchRequest.model_validate_json(search_json) if search_json else None
+        if args.health_check:
+            if not client.cookie:
+                raise RuntimeError("dy-cli 未检测到抖音登录态，请先运行 scripts\\douyin_login.ps1 完成一次扫码登录")
+            payload = client.search("测试", search_type="general", count=1)
+            nil_info = payload.get("search_nil_info") if isinstance(payload, dict) else None
+            if isinstance(nil_info, dict) and nil_info.get("search_nil_type") == "verify_check":
+                raise RuntimeError("抖音返回 verify_check，当前网络或账号需要人工验证")
+            if isinstance(payload, dict) and payload.get("status_code", 0) not in (0, None):
+                raise RuntimeError(f"抖音健康检查失败: {payload.get('status_msg') or payload.get('status_code')}")
+            return {"ok": True, "cookie": True, "source": "dy-cli", "candidates": len(_records(payload))}
         media_type = search_request.media_type if search_request else "images"
         profile_share_url: str | None = None
         if args.url:

@@ -36,7 +36,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install_sources.ps1 -UseGit
 
 ## 启动
 
-双击 **启动应用.bat**。第一次启动也会自动检查并创建运行环境；浏览器打开后访问 `http://127.0.0.1:8765/`。关闭启动窗口即可停止应用。
+双击 **启动应用.bat**。启动时会先自动检查 Python 依赖、Playwright 浏览器、来源桥接、抖音 Cookie 和一次轻量抖音请求；缺少 Chromium 会尝试安装，检测到 Cookie 缺失或过期会打开扫码登录流程。检查结果保存在 `.cache\preflight-latest.json`，通过后浏览器打开 `http://127.0.0.1:8765/`。关闭启动窗口即可停止应用。
 
 ## 使用
 

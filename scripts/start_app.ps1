@@ -19,6 +19,28 @@ $env:MEDIA_CRAWLER_COMMAND = ('"{0}" "{1}" --platform {{platform}} --query "{{qu
 $env:DOUYIN_SOURCE_COMMAND = ('"{0}" "{1}" --query "{{query}}" --item-id "{{item_id}}" --url "{{url}}" --limit {{limit}}' -f $python, (Join-Path $ProjectRoot "scripts\douyin_cli_bridge.py"))
 $env:XHS_DOWNLOADER_COMMAND = ('"{0}" "{1}" --query "{{query}}" --item-id "{{item_id}}" --url "{{url}}" --limit {{limit}}' -f $python, (Join-Path $ProjectRoot "scripts\xhs_downloader_bridge.py"))
 $env:MEDIA_CRAWLER_ROOT = Join-Path $ProjectRoot "third_party\MediaCrawler"
+# Prefer an installed Microsoft Edge when Playwright's bundled Chromium has
+# not been downloaded yet. The bridge and webpage crawler both honor this
+# channel, so a missing cache does not break the whole startup chain.
+if (-not $env:BROWSER_CHANNEL) {
+    $envFile = Join-Path $ProjectRoot ".env"
+    if (Test-Path -LiteralPath $envFile) {
+        $channelLine = Get-Content -LiteralPath $envFile | Where-Object { $_ -match '^\s*BROWSER_CHANNEL\s*=' } | Select-Object -First 1
+        if ($channelLine) { $env:BROWSER_CHANNEL = ($channelLine -split '=', 2)[1].Trim().Trim('"') }
+    }
+}
+if (-not $env:BROWSER_CHANNEL) {
+    $edgeCandidates = @()
+    if (${env:ProgramFiles(x86)}) { $edgeCandidates += Join-Path ${env:ProgramFiles(x86)} "Microsoft\Edge\Application\msedge.exe" }
+    if ($env:ProgramFiles) { $edgeCandidates += Join-Path $env:ProgramFiles "Microsoft\Edge\Application\msedge.exe" }
+    if ($edgeCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1) { $env:BROWSER_CHANNEL = "msedge" }
+}
+$env:DOUYIN_BROWSER_CHANNEL = $env:BROWSER_CHANNEL
+# Check the complete local chain before opening the UI. The checker repairs
+# missing dependencies and can launch the existing Douyin QR login flow when
+# its storage state is missing or expired.
+& $python (Join-Path $ProjectRoot "scripts\preflight.py") --project-root $ProjectRoot --python $python
+if ($LASTEXITCODE -ne 0) { throw "启动前自检未通过。请按上面的提示修复后重试。" }
 $appArguments = @((Join-Path $ProjectRoot "scripts\app_server.py"), "--port", $Port)
 if ($NoBrowser) { $appArguments += "--no-browser" }
 & $python @appArguments

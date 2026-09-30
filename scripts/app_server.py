@@ -24,6 +24,7 @@ from social_image_mcp.server import search_images, service
 
 HTML = (ROOT / "scripts" / "app.html").read_text(encoding="utf-8")
 APP_ID = "social-image-mcp-desktop"
+PREFLIGHT_REPORT = ROOT / ".cache" / "preflight-latest.json"
 
 
 class LocalHTTPServer(ThreadingHTTPServer):
@@ -56,6 +57,14 @@ def _is_running_app(url: str) -> bool:
             if attempt < 2:
                 time.sleep(0.2)
     return False
+
+
+def _preflight_report() -> dict:
+    try:
+        payload = json.loads(PREFLIGHT_REPORT.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
 
 
 def _preview_referer(image_url: str, referer: str = "") -> str:
@@ -141,9 +150,9 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/app.js":
             self._send(200, (ROOT / "scripts" / "app.js").read_text(encoding="utf-8"), "application/javascript; charset=utf-8")
         elif parsed.path == "/api/health":
-            self._send(200, {"app": APP_ID, "root": str(ROOT)})
+            self._send(200, {"app": APP_ID, "root": str(ROOT), "preflight": _preflight_report()})
         elif parsed.path == "/api/status":
-            self._send(200, {"platforms": service.statuses(), "sources": service.source_statuses()})
+            self._send(200, {"platforms": service.statuses(), "sources": service.source_statuses(), "preflight": _preflight_report()})
         elif parsed.path == "/api/image":
             query = parse_qs(parsed.query)
             image_url = str((query.get("url") or [""])[0])
