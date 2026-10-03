@@ -106,6 +106,224 @@ def _creator_hint(query: str, selected_platform: str | None, detected: str | Non
     return compact.lstrip("@"), None
 
 
+_PLATFORM_LABELS = {
+    "douyin": "抖音", "xhs": "小红书", "weibo": "微博",
+    "bilibili": "B站", "x": "X", "instagram": "Instagram", "other": "自定义网页",
+}
+
+
+def _error_guidance(message: str, platform: str) -> tuple[str, str]:
+    """Translate source failures into a reason and an actionable next step."""
+    raw = str(message or "未知错误").strip()
+    lowered = raw.lower()
+    label = _PLATFORM_LABELS.get(platform, platform or "当前平台")
+    if "请输入搜索提示词或链接" in raw:
+        return "没有填写要采集的账号或网址。", "输入账号昵称、完整主页链接或作品链接后再试。"
+    if any(marker in lowered for marker in (
+        "verify_check", "wbi", "rate limit", "risk control", "验证码",
+        "api error -352", "api error -412", "http 412", "http 403", "http 429",
+        "temporarily rejected",
+    )):
+        action = "稍后重试，并确认平台登录状态正常。"
+        if platform == "douyin":
+            action = "重新运行抖音扫码登录，完成验证后再试；仍失败时稍后重试或更换网络。"
+        elif platform == "bilibili":
+            action = "稍后重试；频繁出现时，在 .env 中更新 BILIBILI_COOKIE 后重启桌面版。"
+        return f"{label}触发了访问频率限制或安全验证，本次请求被平台拒绝。", action
+    if any(marker in lowered for marker in ("cookie", "login", "logged in", "登录", "扫码", "unauthorized", "-101")):
+        return f"{label}登录状态缺失或已经失效。", "重新完成该平台登录或扫码验证，然后重启桌面版再试。"
+    if any(marker in lowered for marker in ("creator_identity_unresolved", "identity_unresolved", "matched 0", "not found", "没有找到")):
+        return "没有确认到唯一的账号，昵称可能不准确、存在同名账号，或账号未公开。", "核对完整昵称；仍无法识别时粘贴该账号的完整主页链接。"
+    if any(marker in lowered for marker in ("timed out", "timeout", "deadline", "超时")):
+        return "平台或下载服务器响应超时。", "先减少下载数量和“最多检索作品数”后重试，并检查网络连接。"
+    if any(marker in lowered for marker in ("no image candidates", "no candidates", "returned no", "没有置顶视频", "no video")):
+        return "平台没有返回当前类型的可下载内容。", "确认账号或作品为公开状态，并检查“只下载图片/视频”的选择；也可增加检索作品数。"
+    if any(marker in lowered for marker in ("below minimum dimensions", "minimum dimensions")):
+        return "文件尺寸低于允许的最小值，已跳过。", "降低最小尺寸要求，或选择包含更高清内容的作品。"
+    if any(marker in lowered for marker in ("dependency", "module not found", "no module named", "未安装")):
+        return "桌面版缺少运行依赖。", "重新运行“安装桌面版.bat”，完成后再启动应用。"
+    if any(marker in lowered for marker in ("connection", "connect", "network", "dns", "ssl", "request failed")):
+        return "访问平台或媒体服务器时网络连接失败。", "检查网络和代理设置后重试；也可减少单次任务数量。"
+    if any(marker in lowered for marker in ("content_filter_required", "required object", "no image matched")):
+        return "严格内容筛选没有找到符合条件的内容。", "放宽内容筛选条件，或将筛选模式改为“尽量筛选”。"
+    return f"{label}任务未完成：{raw}", "检查账号或网址是否公开、登录状态和网络连接，然后重试。"
+
+
+def _warning_guidance(message: str, platform: str) -> tuple[str, str]:
+    """Translate partial-result warnings without presenting them as fatal errors."""
+    raw = str(message or "未知提醒").strip()
+    lowered = raw.lower()
+    label = _PLATFORM_LABELS.get(platform, platform or "当前平台")
+    if "creator timeline unavailable" in lowered:
+        return f"{label}账号作品列表暂时无法完整读取，已保留其他方式找到的内容。", "稍后重试；频繁出现时更新该平台 Cookie 或重新登录。"
+    if "video url unavailable" in lowered:
+        return "部分作品没有取得可直接下载的视频地址。", "确认作品可以公开播放后重试，或减少单次检索作品数。"
+    if "missing or mismatched author" in lowered:
+        return "部分作品的作者信息与目标账号不一致，已为避免下载错账号而跳过。", "优先使用完整主页链接；用昵称时请确认没有同名账号。"
+    if "missing publication date" in lowered:
+        return "部分作品没有发布时间，无法按发布时间完整排序。", "下载结果仍可使用；需要严格时间顺序时请稍后重试。"
+    if "filter" in lowered or "筛选" in raw:
+        return "部分内容无法完成筛选，已按当前筛选模式处理可用结果。", "需要严格筛选时检查本地模型后重试；否则可使用“尽量筛选”。"
+    if "hls" in lowered or "dash" in lowered:
+        return "页面中的部分视频是分段流，当前无法作为单个视频文件直接下载。", "改用该视频的作品链接，或选择平台专用采集链路。"
+    if "动态页面" in raw or "详情页" in raw or "time" in lowered:
+        return "部分动态页面或详情页没有读取完成，已保留成功找到的内容。", "减少“最多检索作品数”后重试，并检查网络连接。"
+    return f"{label}返回了部分结果：{raw}", "查看实际数量；如未达到目标，可稍后重试或减少单次任务数量。"
+
+
+def _task_report(body: dict, result: dict, elapsed_seconds: float) -> dict:
+    """Build a stable, user-facing account of requested and actual results."""
+    platform = str((body.get("platforms") or [""])[0] or "")
+    media_type = str(body.get("media_type") or "images")
+    requested = {
+        "images": int(body.get("image_limit") or 0) if media_type != "videos" else 0,
+        "videos": int(body.get("video_limit") or 0) if media_type != "images" else 0,
+        "max_posts": int(body.get("max_posts") or 0),
+        "per_post_limit": int(body.get("per_post_limit") or 0) if media_type != "videos" else 0,
+    }
+    items = [item for item in result.get("items", []) if isinstance(item, dict)]
+    downloads = [item for item in result.get("downloads", []) if isinstance(item, dict)]
+    by_id = {str(item.get("id") or ""): str(item.get("media_type") or "image") for item in items}
+    found = {"images": 0, "videos": 0}
+    for item in items:
+        found["videos" if item.get("media_type") == "video" else "images"] += 1
+    status_counts = {
+        name: {"images": 0, "videos": 0}
+        for name in ("downloaded", "existing", "duplicate", "rejected", "failed")
+    }
+    failure_messages: list[str] = []
+    for record in downloads:
+        status_name = str(record.get("status") or "failed")
+        if status_name not in status_counts:
+            status_name = "failed"
+        media = str(record.get("media_type") or by_id.get(str(record.get("candidate_id") or ""), "image"))
+        bucket = "videos" if media == "video" else "images"
+        status_counts[status_name][bucket] += 1
+        if status_name in {"failed", "rejected"} and record.get("error"):
+            failure_messages.append(str(record["error"]))
+
+    logs: list[dict[str, str]] = []
+    target_parts = []
+    if requested["images"]:
+        target_parts.append(f"{requested['images']} 张图片")
+    if requested["videos"]:
+        target_parts.append(f"{requested['videos']} 个视频")
+    scope = f"，最多检查 {requested['max_posts']} 个作品" if requested["max_posts"] else ""
+    logs.append({"level": "info", "message": f"目标：{'，'.join(target_parts) or '检索媒体'}{scope}。"})
+    if requested["images"] > 200 or requested["videos"] > 200 or requested["max_posts"] > 100:
+        logs.append({
+            "level": "warning",
+            "message": "这是大批量任务，程序会分页采集并继续使用增量去重。",
+            "action": "请保持桌面版运行；CLI 仍受平台访问频率和登录状态限制，遇到验证时请按后续日志处理。",
+        })
+
+    identity = result.get("identity") if isinstance(result.get("identity"), dict) else None
+    if identity:
+        account = str(identity.get("name") or identity.get("canonical_id") or "已确认账号")
+        logs.append({"level": "success", "message": f"已确认账号：{account}。"})
+
+    actual_parts = []
+    if requested["images"]:
+        actual_parts.append(f"找到 {found['images']} 张图片")
+    if requested["videos"]:
+        actual_parts.append(f"找到 {found['videos']} 个视频")
+    logs.append({"level": "info", "message": f"采集结果：{'，'.join(actual_parts) or '没有找到媒体'}。"})
+
+    new_total = sum(status_counts["downloaded"].values())
+    existing_total = sum(status_counts["existing"].values())
+    duplicate_total = sum(status_counts["duplicate"].values())
+    rejected_total = sum(status_counts["rejected"].values())
+    failed_total = sum(status_counts["failed"].values())
+    if downloads:
+        logs.append({
+            "level": "success" if not failed_total and not rejected_total else "warning",
+            "message": (
+                f"保存结果：新下载 {new_total} 个，已存在 {existing_total} 个，"
+                f"重复跳过 {duplicate_total} 个，规则拒绝 {rejected_total} 个，失败 {failed_total} 个。"
+            ),
+        })
+
+    issues: list[dict[str, str]] = []
+    raw_errors: list[str] = []
+    top_error = result.get("error")
+    if isinstance(top_error, dict) and top_error.get("message"):
+        raw_errors.append(str(top_error["message"]))
+    elif isinstance(top_error, str) and top_error:
+        raw_errors.append(top_error)
+    platform_results = result.get("platforms") if isinstance(result.get("platforms"), dict) else {}
+    for entry in platform_results.values():
+        error = entry.get("error") if isinstance(entry, dict) else None
+        if isinstance(error, dict) and error.get("message"):
+            raw_errors.append(str(error["message"]))
+        elif isinstance(error, str) and error:
+            raw_errors.append(error)
+    raw_errors.extend(failure_messages)
+    for raw_error in dict.fromkeys(raw_errors):
+        reason, action = _error_guidance(raw_error, platform)
+        issues.append({"reason": reason, "action": action, "technical_message": raw_error})
+
+    raw_warnings = [str(value) for value in result.get("warnings", []) if value]
+    for key in ("filter_warning", "object_detection_error"):
+        if result.get(key):
+            raw_warnings.append(str(result[key]))
+    for raw_warning in dict.fromkeys(raw_warnings):
+        reason, action = _warning_guidance(raw_warning, platform)
+        issues.append({"reason": reason, "action": action, "technical_message": raw_warning})
+
+    filtered = int(result.get("rejected_by_content_filter") or 0)
+    if filtered:
+        issues.append({
+            "reason": f"内容筛选排除了 {filtered} 个候选。",
+            "action": "放宽内容描述或筛选模式后重试。",
+            "technical_message": "content filter rejected candidates",
+        })
+
+    successful = {
+        media: status_counts["downloaded"][media] + status_counts["existing"][media]
+        for media in ("images", "videos")
+    }
+    shortfalls = {
+        media: max(0, requested[media] - (successful[media] if body.get("download", True) else found[media]))
+        for media in ("images", "videos")
+    }
+    for media, unit in (("images", "张图片"), ("videos", "个视频")):
+        if not shortfalls[media] or raw_errors:
+            continue
+        reason = f"实际可用数量比目标少 {shortfalls[media]} {unit}。"
+        action = "增加“最多检索作品数”后重试；若仍不足，说明平台当前可访问内容少于目标。"
+        if media == "images" and requested["per_post_limit"] and requested["max_posts"]:
+            capacity = requested["per_post_limit"] * requested["max_posts"]
+            if requested["images"] > capacity:
+                reason = f"当前设置理论最多只能取得 {capacity} 张图片，低于目标 {requested['images']} 张。"
+                action = "提高“最多检索作品数”或“每个作品最多张数”。"
+        if not items and result.get("refresh_count") and result.get("post_ids"):
+            reason = "没有新增文件；该账号已发现的作品之前已经处理过。"
+            action = "这是增量采集的正常结果，等待账号发布新作品后再次运行。"
+        issues.append({"reason": reason, "action": action, "technical_message": "requested quantity was not fulfilled"})
+
+    error_messages = set(raw_errors)
+    for issue in issues:
+        level = "error" if issue["technical_message"] in error_messages else "warning"
+        logs.append({"level": level, "message": issue["reason"], "action": issue["action"]})
+    if result.get("output_dir"):
+        logs.append({"level": "info", "message": f"保存目录：{result['output_dir']}"})
+    logs.append({"level": "info", "message": f"任务耗时：{elapsed_seconds:.1f} 秒。"})
+
+    requested_total = requested["images"] + requested["videos"]
+    available_total = successful["images"] + successful["videos"] if body.get("download", True) else found["images"] + found["videos"]
+    report_status = "failed" if raw_errors and available_total == 0 else ("partial" if issues or available_total < requested_total else "success")
+    return {
+        "status": report_status,
+        "requested": requested,
+        "found": found,
+        "downloads": status_counts,
+        "successful": successful,
+        "shortfalls": shortfalls,
+        "issues": issues,
+        "logs": logs,
+    }
+
+
 async def _fetch_preview(image_url: str, referer: str = "") -> tuple[str, bytes]:
     parsed = urlparse(image_url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -195,6 +413,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         if urlparse(self.path).path != "/api/search":
             self._send(404, {"error": "not found"}); return
+        started = time.monotonic()
+        body: dict = {}
         try:
             length = int(self.headers.get("Content-Length", "0"))
             body = json.loads(self.rfile.read(length).decode("utf-8"))
@@ -235,9 +455,18 @@ class Handler(BaseHTTPRequestHandler):
                     "creator_identity_unresolved", "identity_unresolved",
                 )):
                     result = self.runner.call(search_images(**search_kwargs, creator_name=None, creator_id=None))
+            if not isinstance(result, dict):
+                raise ValueError("采集服务返回了无法识别的结果")
+            result["task_report"] = _task_report(body, result, time.monotonic() - started)
             self._send(200, result)
         except Exception as exc:
-            self._send(400, {"error": str(exc)})
+            error_result = {
+                "items": [],
+                "downloads": [],
+                "error": {"code": "request_error", "message": str(exc)},
+            }
+            error_result["task_report"] = _task_report(body, error_result, time.monotonic() - started)
+            self._send(400, error_result)
 
 
 def main() -> None:

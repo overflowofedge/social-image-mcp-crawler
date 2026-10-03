@@ -468,7 +468,8 @@ class ExternalJsonSource:
                 *command, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE, env=env, **_process_spawn_options(),
             )
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=self.timeout_seconds)
+            task_timeout = min(600.0, max(float(self.timeout_seconds), 30.0 + request.max_posts * 0.9))
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=task_timeout)
             if process.returncode:
                 detail = f"{self.name} creator request failed: {_decode_process_output(stderr)[-1500:]}"
                 raise SourceError(detail)
@@ -480,7 +481,7 @@ class ExternalJsonSource:
             return result
         except asyncio.TimeoutError as exc:
             await _terminate_process_tree(process)
-            detail = f"{self.name} creator request timed out after {self.timeout_seconds}s"
+            detail = f"{self.name} creator request timed out after {task_timeout:.0f}s"
             self._failed(request.platform, detail, scope)
             raise SourceError(detail) from exc
         except asyncio.CancelledError:

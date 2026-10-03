@@ -34,10 +34,10 @@ def test_unknown_url_is_routed_to_other_platform():
 
 
 def test_combined_media_limits_accept_the_desktop_total():
-    request = SearchRequest(query="https://example.org/", max_results=400, image_limit=200, video_limit=200, media_type="all")
-    assert request.max_results == 400
+    request = SearchRequest(query="https://example.org/", max_results=2000, image_limit=1000, video_limit=1000, media_type="all")
+    assert request.max_results == 2000
     with pytest.raises(ValueError, match="single media type"):
-        SearchRequest(query="https://example.org/", max_results=400, media_type="images")
+        SearchRequest(query="https://example.org/", max_results=2000, media_type="images")
 
 
 def test_webpage_adapter_extracts_main_and_lazy_images():

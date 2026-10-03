@@ -26,6 +26,48 @@ from social_image_mcp.intent import parse_intent
 from social_image_mcp.models import CreatorFetchRequest, SearchRequest
 
 
+async def _fetch_creator_pages(api: BilibiliApi, request: CreatorFetchRequest) -> dict:
+    """Collect bounded creator pages inside the isolated Bilibili process."""
+    cursor = request.cursor
+    remaining = request.max_posts
+    identity = None
+    items: dict[str, object] = {}
+    post_ids: list[str] = []
+    warnings: list[str] = []
+    rejected_posts = 0
+    posts_fetched = 0
+    pages_fetched = 0
+    page_limit = min(50, max(1, (request.max_posts + 9) // 10))
+    while remaining > 0 and pages_fetched < page_limit:
+        page_request = request.model_copy(update={"cursor": cursor, "max_posts": remaining})
+        result = await api.fetch_creator(page_request)
+        identity = identity or result.identity
+        for item in result.items:
+            items[item.stable_key] = item
+        post_ids.extend(result.post_ids)
+        warnings.extend(result.warnings)
+        rejected_posts += result.rejected_posts
+        posts_fetched += result.posts_fetched
+        pages_fetched += result.pages_fetched
+        remaining -= result.posts_fetched
+        cursor = result.next_cursor
+        if not cursor or result.posts_fetched <= 0:
+            break
+        await asyncio.sleep(max(0.1, float(os.getenv("BILIBILI_CREATOR_SLEEP_SECONDS", "0.5"))))
+    if identity is None:
+        raise RuntimeError("Bilibili creator retrieval returned no identity")
+    return {
+        "identity": identity.model_dump(mode="json") | {"source": "bilibili-cli"},
+        "items": [item.model_dump(mode="json") for item in items.values()],
+        "posts_fetched": posts_fetched,
+        "next_cursor": cursor,
+        "post_ids": list(dict.fromkeys(post_ids)),
+        "rejected_posts": rejected_posts,
+        "pages_fetched": pages_fetched,
+        "warnings": list(dict.fromkeys(warnings)),
+    }
+
+
 def _configure_stdio() -> None:
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -69,17 +111,8 @@ async def _run(args: argparse.Namespace) -> None:
         raw_creator = os.getenv("SOCIAL_IMAGE_CREATOR_REQUEST")
         if raw_creator:
             request = CreatorFetchRequest.model_validate_json(raw_creator)
-            result = await api.fetch_creator(request)
-            print(json.dumps({
-                "identity": result.identity.model_dump(mode="json") | {"source": "bilibili-cli"},
-                "items": [item.model_dump(mode="json") for item in result.items],
-                "posts_fetched": result.posts_fetched,
-                "next_cursor": result.next_cursor,
-                "post_ids": list(result.post_ids),
-                "rejected_posts": result.rejected_posts,
-                "pages_fetched": result.pages_fetched,
-                "warnings": list(result.warnings),
-            }, ensure_ascii=False, separators=(",", ":")))
+            result = await _fetch_creator_pages(api, request)
+            print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
             return
 
         raw = args.url or args.item_id or args.query
@@ -87,7 +120,7 @@ async def _run(args: argparse.Namespace) -> None:
         request = SearchRequest.model_validate_json(raw_request) if raw_request else None
         items = await api.search(
             parse_intent(raw),
-            max(1, min(args.limit, 100)),
+            max(1, min(args.limit, 1000)),
             media_type=request.media_type if request else "images",
             image_limit=request.image_limit if request else None,
             video_limit=request.video_limit if request else None,

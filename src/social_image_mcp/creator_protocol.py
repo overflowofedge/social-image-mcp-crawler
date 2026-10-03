@@ -220,7 +220,8 @@ class CreatorCollector:
             raise ValueError("creator_cursor_stalled: platform did not return an advancing cursor")
         self.native, self.offset = str(next_native), 0
         self.next_cursor = pack_cursor(self.native)
-        return self.posts_fetched < self.request.max_posts and self.pages_fetched < 10
+        page_limit = min(100, max(10, (self.request.max_posts + 9) // 10))
+        return self.posts_fetched < self.request.max_posts and self.pages_fetched < page_limit
 
     def result(self) -> dict[str, Any]:
         return {"identity": self.identity.model_dump(mode="json"), "items": self.items,

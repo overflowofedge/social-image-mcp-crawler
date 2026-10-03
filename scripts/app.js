@@ -8,6 +8,54 @@ const mediaType = $("media_type");
 const imageLimit = $("image_limit");
 const videoLimit = $("video_limit");
 const perPostLimit = $("per_post_limit");
+const maxPosts = $("max_posts");
+
+const platformLabels = {
+  douyin: "抖音", weibo: "微博", x: "X", xhs: "小红书",
+  bilibili: "B站", instagram: "Instagram", other: "自定义网页"
+};
+
+function renderLogEntries(entries) {
+  status.innerHTML = "";
+  const labels = {info: "信息", success: "成功", warning: "提醒", error: "错误"};
+  const safeEntries = Array.isArray(entries) && entries.length ? entries : [
+    {level: "error", message: "任务没有返回可读取的运行日志。", action: "重试一次；仍然失败时请重启桌面版。"}
+  ];
+  safeEntries.forEach(entry => {
+    const level = labels[entry.level] ? entry.level : "info";
+    const row = document.createElement("div");
+    row.className = `log-line log-${level}`;
+    const badge = document.createElement("span");
+    badge.className = "log-level";
+    badge.textContent = labels[level];
+    const content = document.createElement("div");
+    const message = document.createElement("div");
+    message.textContent = entry.message || "";
+    content.appendChild(message);
+    if (entry.action) {
+      const action = document.createElement("div");
+      action.className = "log-action";
+      action.textContent = `处理建议：${entry.action}`;
+      content.appendChild(action);
+    }
+    row.append(badge, content);
+    status.appendChild(row);
+  });
+}
+
+function renderTaskReport(report, fallbackData = {}) {
+  if (report && Array.isArray(report.logs)) {
+    renderLogEntries(report.logs);
+    return;
+  }
+  const rawError = fallbackData && fallbackData.error;
+  const message = typeof rawError === "string" ? rawError : rawError && rawError.message;
+  renderLogEntries([{
+    level: "error",
+    message: message ? `任务失败：${message}` : "任务失败，服务器没有返回详细原因。",
+    action: "检查账号或网址、平台登录状态和网络连接后重试。"
+  }]);
+}
 
 function updateDownloadSummary() {
   const count = input => input.value || "—";
@@ -18,7 +66,13 @@ function updateDownloadSummary() {
   if (mediaType.value !== "images") {
     limits.push(`最多 ${count(videoLimit)} 个视频`);
   }
-  $("download_summary").textContent = `本次下载：${limits.join("，")}。实际数量以找到的可下载内容为准。`;
+  const notes = [`本次目标：${limits.join("，")}。数量是目标上限，完成日志会说明实际数量和不足原因。`];
+  const imageTarget = Number(imageLimit.value);
+  const capacity = Number(maxPosts.value) * Number(perPostLimit.value);
+  if (mediaType.value !== "videos" && imageTarget > 0 && capacity > 0 && imageTarget > capacity) {
+    notes.push(`当前设置理论最多取得 ${capacity} 张图片；请增加“最多检索作品数”或“每个作品最多张数”。`);
+  }
+  $("download_summary").textContent = notes.join(" ");
 }
 
 function syncMediaLimits() {
@@ -59,7 +113,7 @@ function renderWorks(works) {
 }
 
 mediaType.addEventListener("change", syncMediaLimits);
-[imageLimit, videoLimit, perPostLimit].forEach(input => input.addEventListener("input", updateDownloadSummary));
+[imageLimit, videoLimit, perPostLimit, maxPosts].forEach(input => input.addEventListener("input", updateDownloadSummary));
 syncMediaLimits();
 
 form.addEventListener("submit", async event => {
@@ -68,7 +122,6 @@ form.addEventListener("submit", async event => {
   button.disabled = true;
   itemsBox.innerHTML = "";
   renderWorks([]);
-  status.textContent = "正在采集并下载，请稍候…";
   const platform = document.querySelector('input[name="platform"]:checked').value;
   const mediaTypeValue = mediaType.value;
   const imageLimitValue = mediaTypeValue !== "videos" ? Number(imageLimit.value) : null;
@@ -88,14 +141,26 @@ form.addEventListener("submit", async event => {
     filter_mode: $("filter_mode").value,
     quality_mode: $("quality_mode").value
   };
+  const targets = [];
+  if (imageLimitValue) targets.push(`${imageLimitValue} 张图片`);
+  if (videoLimitValue) targets.push(`${videoLimitValue} 个视频`);
+  renderLogEntries([
+    {level: "info", message: `开始采集${platformLabels[platform] || platform}，目标为 ${targets.join("、")}。`},
+    {level: "info", message: `本次最多检查 ${body.max_posts} 个作品，请稍候。`}
+  ]);
   try {
     const response = await fetch("/api/search", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify(body)
     });
-    const data = await response.json();
-    status.textContent = JSON.stringify(data, null, 2);
+    let data;
+    try {
+      data = await response.json();
+    } catch (_error) {
+      throw new Error(`服务器返回内容无法读取（HTTP ${response.status}）`);
+    }
+    renderTaskReport(data.task_report, data);
     renderWorks(data.works);
     (data.items || []).forEach(item => {
       const card = document.createElement("div");
@@ -125,7 +190,11 @@ form.addEventListener("submit", async event => {
       itemsBox.appendChild(card);
     });
   } catch (error) {
-    status.textContent = "请求失败：" + error;
+    renderLogEntries([{
+      level: "error",
+      message: `无法连接到桌面采集服务：${error.message || error}`,
+      action: "确认桌面版仍在运行，并检查网络连接后重试。"
+    }]);
   } finally {
     button.disabled = false;
   }

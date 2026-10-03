@@ -63,8 +63,16 @@ class CreatorImageService:
         started = time.monotonic()
         try:
             lock = self._locks.setdefault(self._request_key(request), asyncio.Lock())
+            media_target = request.max_images + (request.max_videos or 0)
+            task_timeout = min(
+                1800.0,
+                max(
+                    float(self.settings.creator_timeout_seconds),
+                    60.0 + request.max_posts * 0.75 + media_target * 1.25,
+                ),
+            )
             async with lock:
-                result = await asyncio.wait_for(self._fetch(request), timeout=self.settings.creator_timeout_seconds)
+                result = await asyncio.wait_for(self._fetch(request), timeout=task_timeout)
         except asyncio.TimeoutError:
             result = {"items": [], "downloads": [], "error": {"code": "creator_timeout", "message": "Account retrieval reached its deadline. Retry with resume=true; completed files and pending items were retained."}}
         except (ValueError, SourceError, BilibiliError, WeiboError) as exc:

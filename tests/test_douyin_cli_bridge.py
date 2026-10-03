@@ -212,3 +212,28 @@ def test_browser_post_response_ignores_wrong_resume_cursor():
     payload = {"aweme_list": [], "max_cursor": 36, "has_more": False}
     assert _browser_items_from_payload(payload, identity, request, collector, "https://www.douyin.com/aweme/v1/web/aweme/post/?max_cursor=0") is False
     assert collector.pages_fetched == 0
+
+
+def test_large_creator_request_can_continue_beyond_ten_pages():
+    from social_image_mcp.models import CreatorFetchRequest, CreatorIdentity, Platform
+    from social_image_mcp.creator_protocol import CreatorCollector
+
+    identity = CreatorIdentity(
+        platform=Platform.DOUYIN, requested_id="sec-1", canonical_id="sec-1",
+        source="test", matched_by="sec_uid",
+    )
+    request = CreatorFetchRequest(
+        platform=Platform.DOUYIN, creator_id="sec-1", max_posts=500,
+        max_images=1000, download=False,
+    )
+    collector = CreatorCollector(identity, request)
+
+    for page in range(1, 12):
+        should_continue = collector.consume(
+            [{"aweme_id": f"post-{page}", "author": {"sec_uid": "sec-1"}}],
+            page,
+            True,
+        )
+        assert should_continue is True
+
+    assert collector.pages_fetched == 11
