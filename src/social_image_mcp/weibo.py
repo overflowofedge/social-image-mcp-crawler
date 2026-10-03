@@ -75,7 +75,22 @@ class WeiboApi:
                 follow_redirects=True,
             )
             response.raise_for_status()
-            payload = response.json()
+            if "json" not in response.headers.get("content-type", "").lower():
+                raise WeiboError(
+                    f"weibo public API returned HTTP {response.status_code} with a non-JSON response; "
+                    "the session may require login or verification"
+                )
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise WeiboError(
+                    f"weibo public API returned HTTP {response.status_code} with invalid JSON; "
+                    "the session may require login or verification"
+                ) from exc
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            detail = "; the session may require login or verification" if status in (401, 403, 418, 432) else ""
+            raise WeiboError(f"weibo public API returned HTTP {status}{detail}") from exc
         except (httpx.HTTPError, ValueError) as exc:
             raise WeiboError(f"weibo public api request failed: {exc}") from exc
         if not isinstance(payload, dict):
@@ -85,15 +100,15 @@ class WeiboApi:
         return payload
 
     @staticmethod
-    def _candidates(row: dict[str, Any], identity: CreatorIdentity | None = None) -> list[ImageCandidate]:
+    def _candidates(row: dict[str, Any], identity: CreatorIdentity | None = None, media_type: str = "images", include_video_covers: bool = False) -> list[ImageCandidate]:
         source = "weibo-public-api"
-        values = normalize_native_record("weibo", {"mblog": row}, source, media_type="images")
+        values = normalize_native_record("weibo", {"mblog": row}, source, media_type=media_type, include_video_covers=include_video_covers)
         result: list[ImageCandidate] = []
         for index, value in enumerate(values, 1):
             if not isinstance(value, dict) or not value.get("image_url"):
                 continue
             value["platform"] = Platform.WEIBO
-            value["media_type"] = "image"
+            value["media_type"] = value.get("media_type") or "image"
             value["media_index"] = int(value.get("media_index") or index)
             value["post_id"] = str(value.get("post_id") or row.get("bid") or row.get("idstr") or row.get("id") or "")
             value["id"] = f"{value['post_id']}:{value['media_index']}"
@@ -137,9 +152,16 @@ class WeiboApi:
                 if name == request.creator_name.strip() and uid:
                     unique[uid] = user
             if len(unique) != 1:
-                raise WeiboError(f"creator_identity_unresolved: exact nickname matched {len(unique)} users")
+                raise WeiboError(f"creator_identity_unresolved: exact nickname matched {len(unique)} users; provide the full Weibo profile URL")
             uid = next(iter(unique))
-            profile = unique[uid]
+            profile_payload = await self._get(
+                "/api/container/getIndex",
+                {"type": "uid", "value": uid, "containerid": f"100505{uid}"},
+            )
+            profile_data = profile_payload.get("data") if isinstance(profile_payload.get("data"), dict) else {}
+            profile = profile_data.get("userInfo") if isinstance(profile_data.get("userInfo"), dict) else {}
+            if str(profile.get("idstr") or profile.get("id") or "") != uid or _text(profile.get("screen_name")) != request.creator_name.strip():
+                raise WeiboError("creator_identity_mismatch: Weibo profile did not confirm the requested nickname")
             return CreatorIdentity(
                 platform=Platform.WEIBO, requested_id=requested, canonical_id=uid,
                 name=_text(profile.get("screen_name") or profile.get("name")),
@@ -152,7 +174,7 @@ class WeiboApi:
         )
         data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
         profile = data.get("userInfo") if isinstance(data.get("userInfo"), dict) else {}
-        confirmed = str(profile.get("id") or profile.get("idstr") or uid)
+        confirmed = str(profile.get("idstr") or profile.get("id") or "")
         if confirmed != uid:
             raise WeiboError("creator_identity_mismatch: Weibo profile UID differs from the requested UID")
         return CreatorIdentity(
@@ -185,10 +207,11 @@ class WeiboApi:
     async def fetch_creator(self, request: CreatorFetchRequest) -> WeiboCreatorResult:
         identity = await self.resolve_identity(request)
         native, _ = unpack_cursor(request.cursor)
-        page = max(1, int(native or "1"))
+        since_id = native or "0"
         payload = await self._get(
             "/api/container/getIndex",
-            {"type": "uid", "value": identity.canonical_id, "containerid": f"107603{identity.canonical_id}", "page": page},
+            {"jumpfrom": "weibocom", "type": "uid", "value": identity.canonical_id,
+             "containerid": f"107603{identity.canonical_id}", "since_id": since_id},
         )
         data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
         rows = _cards(data.get("cards"))[: request.max_posts]
@@ -204,12 +227,11 @@ class WeiboApi:
             post_id = str(row.get("bid") or row.get("idstr") or row.get("id") or "")
             if post_id:
                 post_ids.append(post_id)
-            if request.media_type != "videos":
-                items.extend(self._candidates(row, identity))
+            items.extend(self._candidates(row, identity, request.media_type, request.include_video_covers))
         info = data.get("cardlistInfo") if isinstance(data.get("cardlistInfo"), dict) else {}
-        has_more = bool(info.get("since_id")) or len(rows) >= request.max_posts
-        next_cursor = pack_cursor(page + 1) if rows and has_more else None
-        warnings = ("Weibo public API exposes image posts only; video requests require the MediaCrawler fallback",) if request.media_type in ("videos", "all") else ()
+        next_native = str(info.get("since_id") or "0")
+        has_more = next_native not in ("", "0", since_id)
+        next_cursor = pack_cursor(next_native) if rows and has_more else None
         return WeiboCreatorResult(
             identity=identity,
             items=items,
@@ -218,5 +240,5 @@ class WeiboApi:
             post_ids=tuple(dict.fromkeys(post_ids)),
             rejected_posts=rejected,
             pages_fetched=1,
-            warnings=warnings,
+            warnings=(),
         )

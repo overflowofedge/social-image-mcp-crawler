@@ -18,7 +18,7 @@ from typing import Any
 from urllib.parse import quote, urlparse
 
 from .intent import Intent, expand_token
-from .models import CreatorFetchRequest, CreatorIdentity, ImageCandidate, Platform
+from .models import CreatorFetchRequest, CreatorIdentity, ImageCandidate, Platform, SearchRequest
 
 
 class SourceError(RuntimeError):
@@ -264,6 +264,8 @@ def _number(value: Any, default: float = 0.0) -> float:
 
 def _media_type(metadata: dict[str, Any], image_url: str) -> str:
     """Infer whether a gallery-dl record is an image or downloadable video."""
+    if metadata.get("media_type") in {"image", "video"}:
+        return metadata["media_type"]
     values = [
         metadata.get("media_type"), metadata.get("mimetype"), metadata.get("mime_type"),
         metadata.get("content_type"), metadata.get("extension"), metadata.get("ext"),
@@ -308,8 +310,9 @@ def _candidate(platform: Platform, record: Any, image_url: str, index: int, sour
     )
 
 
-def normalize_source_output(platform: Platform, output: str, source_name: str, limit: int) -> list[ImageCandidate]:
+def normalize_source_output(platform: Platform, output: str, source_name: str, limit: int, media_type: str | None = None) -> list[ImageCandidate]:
     candidates: list[ImageCandidate] = []
+    counts = {"image": 0, "video": 0}
     for value in _json_values(output):
         for index, record in enumerate(_records(value)):
             # gallery-dl's [type, media_url, metadata] uses metadata.url for
@@ -319,11 +322,21 @@ def normalize_source_output(platform: Platform, output: str, source_name: str, l
                 if record[0] != 3 or len(record) <= 1:
                     continue
                 image_urls = _urls(record[1])
+            elif isinstance(record, dict) and record.get("image_url"):
+                # Normalized records carry a single media URL. The permalink
+                # and video thumbnail are metadata, not additional downloads.
+                image_urls = _urls(record["image_url"])
             else:
                 image_urls = _urls(record)
             for image_url in image_urls:
-                candidates.append(_candidate(platform, record, image_url, len(candidates) + index, source_name))
-                if len(candidates) >= limit:
+                item = _candidate(platform, record, image_url, len(candidates) + index, source_name)
+                if media_type in {"images", "videos"} and item.media_type != media_type[:-1]:
+                    continue
+                if media_type == "all" and counts[item.media_type] >= limit:
+                    continue
+                candidates.append(item)
+                counts[item.media_type] += 1
+                if media_type != "all" and len(candidates) >= limit:
                     return candidates
     return candidates
 
@@ -455,7 +468,8 @@ class ExternalJsonSource:
                 *command, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE, env=env, **_process_spawn_options(),
             )
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=self.timeout_seconds)
+            task_timeout = min(600.0, max(float(self.timeout_seconds), 30.0 + request.max_posts * 0.9))
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=task_timeout)
             if process.returncode:
                 detail = f"{self.name} creator request failed: {_decode_process_output(stderr)[-1500:]}"
                 raise SourceError(detail)
@@ -467,7 +481,7 @@ class ExternalJsonSource:
             return result
         except asyncio.TimeoutError as exc:
             await _terminate_process_tree(process)
-            detail = f"{self.name} creator request timed out after {self.timeout_seconds}s"
+            detail = f"{self.name} creator request timed out after {task_timeout:.0f}s"
             self._failed(request.platform, detail, scope)
             raise SourceError(detail) from exc
         except asyncio.CancelledError:
@@ -487,7 +501,7 @@ class ExternalJsonSource:
             self._failed(request.platform, detail, scope)
             raise SourceError(detail) from exc
 
-    async def search(self, platform: Platform, intent: Intent, limit: int) -> list[ImageCandidate]:
+    async def search(self, platform: Platform, intent: Intent, limit: int, *, request: SearchRequest | None = None) -> list[ImageCandidate]:
         if platform not in self.platforms:
             raise SourceUnavailable(f"{self.name} does not support {platform.value}")
         self._check_cooldown(platform)
@@ -504,6 +518,8 @@ class ExternalJsonSource:
             "PYTHONIOENCODING": "utf-8",
             "PYTHONUTF8": "1",
         })
+        if request is not None:
+            env["SOCIAL_IMAGE_SEARCH_REQUEST"] = request.model_dump_json()
         process: asyncio.subprocess.Process | None = None
         try:
             process = await asyncio.create_subprocess_exec(
@@ -534,7 +550,7 @@ class ExternalJsonSource:
             detail = _decode_process_output(stderr).strip()[-1000:]
             self._failed(platform, detail or f"exited with code {process.returncode}")
             raise SourceError(f"{self.name} exited with code {process.returncode}: {detail}")
-        candidates = normalize_source_output(platform, _decode_process_output(stdout), self.name, limit)
+        candidates = normalize_source_output(platform, _decode_process_output(stdout), self.name, limit, request.media_type if request else None)
         if not candidates:
             self._failed(platform, f"no image candidates returned for {platform.value}")
             raise SourceError(
@@ -693,7 +709,7 @@ class GalleryDlSource:
         command.extend(self._targets(platform, intent))
         return command
 
-    async def search(self, platform: Platform, intent: Intent, limit: int) -> list[ImageCandidate]:
+    async def search(self, platform: Platform, intent: Intent, limit: int, *, request: SearchRequest | None = None) -> list[ImageCandidate]:
         if platform not in self.platforms:
             raise SourceUnavailable(f"gallery-dl does not support {platform.value} in this integration")
         if not self.status.configured:
@@ -731,7 +747,7 @@ class GalleryDlSource:
         if error := _embedded_error(values):
             self._failed(platform, error)
             raise SourceError(f"gallery-dl {platform.value} request failed: {error}")
-        candidates = normalize_source_output(platform, output, "gallery-dl", limit)
+        candidates = normalize_source_output(platform, output, "gallery-dl", limit, request.media_type if request else None)
         if not candidates:
             self._failed(platform, f"no images returned for {platform.value}")
             raise SourceError(
@@ -799,7 +815,7 @@ class GalleryDlSource:
 
 
 class SourceHub:
-    def __init__(self, media_crawler_command: str | None, xhs_downloader_command: str | None, gallery_dl_binary: str, gallery_dl_config: str | None = None, timeout_seconds: int = 120, douyin_source_command: str | None = None, douyin_timeout_seconds: int = 45, gallery_dl_cookies_from_browser: str | None = None, failure_cooldown_seconds: int = 120, verification_path: str | None = None, verification_ttl_seconds: int = 86400, gallery_dl_cookies_file: str | None = None, douyin_media_crawler_fallback: bool = False) -> None:
+    def __init__(self, media_crawler_command: str | None, xhs_downloader_command: str | None, gallery_dl_binary: str, gallery_dl_config: str | None = None, timeout_seconds: int = 120, douyin_source_command: str | None = None, douyin_timeout_seconds: int = 45, gallery_dl_cookies_from_browser: str | None = None, failure_cooldown_seconds: int = 120, verification_path: str | None = None, verification_ttl_seconds: int = 86400, gallery_dl_cookies_file: str | None = None, douyin_media_crawler_fallback: bool = False, bilibili_source_command: str | None = None) -> None:
         # Douyin is intentionally handled by dy-cli. MediaCrawler's Douyin
         # browser-login path is not used when embedded in an MCP stdio server.
         # MediaCrawler remains available as an opt-in Douyin creator fallback.
@@ -810,11 +826,12 @@ class SourceHub:
         self.media_crawler = ExternalJsonSource("media-crawler", media_crawler_command, domestic, timeout_seconds, failure_cooldown_seconds, verification)
         self.xhs_downloader = ExternalJsonSource("xhs-downloader", xhs_downloader_command, (Platform.XHS,), timeout_seconds, failure_cooldown_seconds, verification)
         self.douyin_source = ExternalJsonSource("dy-cli", douyin_source_command, (Platform.DOUYIN,), douyin_timeout_seconds, failure_cooldown_seconds, verification)
+        self.bilibili_source = ExternalJsonSource("bilibili-cli", bilibili_source_command, (Platform.BILIBILI,), timeout_seconds, failure_cooldown_seconds, verification)
         self.douyin_media_crawler_fallback = douyin_media_crawler_fallback
         self.gallery_dl = GalleryDlSource(gallery_dl_binary, gallery_dl_config, timeout_seconds, gallery_dl_cookies_from_browser, failure_cooldown_seconds, verification, gallery_dl_cookies_file)
 
     def statuses(self) -> list[dict[str, Any]]:
-        return [{"name": status.name, "configured": status.configured, "verified": status.verified, "verified_platforms": list(status.verified_platforms), "ready_platforms": list(status.ready_platforms), "mode": status.mode, "detail": status.detail, "platforms": list(status.platforms), "platform_status": status.platform_status or {}} for status in (self.douyin_source.status, self.media_crawler.status, self.xhs_downloader.status, self.gallery_dl.status)]
+        return [{"name": status.name, "configured": status.configured, "verified": status.verified, "verified_platforms": list(status.verified_platforms), "ready_platforms": list(status.ready_platforms), "mode": status.mode, "detail": status.detail, "platforms": list(status.platforms), "platform_status": status.platform_status or {}} for status in (self.douyin_source.status, self.bilibili_source.status, self.media_crawler.status, self.xhs_downloader.status, self.gallery_dl.status)]
 
     async def fetch_creator(self, request: CreatorFetchRequest) -> CreatorSourceResult:
         if request.platform == Platform.DOUYIN:
@@ -830,6 +847,8 @@ class SourceHub:
                 except (SourceError, SourceUnavailable) as exc:
                     errors.append(f"media-crawler: {exc}")
             raise SourceError("; ".join(errors) or "No creator source configured for douyin")
+        if request.platform == Platform.BILIBILI and self.bilibili_source.command_template:
+            return await self.bilibili_source.fetch_creator(request)
         if request.platform == Platform.WEIBO:
             return await self.media_crawler.fetch_creator(request)
         if request.platform == Platform.BILIBILI:
@@ -838,7 +857,7 @@ class SourceHub:
             return await self.gallery_dl.fetch_creator(request)
         raise SourceUnavailable("creator retrieval currently supports only douyin and weibo")
 
-    async def search(self, platform: Platform, intent: Intent, limit: int) -> list[ImageCandidate]:
+    async def search(self, platform: Platform, intent: Intent, limit: int, *, request: SearchRequest | None = None) -> list[ImageCandidate]:
         sources: list[Any] = []
         if platform == Platform.DOUYIN and self.douyin_source.command_template:
             sources.append(self.douyin_source)
@@ -846,11 +865,13 @@ class SourceHub:
             sources.append(self.media_crawler)
         if platform == Platform.XHS and self.xhs_downloader.command_template and (intent.url or intent.identifier):
             sources.append(self.xhs_downloader)
+        if platform == Platform.BILIBILI and self.bilibili_source.command_template:
+            sources.append(self.bilibili_source)
         if platform in self.gallery_dl.platforms and self.gallery_dl.status.configured and (platform != Platform.WEIBO or intent.url or intent.identifier):
             sources.append(self.gallery_dl)
         if not sources:
             raise SourceUnavailable(f"No recommended source configured for {platform.value}; configure MediaCrawler/XHS-Downloader/gallery-dl")
-        results = await asyncio.gather(*(source.search(platform, intent, limit) for source in sources), return_exceptions=True)
+        results = await asyncio.gather(*(source.search(platform, intent, limit, request=request) for source in sources), return_exceptions=True)
         candidates: list[ImageCandidate] = []
         errors: list[str] = []
         for result in results:

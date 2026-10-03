@@ -57,7 +57,7 @@ class SocialImageService:
             label_map=getattr(self.settings, "object_label_map", None),
             vision=self.vision,
         )
-        self.sources = SourceHub(self.settings.media_crawler_command, self.settings.xhs_downloader_command, self.settings.gallery_dl_binary, self.settings.gallery_dl_config, self.settings.source_timeout_seconds, self.settings.douyin_source_command, self.settings.douyin_source_timeout_seconds, self.settings.gallery_dl_cookies_from_browser, self.settings.source_failure_cooldown_seconds, self.settings.source_verification_path, self.settings.source_verification_ttl_seconds, self.settings.gallery_dl_cookies_file, getattr(self.settings, "douyin_media_crawler_fallback", False))
+        self.sources = SourceHub(self.settings.media_crawler_command, self.settings.xhs_downloader_command, self.settings.gallery_dl_binary, self.settings.gallery_dl_config, self.settings.source_timeout_seconds, self.settings.douyin_source_command, self.settings.douyin_source_timeout_seconds, self.settings.gallery_dl_cookies_from_browser, self.settings.source_failure_cooldown_seconds, self.settings.source_verification_path, self.settings.source_verification_ttl_seconds, self.settings.gallery_dl_cookies_file, getattr(self.settings, "douyin_media_crawler_fallback", False), getattr(self.settings, "bilibili_source_command", None))
         self.creators = CreatorImageService(
             self.settings, self.sources, self.downloader, self.reranker, self.vision, self.object_detector,
             bilibili=getattr(self.adapters.get(Platform.BILIBILI), "api", None),
@@ -79,8 +79,6 @@ class SocialImageService:
             request = request.model_copy(update={"platforms": [Platform.OTHER]})
             if not intent.url:
                 raise ValueError("其他平台需要输入完整的 http(s) 网页网址")
-            if request.media_type == "videos":
-                raise ValueError("其他平台目前支持提取网页图片，请选择图片")
         if intent.identifier_scope == "creator" and not webpage:
             return await self.fetch_creator(CreatorFetchRequest(
                 platform=Platform(intent.identifier_platform), creator_id=intent.identifier,
@@ -144,7 +142,8 @@ class SocialImageService:
         platforms = self._target_platforms(request, intent.identifier_platform)
         # Bump the namespace when relevance rules change so old low-quality
         # keyword results are never served from the persistent cache.
-        key = self.cache.key("search-v3-relevance-gated", request.model_dump(mode="json"), intent.normalized) if request.use_cache else None
+        namespace = "search-v5-web-originals" if platforms == [Platform.OTHER] else "search-v5-source-media"
+        key = self.cache.key(namespace, request.model_dump(mode="json"), intent.normalized) if request.use_cache else None
         if key and (cached := self.cache.get(key)) is not None:
             return await self._refresh_cached_status(cached, platforms, request, key)
 
@@ -175,28 +174,46 @@ class SocialImageService:
                     errors.append({"code": "unexpected_error", "message": f"{label}: {exc}"})
 
             if platform == Platform.OTHER:
-                await collect("webpage", adapter.search(intent, requested_total, request.safe_mode))
-                if not candidates and errors:
-                    first = errors[0]
-                    return platform, [], {"code": first["code"], "message": first["message"]}
-                return platform, candidates, None
+                try:
+                    page = await adapter.search_media(request)
+                except AdapterError as exc:
+                    return platform, [], {"code": "webpage_error", "message": str(exc)}
+                warning = {"code": "partial_error", "message": "; ".join(page.warnings)} if page.warnings else None
+                return platform, page.items, warning
 
             if request.retrieval_mode in ("discovery", "hybrid"):
                 await collect("discovery", self.discovery.search(platform, intent, requested_total * 2))
             if request.retrieval_mode in ("sources", "hybrid"):
-                if platform in (Platform.BILIBILI, Platform.WEIBO):
+                if platform == Platform.BILIBILI:
+                    # Bilibili uses the same isolated JSON CLI contract as
+                    # the other domestic platforms. The native API remains a
+                    # bounded fallback when no CLI has been installed.
+                    await collect("sources", self.sources.search(platform, intent, source_limit, request=request))
+                    if not candidates:
+                        await collect(
+                            "platform",
+                            adapter.search(
+                                intent,
+                                requested_total * 2,
+                                request.safe_mode,
+                                request.media_type,
+                                image_limit=request.image_limit,
+                                video_limit=request.video_limit,
+                            ),
+                        )
+                elif platform == Platform.WEIBO:
                     media_crawler = getattr(self.sources, "media_crawler", None)
                     if platform == Platform.WEIBO and getattr(media_crawler, "command_template", None):
                         # Prefer an already configured authenticated source;
                         # the public mobile endpoint is frequently rate limited.
-                        await collect("sources", self.sources.search(platform, intent, source_limit))
+                        await collect("sources", self.sources.search(platform, intent, source_limit, request=request))
                         if not candidates:
                             await collect("platform", adapter.search(intent, requested_total * 2, request.safe_mode))
                     else:
                         # Bilibili's bounded public API is the recommended source.
                         await collect("platform", adapter.search(intent, requested_total * 2, request.safe_mode))
                 else:
-                    await collect("sources", self.sources.search(platform, intent, source_limit))
+                    await collect("sources", self.sources.search(platform, intent, source_limit, request=request))
                 if platform not in (Platform.BILIBILI, Platform.WEIBO) and request.retrieval_mode == "sources" and getattr(adapter.status, "mode", "") == "browser-fallback":
                     await collect("browser", adapter.search(intent, requested_total, request.safe_mode))
             if request.retrieval_mode == "platform" or (request.retrieval_mode == "hybrid" and platform not in (Platform.BILIBILI, Platform.WEIBO)):
@@ -286,7 +303,9 @@ class SocialImageService:
                 vision_deferred = bool(self.vision.status.get("loading"))
                 ranked = ranked[:target_limit]
         else:
-            ranked = self._direct_items(all_candidates, requested_total, request.min_width, request.min_height)
+            # De-duplicate and validate the pool before applying separate
+            # quotas; an early combined cap can be filled entirely by images.
+            ranked = self._direct_items(all_candidates, len(all_candidates), request.min_width, request.min_height)
         ranked = self._apply_media_limits(ranked, request)
         # Report the same count the caller receives in ``items``.  The source
         # adapters intentionally fetch a larger shortlist for ranking, so the
@@ -450,13 +469,15 @@ class SocialImageService:
             if request.media_type == "videos" and item.media_type != "video":
                 continue
             post = item.post_id or item.id
-            if per_post_limit is not None and posts.get(post, 0) >= per_post_limit:
+            limit_post = item.media_type == "image"
+            if limit_post and per_post_limit is not None and posts.get(post, 0) >= per_post_limit:
                 continue
             limit = image_limit if item.media_type == "image" else video_limit
             if counts[item.media_type] >= limit:
                 continue
             counts[item.media_type] += 1
-            posts[post] = posts.get(post, 0) + 1
+            if limit_post:
+                posts[post] = posts.get(post, 0) + 1
             selected.append(item)
             if request.media_type != "all" and len(selected) >= request.max_results:
                 break
@@ -557,7 +578,7 @@ class SocialImageService:
 
     def source_statuses(self) -> list[dict]:
         if self.sources is None:
-            self.sources = SourceHub(self.settings.media_crawler_command, self.settings.xhs_downloader_command, self.settings.gallery_dl_binary, self.settings.gallery_dl_config, self.settings.source_timeout_seconds, self.settings.douyin_source_command, self.settings.douyin_source_timeout_seconds, self.settings.gallery_dl_cookies_from_browser, self.settings.source_failure_cooldown_seconds, self.settings.source_verification_path, self.settings.source_verification_ttl_seconds, self.settings.gallery_dl_cookies_file, getattr(self.settings, "douyin_media_crawler_fallback", False))
+            self.sources = SourceHub(self.settings.media_crawler_command, self.settings.xhs_downloader_command, self.settings.gallery_dl_binary, self.settings.gallery_dl_config, self.settings.source_timeout_seconds, self.settings.douyin_source_command, self.settings.douyin_source_timeout_seconds, self.settings.gallery_dl_cookies_from_browser, self.settings.source_failure_cooldown_seconds, self.settings.source_verification_path, self.settings.source_verification_ttl_seconds, self.settings.gallery_dl_cookies_file, getattr(self.settings, "douyin_media_crawler_fallback", False), getattr(self.settings, "bilibili_source_command", None))
         return self.sources.statuses()
 
 

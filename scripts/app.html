@@ -4,7 +4,32 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>社交媒体图片采集器</title>
-<style>body{font-family:system-ui,"Microsoft YaHei",sans-serif;background:#f5f7fb;color:#1f2937;max-width:1100px;margin:auto;padding:24px}.card{background:#fff;border-radius:14px;padding:20px;margin:16px 0;box-shadow:0 2px 10px #0001}label{display:block;margin:8px 0 4px}input,select{box-sizing:border-box;width:100%;padding:9px;border:1px solid #ccd3df;border-radius:7px;font-size:15px}.checks{display:flex;gap:15px;flex-wrap:wrap}.checks label{display:inline-block;width:auto}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.hint{color:#64748b;font-size:13px}button{background:#2563eb;color:#fff;border:0;border-radius:8px;padding:11px 22px;font-size:15px}.status{white-space:pre-wrap;background:#111827;color:#e5e7eb;border-radius:8px;padding:14px;max-height:300px;overflow:auto}.items{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px}.item{border:1px solid #e5e7eb;border-radius:8px;overflow:hidden}.item img{width:100%;height:180px;object-fit:cover}.item p{padding:8px;margin:0;font-size:13px}@media(max-width:700px){.grid{grid-template-columns:1fr}}</style>
+<style>body{font-family:system-ui,"Microsoft YaHei",sans-serif;background:#f5f7fb;color:#1f2937;max-width:1100px;margin:auto;padding:24px}.card{background:#fff;border-radius:14px;padding:20px;margin:16px 0;box-shadow:0 2px 10px #0001}label{display:block;margin:8px 0 4px}input,select{box-sizing:border-box;width:100%;padding:9px;border:1px solid #ccd3df;border-radius:7px;font-size:15px}.checks{display:flex;gap:15px;flex-wrap:wrap}.checks label{display:inline-block;width:auto}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.hint{color:#64748b;font-size:13px}button{background:#2563eb;color:#fff;border:0;border-radius:8px;padding:11px 22px;font-size:15px}.status{white-space:pre-wrap;background:#111827;color:#e5e7eb;border-radius:8px;padding:14px;max-height:300px;overflow:auto}.items{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px}.item{border:1px solid #e5e7eb;border-radius:8px;overflow:hidden}.item img{width:100%;height:180px;object-fit:cover}.item p{padding:8px;margin:0;font-size:13px}.works{display:grid;gap:8px}.work-row{display:flex;justify-content:space-between;gap:12px;padding:10px 12px;border:1px solid #e5e7eb;border-radius:8px;background:#fafafa}.work-title{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.work-meta{color:#64748b;font-size:13px;white-space:nowrap}@media(max-width:700px){.grid{grid-template-columns:1fr}.work-row{display:block}.work-meta{margin-top:4px}}</style>
+<style>
+.checks label{display:inline-flex;align-items:center;gap:6px}
+.checks input{width:auto;margin:0}
+.download-settings{border-top:1px solid #e5e7eb;margin-top:20px;padding-top:16px}
+.media-choice{display:grid;grid-template-columns:minmax(200px,1fr) 2fr;align-items:center;gap:24px;margin-bottom:16px}
+.media-limits{display:grid;grid-template-columns:1.4fr 1fr;gap:16px}
+.media-settings{min-width:0;margin:0;padding:12px 16px 16px;border:1px solid #ccd3df;border-radius:10px}
+.media-settings legend{font-size:15px;font-weight:600;padding:0 6px}
+.image-limits{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.media-settings:disabled{background:#f8fafc;border-color:#e2e8f0;color:#94a3b8}
+.media-settings:disabled .hint{color:#94a3b8}
+input:disabled{background:#f1f5f9;color:#94a3b8;cursor:not-allowed;border-color:#e2e8f0}
+.search-scope{display:grid;grid-template-columns:minmax(200px,1fr) 2fr;align-items:center;gap:24px;margin-top:16px}
+.settings-summary{background:#eff6ff;color:#1e40af;border-radius:8px;padding:12px 14px;font-size:14px;line-height:1.6}
+.status{white-space:normal;background:#f8fafc;color:#1f2937;border:1px solid #dbe3ee;max-height:420px;padding:4px 14px}
+.log-line{display:grid;grid-template-columns:48px minmax(0,1fr);gap:10px;padding:11px 0;border-bottom:1px solid #e5e7eb;line-height:1.5}
+.log-line:last-child{border-bottom:0}
+.log-level{font-size:12px;font-weight:700;text-align:center;border-radius:4px;padding:2px 4px;height:max-content}
+.log-info .log-level{background:#e0f2fe;color:#075985}
+.log-success .log-level{background:#dcfce7;color:#166534}
+.log-warning .log-level{background:#fef3c7;color:#92400e}
+.log-error .log-level{background:#fee2e2;color:#991b1b}
+.log-action{margin-top:4px;color:#475569;font-size:13px}
+@media(max-width:700px){.media-choice,.media-limits,.search-scope{grid-template-columns:1fr;gap:10px}.image-limits{grid-template-columns:1fr}body{padding:16px}.card{padding:16px}}
+</style>
 </head>
 <body>
 <h1>社交媒体图片采集器</h1>
@@ -30,40 +55,50 @@
 <label>
 <input type="radio" name="platform" value="other"> 其他平台</label>
 </div>
-<p class="hint">选择“其他平台”后粘贴网页网址，程序会提取该网页中的主图和图片链接。</p>
-<div class="grid">
+<p class="hint">“其他平台”会检索主页正文及内容卡片的详情页，过滤 Logo、图标和小图，下载内容图片与直接视频文件。</p>
+<section class="download-settings" aria-label="下载设置">
+<div class="media-choice">
 <div>
-<label>内容类型</label>
+<label for="media_type">下载内容</label>
 <select id="media_type">
 <option value="images">只下载图片</option>
 <option value="videos">只下载视频</option>
 <option value="all">图片和视频</option>
 </select>
 </div>
-<div>
-<label>图片总数</label>
-<input id="image_limit" type="number" min="1" max="200" value="20">
+<p class="hint">选择要下载的内容，下方只启用对应的数量设置。</p>
 </div>
+<div class="media-limits">
+<fieldset id="image_settings" class="media-settings">
+<legend>图片数量</legend>
+<div class="image-limits">
 <div>
-<label>视频总数</label>
-<input id="video_limit" type="number" min="1" max="200" placeholder="选择视频后填写">
-</div>
-</div>
-<div class="grid">
-<div>
-<label>每个图文作品最多下载张数</label>
-<input id="per_post_limit" type="number" min="1" max="50" value="3">
+<label for="image_limit">图片总上限（张）</label>
+<input id="image_limit" type="number" min="1" max="1000" value="20" required>
 </div>
 <div>
-<label>最大作品数</label>
-<input id="max_posts" type="number" min="1" max="100" value="20">
+<label for="per_post_limit">每个作品最多（张）</label>
+<input id="per_post_limit" type="number" min="1" max="50" value="3" required>
 </div>
+</div>
+<p class="hint">每个作品的图片计入总上限。</p>
+</fieldset>
+<fieldset id="video_settings" class="media-settings" disabled>
+<legend>视频数量</legend>
+<label for="video_limit">视频总上限（个）</label>
+<input id="video_limit" type="number" min="1" max="1000" value="20">
+<p class="hint">视频单独计数，不受每个作品图片张数限制。</p>
+</fieldset>
+</div>
+<div class="search-scope">
 <div>
-<label>
-<input id="download" type="checkbox" checked> 下载文件</label>
+<label for="max_posts">最多检索作品数</label>
+<input id="max_posts" type="number" min="1" max="500" value="20" required aria-describedby="scope_hint">
 </div>
+<p id="scope_hint" class="hint">限制本次查找的作品范围，不是下载文件数，最多 500 个。大批量任务会分页执行，仍可能触发平台限流；输入自定义网址时，此项限制跟进的内容详情页数。</p>
 </div>
-<p class="hint">图片和视频分别计数；每篇图文作品按“每篇最多”限制。</p>
+<p id="download_summary" class="settings-summary" aria-live="polite"></p>
+</section>
 <label>内容筛选（可选）</label>
 <input id="content_query" placeholder="例如：只要人物穿搭，排除风景">
 <div class="grid">
@@ -85,14 +120,18 @@
 </div>
 <div>
 <label>&nbsp;</label>
-<button id="submit">开始采集</button>
+<button id="submit" type="submit">开始采集并下载</button>
 </div>
 </div>
 </form>
 </div>
 <div class="card">
 <h3>运行状态</h3>
-<div id="status" class="status">等待任务…</div>
+<div id="status" class="status" role="log" aria-live="polite"><div class="log-line log-info"><span class="log-level">信息</span><div>等待任务。</div></div></div>
+</div>
+<div class="card">
+<h3>作品清单</h3>
+<div id="works" class="works"><p class="hint">等待采集结果…</p></div>
 </div>
 <div class="card">
 <h3>结果预览</h3>

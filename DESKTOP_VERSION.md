@@ -1,43 +1,50 @@
 # 桌面版安装与使用
 
-桌面版是一个本机运行的 Windows 网页应用，默认只监听 `127.0.0.1:8765`。它不需要打开 Codex，下载的文件默认保存到项目根目录的 `downloads` 文件夹。
+桌面版是一个本机运行的 Windows 网页应用，支持抖音、小红书、微博、B 站、X、Instagram 和自定义网页，默认只监听 `127.0.0.1:8765`。它不需要打开 Codex、配置 MCP 客户端或手动输入 JSON，下载的文件默认保存到项目根目录的 `downloads` 文件夹。
+
+## 功能与数量
+
+- 输入关键词、昵称、UID、主页链接或作品链接；抖音、微博和 B 站支持账号身份确认。
+- 单类图片或视频最多设置 1000 个，两类合计最多 2000 个，最多检索 500 个作品。默认数量仍是 20，大批量任务通过分页和增量续传执行。
+- 图片和视频分别计数，每个作品的图片上限不会占用视频配额。
+- 文件按 `平台/<images|videos>` 分类，名称由时间戳、作品号和作品名组成；再次采集相同账号时跳过已经处理的作品与重复文件。
+- 运行日志显示预设数量、实际找到数量和每种保存状态；没有达到目标或发生错误时，会显示中文原因与可操作的处理建议。
+
+数量是目标上限，并不保证平台一定返回足量内容。CLI 仍然使用平台接口、登录 Cookie 和当前网络，可能遇到验证码、限流或登录失效；程序会保留已完成文件，用户可按日志处理后继续采集。
 
 ## 安装
 
 1. 安装 Python 3.10 或更高版本，并在安装时勾选 **Add Python to PATH**。
-2. 将项目目录复制到本机，或使用 Git 获取项目：
+2. 下载 GitHub 的 `desktop` 分支 ZIP 并解压，或使用 Git 获取桌面版：
 
    ```powershell
-   git clone https://github.com/wozhendemeiyou/social-image-mcp-crawler.git
-   cd 抖音、小红书、微博社交媒体图片MCP爬取器
+   git clone -b desktop https://github.com/wozhendemeiyou/social-image-mcp-crawler.git
+   cd social-image-mcp-crawler
    ```
 
-3. 安装项目依赖：
+3. 双击 `安装桌面版.bat`。它会自动创建 `.venv`、安装依赖和 Playwright，并生成 `.env`；如果已有 `third_party\dy-cli`，也会安装该来源的依赖。也可以执行：
 
    ```powershell
-   python -m venv .venv
-   .\.venv\Scripts\Activate.ps1
-   python -m pip install -U pip
-   pip install -e .
+   powershell -ExecutionPolicy Bypass -File .\scripts\install_desktop.ps1
    ```
 
-4. 按需配置平台来源和登录态。抖音可运行 `powershell -ExecutionPolicy Bypass -File .\scripts\setup_account.ps1 -Platform douyin`；微博可运行同一脚本并把平台改为 `weibo`。其他平台按 `README.md` 中的配置说明启用。
+4. 只使用“其他平台”时可以直接启动。需要抖音时，先安装 `third_party\dy-cli`，尚未配置浏览器时执行 `.\.venv\Scripts\python.exe -m playwright install chromium`，然后运行 `scripts\douyin_login.ps1`；需要抖音、小红书、微博或 B 站时，运行 `powershell -ExecutionPolicy Bypass -File .\scripts\install_desktop.ps1 -InstallSources`，安装来源及桌面桥接依赖。四个平台的检索和账号采集都通过独立 CLI 子进程运行，首次采集时按浏览器提示完成登录。
 
 ## 启动
 
-双击项目根目录的 `启动应用.bat`，或在 PowerShell 中执行：
+双击 `启动应用.bat`。启动前会自动检查 Python 依赖、Playwright 浏览器、来源桥接、抖音 Cookie，并执行轻量抖音和微博接口检查；缺少 MediaCrawler 桥接依赖会尝试修复。详细结果保存在 `.cache\preflight-latest.json`，微博浏览器登录状态需在首次采集时核验。检查通过后浏览器打开 `http://127.0.0.1:8765/` 即可使用。关闭启动它的 PowerShell 窗口即可停止应用。
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\start_app.ps1
-```
+如果旧版启动时出现 `init_import_site` / `UnicodeDecodeError`，更新后直接双击启动即可。程序会在 Python 加载依赖前修复中文安装路径的编码，并备份原路径文件；不需要删除 `.venv`、`.env`、登录缓存或已下载的文件。安装脚本也会执行同样的修复。
 
-浏览器打开 `http://127.0.0.1:8765/` 后即可使用。停止时关闭启动它的 PowerShell 窗口。
+如果能启动但采集提示 `No module named 'playwright'`，更新后重新运行 `安装桌面版.bat`，补齐当前 `.venv` 的浏览器组件。安装到系统 Python 的组件不会自动用于桌面版虚拟环境。
 
 ## 使用
 
-- 在输入框直接填写关键词、昵称、账号或完整平台链接，程序会自动识别入口。
-- 选择抖音、微博、X 或“其他平台”。选择“其他平台”时粘贴网页地址，程序会提取网页主图和图片链接。
-- 图片模式不要求填写视频数量；只有选择视频或全部模式时才填写视频数量。
-- 点击开始采集后，图片会下载到 `downloads`，页面会显示数量、状态和缩略图。微博图片通过本地预览代理加载，避免浏览器跨域或 Referer 导致破图。
+- 直接填写关键词、昵称、账号或完整网址，程序自动识别入口。
+- 选择“其他平台”并粘贴主页地址时，会提取正文图片和直接视频文件，并按“最大作品数”访问同站内容卡片的详情页（只检索一层）。支持懒加载、原图链接、响应式图片和结构化媒体；自动过滤导航、Logo、图标以及宽高不足 160 像素的小图。
+- 图片和视频可同时采集，分别计数；每篇图片上限不影响视频。动态内容会尝试浏览器加载，需已安装 Chromium 或配置 `WEBPAGE_BROWSER_PATH`。HLS/DASH 分段视频和只有嵌入式播放器的页面目前会明确提示限制。
+- 图片模式不要求填写视频数量；只有视频或全部模式才填写视频数量。
+- 点击开始采集后，页面会按作品类型列出图片、视频和混合作品清单；文件按平台与媒体类型保存到 `downloads/<platform>/<images|videos>`，命名为 `时间戳_作品号_作品名`。重复采集会读取作品清单和 `manifest.jsonl`，只下载新增作品，已校验的文件显示为已存在。微博图片通过本地预览代理加载，避免浏览器跨域或 Referer 导致破图。
+- 页面中的数量为目标上限。任务完成后，日志会分别列出找到、新下载、已存在、重复、拒绝和失败数量，并针对理论容量不足、Cookie 失效、平台验证、超时或内容筛选给出处理建议。
 
-桌面版与 MCP 使用同一套采集、筛选、下载和断点逻辑。完整参数、平台登录和故障排查请参阅 `README.md`。
+桌面版与 MCP 使用同一套采集、筛选、下载和断点逻辑，但桌面版日常使用不要求安装或注册 MCP 客户端。

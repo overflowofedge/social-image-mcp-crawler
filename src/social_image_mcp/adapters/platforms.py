@@ -500,9 +500,16 @@ class BilibiliAdapter(PlatformAdapter):
     def status(self) -> AdapterStatus:
         return AdapterStatus(self.platform, True, "public-api", "Public Bilibili API; login is optional and may improve rate limits")
 
-    async def search(self, intent: Intent, limit: int, safe_mode: bool) -> list[ImageCandidate]:
+    async def search(self, intent: Intent, limit: int, safe_mode: bool, media_type: str = "images", *, image_limit: int | None = None, video_limit: int | None = None) -> list[ImageCandidate]:
         try:
-            return await self.api.search(intent, limit, safe_mode)
+            return await self.api.search(
+                intent,
+                limit,
+                safe_mode,
+                media_type=media_type,
+                image_limit=image_limit,
+                video_limit=video_limit,
+            )
         except BilibiliError as exc:
             raise AdapterError(str(exc)) from exc
 
@@ -555,5 +562,6 @@ def build_adapters(settings: Settings, client: httpx.AsyncClient) -> dict[Platfo
         Platform.BILIBILI: BilibiliAdapter(client, settings.bilibili_cookie, settings.native_api_timeout_seconds),
         Platform.X: BrowserSearchAdapter(client, Platform.X, "https://x.com/search?q={query}&src=typed_query", headless=settings.browser_headless, timeout_ms=settings.browser_timeout_ms, cdp_url=settings.browser_cdp_url, user_data_dir=settings.browser_user_data_dir, channel=settings.browser_channel) if settings.browser_fallback and not settings.x_bearer_token else XAdapter(client, settings.x_bearer_token),
         Platform.INSTAGRAM: BrowserSearchAdapter(client, Platform.INSTAGRAM, "https://www.instagram.com/explore/tags/{query}/", headless=settings.browser_headless, timeout_ms=settings.browser_timeout_ms, cdp_url=settings.browser_cdp_url, user_data_dir=settings.browser_user_data_dir, channel=settings.browser_channel) if settings.browser_fallback and not settings.instagram_access_token else InstagramAdapter(client, settings.instagram_access_token, settings.instagram_user_id, settings.meta_graph_version),
-        Platform.OTHER: WebPageAdapter(client),
+        Platform.OTHER: WebPageAdapter(client, render_pages=True, browser_channel=settings.browser_channel,
+                                      browser_path=os.getenv("WEBPAGE_BROWSER_PATH") or os.getenv("MEDIA_CRAWLER_BROWSER_PATH")),
     }

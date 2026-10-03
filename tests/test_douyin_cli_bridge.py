@@ -42,6 +42,25 @@ def test_dy_cli_verify_check_is_reported_as_an_error():
         _raise_for_empty_search({"search_nil_info": {"search_nil_type": "verify_check"}})
 
 
+def test_missing_browser_dependency_explains_how_to_repair(monkeypatch):
+    import asyncio
+    import builtins
+    import pytest
+    from social_image_mcp.models import CreatorFetchRequest
+
+    original_import = builtins.__import__
+
+    def import_without_playwright(name, *args, **kwargs):
+        if name == "playwright.async_api":
+            raise ModuleNotFoundError("No module named 'playwright'", name="playwright")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_playwright)
+    request = CreatorFetchRequest(platform="douyin", creator_id="sec-1", download=False)
+    with pytest.raises(RuntimeError, match="Playwright 未安装.*安装桌面版.bat"):
+        asyncio.run(_fetch_creator_via_browser(request))
+
+
 def test_dy_cli_id_fallback_requires_exact_aweme_id():
     records = [{"aweme_id": "123"}, {"aweme_id": "1234"}]
     assert _exact_record(records, "123") == records[0]
@@ -54,6 +73,38 @@ def test_dy_cli_cache_reuses_only_recent_exact_ids(tmp_path, monkeypatch):
     _save_cached_items(items)
     assert _load_cached_items("123") == items
     assert _load_cached_items("1234") == []
+
+
+def test_image_only_cache_cannot_satisfy_a_video_request(tmp_path, monkeypatch):
+    monkeypatch.setenv("DY_CLI_RESULT_CACHE", str(tmp_path / "results.json"))
+    items = [{"id": "123", "image_url": "https://img.test/a.jpg"}]
+    _save_cached_items(items)
+    assert _load_cached_items("123", media_type="all") == []
+    assert _load_cached_items("123", media_type="videos") == []
+
+
+def test_profile_share_preserves_requested_media_and_later_videos(monkeypatch):
+    from social_image_mcp.models import SearchRequest
+
+    class Client:
+        def resolve_creator_share_url(self, url):
+            return "https://www.douyin.com/user/sec-1"
+
+    items = [{"id": str(i), "media_type": "image"} for i in range(8)]
+    items.append({"id": "clip", "media_type": "video"})
+
+    def fetch(client, request, account=None):
+        assert request.media_type == "all"
+        assert request.max_posts == 17
+        assert request.max_images == 2
+        assert request.max_videos == 1
+        assert request.per_post_limit == 1
+        return {"items": items}
+
+    monkeypatch.setattr(_MODULE, "_fetch_creator_with_fallback", fetch)
+    request = SearchRequest(query="https://v.douyin.com/home/", media_type="all", image_limit=2,
+                            video_limit=1, per_post_limit=1, max_posts=17)
+    assert _creator_items_from_profile_share(Client(), request.query, 3, search_request=request) == items
 
 
 def test_dy_cli_relative_cache_is_anchored_to_project(monkeypatch):
@@ -104,6 +155,16 @@ def test_browser_user_search_matches_exact_nickname():
     assert _browser_user_matches(payload, "放学小野猪", nickname=True) == [payload["data"][0]["user_info"]]
 
 
+def test_browser_user_search_preserves_rank_for_duplicate_exact_nicknames():
+    payload = {"data": [
+        {"user_info": {"sec_uid": "sec-ranked", "nickname": "同名账号"}},
+        {"user_info": {"sec_uid": "sec-later", "nickname": "同名账号"}},
+    ]}
+    assert [row["sec_uid"] for row in _browser_user_matches(payload, "同名账号", nickname=True)] == [
+        "sec-ranked", "sec-later",
+    ]
+
+
 def test_browser_post_cursor_normalizes_string_booleans_and_query_cursor():
     url = "https://www.douyin.com/aweme/v1/web/aweme/post/?sec_user_id=sec-1&max_cursor=18"
     assert _browser_endpoint(url) == "posts"
@@ -151,3 +212,28 @@ def test_browser_post_response_ignores_wrong_resume_cursor():
     payload = {"aweme_list": [], "max_cursor": 36, "has_more": False}
     assert _browser_items_from_payload(payload, identity, request, collector, "https://www.douyin.com/aweme/v1/web/aweme/post/?max_cursor=0") is False
     assert collector.pages_fetched == 0
+
+
+def test_large_creator_request_can_continue_beyond_ten_pages():
+    from social_image_mcp.models import CreatorFetchRequest, CreatorIdentity, Platform
+    from social_image_mcp.creator_protocol import CreatorCollector
+
+    identity = CreatorIdentity(
+        platform=Platform.DOUYIN, requested_id="sec-1", canonical_id="sec-1",
+        source="test", matched_by="sec_uid",
+    )
+    request = CreatorFetchRequest(
+        platform=Platform.DOUYIN, creator_id="sec-1", max_posts=500,
+        max_images=1000, download=False,
+    )
+    collector = CreatorCollector(identity, request)
+
+    for page in range(1, 12):
+        should_continue = collector.consume(
+            [{"aweme_id": f"post-{page}", "author": {"sec_uid": "sec-1"}}],
+            page,
+            True,
+        )
+        assert should_continue is True
+
+    assert collector.pages_fetched == 11

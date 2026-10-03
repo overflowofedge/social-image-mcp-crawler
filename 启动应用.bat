@@ -2,4 +2,4 @@
 chcp 65001 >nul
 cd /d "%~dp0"
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\start_app.ps1"
-pause
+if errorlevel 1 pause

@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import importlib.util
 import subprocess
 import sys
@@ -6,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from social_image_mcp.bridge_utils import extract_media_urls, extract_video_urls, normalize_native_record
+from social_image_mcp.models import CreatorFetchRequest, Platform
 
 
 _MEDIA_SPEC = importlib.util.spec_from_file_location(
@@ -69,6 +71,16 @@ def test_douyin_media_type_all_keeps_image_and_video_records():
     assert {item["media_type"] for item in items} == {"image", "video"}
 
 
+def test_douyin_video_extraction_drops_music_track_urls():
+    record = {"aweme_id": "45", "video": {
+        "play_addr": {"url_list": ["https://cdn.test/audio.mp3"]},
+        "bit_rate": [{"play_addr": {"url_list": ["https://cdn.test/video?id=45"]}}],
+    }}
+    assert extract_video_urls("douyin", record) == ["https://cdn.test/video?id=45"]
+    del record["video"]["bit_rate"]
+    assert extract_video_urls("douyin", record) == []
+
+
 def test_gallery_candidates_have_unique_ids_and_keep_post_id():
     record = {
         "aweme_id": "42",
@@ -95,6 +107,39 @@ def test_weibo_native_record_extracts_pic_urls_and_strips_html():
     assert items[0]["id"] == "w1"
     assert items[0]["title"] == "咖啡店室内"
     assert items[0]["image_url"] == "https://wx.test/pic.jpg"
+
+
+def test_weibo_bridge_resolves_exact_nickname_and_keeps_video_only_post():
+    class Client:
+        async def get(self, path, params):
+            return {"cards": [{"user": {"idstr": "5984743446", "screen_name": "凌云Tiger1"}}]}
+        async def get_creator_info_by_id(self, creator_id):
+            return {"userInfo": {"idstr": creator_id, "screen_name": "凌云Tiger1"}}
+        async def get_notes_by_creator(self, creator, container, since):
+            return {"cards": [{"card_type": 9, "mblog": {"id": "v1", "user": {"idstr": creator}, "page_info": {"media_info": {"mp4_hd_mp4": "https://video.test/v1.mp4"}}}}], "cardlistInfo": {"since_id": 0}}
+    request = CreatorFetchRequest(platform=Platform.WEIBO, creator_name="凌云Tiger1", media_type="videos", download=False)
+    result = asyncio.run(_MEDIA_MODULE._fetch_weibo_creator(Client(), request))
+    assert result["identity"]["canonical_id"] == "5984743446"
+    assert result["identity"]["matched_by"] == "exact_account_name"
+    assert [(item["post_id"], item["media_type"]) for item in result["items"]] == [("v1", "video")]
+
+
+def test_weibo_bridge_session_probe_uses_creator_endpoint_instead_of_api_config():
+    class Client:
+        async def get_creator_info_by_id(self, creator_id):
+            return {"userInfo": {"idstr": creator_id}}
+
+    request = CreatorFetchRequest(platform=Platform.WEIBO, profile_url="https://weibo.com/u/5984743446", download=False)
+    assert asyncio.run(_MEDIA_MODULE._weibo_creator_session_ready(Client(), request)) is True
+
+
+def test_weibo_bridge_search_probe_uses_search_response_instead_of_api_config():
+    class Client:
+        async def get(self, path, params):
+            assert path == "/api/container/getIndex"
+            return {"cards": []}
+
+    assert asyncio.run(_MEDIA_MODULE._weibo_search_session_ready(Client(), "咖啡")) is True
 
 
 def test_media_bridge_missing_vendor_is_a_clear_error(tmp_path: Path):

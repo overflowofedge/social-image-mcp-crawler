@@ -20,16 +20,23 @@ class Platform(str, Enum):
 class SearchRequest(BaseModel):
     query: str = Field(min_length=1, max_length=500)
     platforms: list[Platform] | None = None
-    max_results: int = Field(default=20, ge=1, le=200)
+    max_results: int = Field(default=20, ge=1, le=2000)
     min_width: int = Field(default=0, ge=0, le=20000)
     min_height: int = Field(default=0, ge=0, le=20000)
     safe_mode: bool = True
     use_cache: bool = True
     retrieval_mode: str = Field(default="sources", pattern="^(sources|discovery|hybrid|platform)$")
     media_type: str = Field(default="images", pattern="^(images|videos|all)$")
-    image_limit: int | None = Field(default=None, ge=1, le=200)
-    video_limit: int | None = Field(default=None, ge=1, le=200)
+    image_limit: int | None = Field(default=None, ge=1, le=1000)
+    video_limit: int | None = Field(default=None, ge=1, le=1000)
     per_post_limit: int | None = Field(default=None, ge=1, le=50)
+    max_posts: int = Field(default=20, ge=1, le=500)
+
+    @model_validator(mode="after")
+    def validate_media_total(self) -> "SearchRequest":
+        if self.media_type != "all" and self.max_results > 1000:
+            raise ValueError("a single media type supports at most 1000 results")
+        return self
 
 
 class CreatorSort(str, Enum):
@@ -43,9 +50,9 @@ class CreatorFetchRequest(BaseModel):
     creator_id: str | None = Field(default=None, min_length=1, max_length=500)
     creator_name: str | None = Field(default=None, min_length=1, max_length=200)
     profile_url: str | None = Field(default=None, min_length=1, max_length=2000)
-    max_posts: int = Field(default=20, ge=1, le=100)
-    max_images: int = Field(default=50, ge=1, le=200)
-    max_videos: int | None = Field(default=None, ge=1, le=200)
+    max_posts: int = Field(default=20, ge=1, le=500)
+    max_images: int = Field(default=50, ge=1, le=1000)
+    max_videos: int | None = Field(default=None, ge=1, le=1000)
     per_post_limit: int | None = Field(default=None, ge=1, le=50)
     cursor: str | None = Field(default=None, max_length=1000)
     since: datetime | None = None
@@ -134,7 +141,7 @@ class ImageCandidate(BaseModel):
 
 
 class DownloadRequest(BaseModel):
-    items: list[ImageCandidate] = Field(min_length=1, max_length=400)
+    items: list[ImageCandidate] = Field(min_length=1, max_length=2000)
     output_dir: str | None = None
     max_concurrency: int = Field(default=5, ge=1, le=20)
     min_width: int = Field(default=0, ge=0)
@@ -155,5 +162,7 @@ class DownloadRecord(BaseModel):
     creator_id: str | None = None
     post_id: str | None = None
     media_index: int | None = None
+    title: str = ""
+    published_at: str | None = None
     status: str
     error: str | None = None

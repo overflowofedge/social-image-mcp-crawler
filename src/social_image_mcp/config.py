@@ -57,6 +57,7 @@ class Settings:
     media_crawler_command: str | None = os.getenv("MEDIA_CRAWLER_COMMAND") or None
     xhs_downloader_command: str | None = os.getenv("XHS_DOWNLOADER_COMMAND") or None
     douyin_source_command: str | None = os.getenv("DOUYIN_SOURCE_COMMAND") or None
+    bilibili_source_command: str | None = os.getenv("BILIBILI_SOURCE_COMMAND") or None
     gallery_dl_binary: str = os.getenv("GALLERY_DL_BINARY", "gallery-dl")
     gallery_dl_config: str | None = os.getenv("GALLERY_DL_CONFIG") or None
     gallery_dl_cookies_from_browser: str | None = os.getenv("GALLERY_DL_COOKIES_FROM_BROWSER") or None

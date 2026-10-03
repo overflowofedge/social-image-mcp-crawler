@@ -1,11 +1,16 @@
 import asyncio
+import io
 import time
+import httpx
 import pytest
+from PIL import Image
 
 from social_image_mcp.creator_protocol import CreatorCollector, creator_target, douyin_identity, pack_cursor, unpack_cursor
 from social_image_mcp.creator_service import CreatorImageService
-from social_image_mcp.models import CreatorFetchRequest, CreatorIdentity, ImageCandidate, Platform
+from social_image_mcp.downloader import ImageDownloader
+from social_image_mcp.models import CreatorFetchRequest, CreatorIdentity, DownloadRecord, ImageCandidate, Platform
 from social_image_mcp.sources import CreatorSourceResult
+from social_image_mcp.weibo import WeiboApi, WeiboError
 
 
 def _identity() -> CreatorIdentity:
@@ -51,6 +56,76 @@ def test_different_creator_ids_run_concurrently(tmp_path):
     asyncio.run(run())
 
 
+def test_weibo_nickname_uses_authenticated_fallback_after_public_432(tmp_path):
+    class Settings:
+        cache_path = str(tmp_path / "cache.sqlite3")
+        output_dir = str(tmp_path / "out")
+        creator_timeout_seconds = 5
+        def ensure_output_dir(self, value=None):
+            path = __import__("pathlib").Path(value or self.output_dir)
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+    class Native:
+        async def fetch_creator(self, request):
+            raise WeiboError("weibo public API returned HTTP 432")
+    class Sources:
+        async def fetch_creator(self, request):
+            assert request.creator_name == "凌云Tiger1"
+            identity = CreatorIdentity(platform=Platform.WEIBO, requested_id=request.creator_name,
+                                       canonical_id="5984743446", name=request.creator_name,
+                                       profile_url="https://weibo.com/u/5984743446", source="media-crawler", matched_by="exact_account_name")
+            item = ImageCandidate(id="post:1", platform=Platform.WEIBO,
+                                  image_url="https://wx.test/photo.jpg", creator_id=identity.canonical_id,
+                                  post_id="post", media_index=1)
+            return CreatorSourceResult(identity=identity, items=[item], posts_fetched=1, post_ids=("post",), pages_fetched=1)
+    async def run():
+        service = CreatorImageService(Settings(), Sources(), object(), weibo=Native())
+        return await service.fetch(CreatorFetchRequest(platform=Platform.WEIBO, creator_name="凌云Tiger1", download=False, resume=False))
+    result = asyncio.run(run())
+    assert result["error"] is None
+    assert result["identity"]["canonical_id"] == "5984743446"
+    assert result["items"][0]["post_id"] == "post"
+
+
+def test_weibo_profile_to_image_and_video_files(tmp_path):
+    image = io.BytesIO()
+    Image.new("RGB", (40, 30), "blue").save(image, format="PNG")
+    def handler(request):
+        if request.url.host == "wx.test":
+            return httpx.Response(200, headers={"content-type": "image/png"}, content=image.getvalue())
+        if request.url.host == "video.test":
+            return httpx.Response(200, headers={"content-type": "video/mp4"}, content=b"video-data")
+        container = request.url.params.get("containerid")
+        if container == "1005055984743446":
+            return httpx.Response(200, json={"ok": 1, "data": {"userInfo": {"idstr": "5984743446", "screen_name": "凌云Tiger1"}}})
+        if container == "1076035984743446":
+            return httpx.Response(200, json={"ok": 1, "data": {"cards": [
+                {"mblog": {"id": "image-post", "user": {"idstr": "5984743446"}, "pics": [{"large": {"url": "https://wx.test/image.png"}}]}},
+                {"mblog": {"id": "video-post", "user": {"idstr": "5984743446"}, "page_info": {"media_info": {"mp4_hd_mp4": "https://video.test/video.mp4"}}}},
+            ], "cardlistInfo": {"since_id": 0}}})
+        return httpx.Response(404)
+    class Settings:
+        cache_path = str(tmp_path / "cache.sqlite3")
+        output_dir = str(tmp_path / "out")
+        creator_timeout_seconds = 5
+        def ensure_output_dir(self, value=None):
+            from pathlib import Path
+            path = Path(value or self.output_dir)
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            service = CreatorImageService(Settings(), object(), ImageDownloader(client), weibo=WeiboApi(client))
+            request = CreatorFetchRequest(platform=Platform.WEIBO, profile_url="https://weibo.com/u/5984743446",
+                                          media_type="all", max_images=2, max_videos=2, output_dir=str(tmp_path / "out"), resume=False)
+            return await service.fetch(request)
+    result = asyncio.run(run())
+    assert result["error"] is None
+    assert {record["media_type"] for record in result["downloads"]} == {"image", "video"}
+    assert all(record["status"] == "downloaded" for record in result["downloads"])
+    assert {__import__("pathlib").Path(record["path"]).suffix for record in result["downloads"]} == {".png", ".mp4"}
+
+
 def test_douyin_identity_resolves_exact_nickname():
     class Client:
         def search_users(self, value, count=20):
@@ -60,6 +135,22 @@ def test_douyin_identity_resolves_exact_nickname():
     identity = douyin_identity(Client(), "放学小野猪", nickname=True)
     assert identity.canonical_id == "sec-1"
     assert identity.matched_by == "exact_account_name"
+
+
+def test_douyin_identity_uses_first_confirmed_ranked_exact_nickname():
+    class Client:
+        def search_users(self, value, count=20):
+            return {"user_list": [
+                {"user_info": {"sec_uid": "sec-ranked", "nickname": value}},
+                {"user_info": {"sec_uid": "sec-later", "nickname": value}},
+            ]}
+
+        def get_user_profile(self, sec_uid):
+            return {"sec_uid": sec_uid, "nickname": "同名账号"}
+
+    identity = douyin_identity(Client(), "同名账号", nickname=True)
+    assert identity.canonical_id == "sec-ranked"
+    assert identity.matched_by == "ranked_exact_account_name"
 
 
 def test_creator_collector_hard_filters_author_and_keeps_media_order():
@@ -326,3 +417,65 @@ def test_creator_resume_keeps_cumulative_counts_when_pending_images_remain(tmp_p
         assert sources.calls == 1
 
     asyncio.run(run())
+
+
+def test_creator_resume_refreshes_exhausted_source_and_returns_new_work_list(tmp_path):
+    class Settings:
+        cache_path = str(tmp_path / "cache.sqlite3")
+        output_dir = str(tmp_path / "out")
+        creator_timeout_seconds = 5
+
+        def ensure_output_dir(self, value=None):
+            from pathlib import Path
+            path = Path(value or self.output_dir)
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+
+    first = ImageCandidate(
+        id="old:1", platform=Platform.DOUYIN, image_url="https://img.test/old.jpg",
+        creator_id="sec-1", post_id="old", media_index=1,
+        title="旧作品", published_at="2026-10-01T00:00:00Z",
+    )
+    second = ImageCandidate(
+        id="new:1", platform=Platform.DOUYIN, image_url="https://img.test/new.jpg",
+        creator_id="sec-1", post_id="new", media_index=1,
+        title="新作品", published_at="2026-10-03T00:00:00Z",
+    )
+
+    class Sources:
+        calls = 0
+
+        async def fetch_creator(self, request):
+            self.calls += 1
+            item = first if self.calls == 1 else second
+            return CreatorSourceResult(
+                identity=_identity(), items=[item], posts_fetched=1,
+                post_ids=(item.post_id,), pages_fetched=1,
+            )
+
+    class Downloader:
+        async def download_many(self, items, *args, **kwargs):
+            return [
+                DownloadRecord(
+                    candidate_id=item.id, platform=item.platform, image_url=item.image_url,
+                    media_type=item.media_type, status="downloaded",
+                )
+                for item in items
+            ]
+
+    async def run():
+        sources = Sources()
+        service = CreatorImageService(Settings(), sources, Downloader())
+        request = CreatorFetchRequest(
+            platform=Platform.DOUYIN, creator_id="Gracebb0722", max_images=1,
+            download=True, output_dir=str(tmp_path / "out"), resume=True,
+        )
+        first_result = await service.fetch(request)
+        second_result = await service.fetch(request)
+        return sources, first_result, second_result
+
+    sources, first_result, second_result = asyncio.run(run())
+    assert sources.calls == 2
+    assert first_result["works"][0]["work_id"] == "old"
+    assert second_result["works"][0]["work_id"] == "new"
+    assert second_result["work_types"] == {"image": 1, "video": 0, "mixed": 0}

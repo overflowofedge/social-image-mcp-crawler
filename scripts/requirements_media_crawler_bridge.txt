@@ -1,0 +1,31 @@
+# MediaCrawler imports every platform from main.py. Keep its bridge imports
+# available on desktop Python 3.10 without installing its Python 3.11-only
+# project metadata or upgrading this application's MCP dependency.
+aiofiles
+aiomysql
+aiosqlite
+alembic
+asyncmy
+curl-cffi
+emoji
+fastapi
+jieba
+matplotlib<3.11
+motor
+opencv-python
+openpyxl
+pandas
+parsel
+pyexecjs
+pyhumps
+pywebview
+redis
+requests
+sqlalchemy
+tenacity==8.2.2
+textual
+typer>=0.12.3
+uvicorn
+websockets
+wordcloud
+xhshow

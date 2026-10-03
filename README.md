@@ -1,6 +1,14 @@
 # Social Image MCP Crawler
 
-一个面向抖音、小红书、微博、X、Instagram 的图片检索与下载 MCP 服务。它把平台适配、用户意图解析、结果排序、质量过滤、去重和下载拆开，避免“只会把网页上的图全部下载下来”。
+一个面向抖音、小红书、微博、B 站、X、Instagram 和自定义网页的图片、视频检索与下载 MCP 服务。它把平台适配、用户意图解析、账号身份确认、结果排序、质量过滤、增量去重和下载拆开，避免把网页图标、Logo 或错误账号内容混入结果。
+
+## 分支与版本
+
+- 默认 `master` 分支是完整 MCP 版本，面向 Codex、Claude Desktop、Cursor 等支持 stdio MCP 的客户端，同时保留本地网页应用入口。
+- `desktop` 分支是面向普通 Windows 用户的独立桌面版，不需要安装或配置 MCP 客户端。
+- 两个分支共用采集、筛选、下载、作品清单和断点数据结构。平台链路采用独立 CLI 子进程：抖音使用 dy-cli，微博和小红书使用 MediaCrawler/XHS-Downloader，B 站使用独立 Bilibili CLI，X 和 Instagram 使用 gallery-dl。
+
+当前单类图片或视频上限为 1000，图片和视频合计上限为 2000，账号或主页单次最多检索 500 个作品。数量是目标上限；平台候选不足、内容筛选、重复文件或下载失败都可能使实际数量更少。桌面版会显示中文任务日志，MCP 调用结果会返回结构化状态与错误信息。
 
 ## 新手安装与使用（Windows）
 
@@ -8,7 +16,7 @@
 
 ### 不使用 Codex：双击启动本地应用
 
-安装依赖并完成平台登录后，直接双击项目根目录的 `启动应用.bat`（英文文件名为 `start_app.bat` 也可以）。程序会启动本机网页界面并自动打开浏览器；在页面中输入提示词或平台链接，选择抖音/微博/X、图片或视频以及是否下载即可。文件默认保存到项目下的 `downloads` 文件夹。
+安装依赖并完成平台登录后，直接双击项目根目录的 `启动应用.bat`（英文文件名为 `start_app.bat` 也可以）。程序会启动本机网页界面并自动打开浏览器；在页面中输入关键词、账号昵称、UID、主页链接或作品链接，选择平台以及图片、视频或两者即可。文件默认保存到项目下的 `downloads` 文件夹。
 
 应用只监听本机 `127.0.0.1:8765`，关闭黑色 PowerShell 窗口即可停止服务。它使用与 MCP 相同的采集、相关性筛选和下载代码，不需要打开 Codex，也不会消耗对话 token。
 
@@ -27,7 +35,7 @@ python --version
 安装 Git 后，在 PowerShell 中逐行执行：
 
 ```powershell
-git clone https://github.com/wozhendemeiyou/social-image-mcp-crawler.git
+git clone https://github.com/overflowofedge/social-image-mcp-crawler.git
 cd social-image-mcp-crawler
 ```
 
@@ -133,6 +141,8 @@ codex mcp add social-image --env PYTHONUTF8=1 --env PYTHONIOENCODING=utf-8 -- py
 - **抖音号或昵称搜不到**：确认抖音号没有多余空格；改用 `creator_name` 填昵称；仍然找不到时，复制博主完整主页链接，改用 `profile_url`。主页链接通常最稳定。
 - **提示登录、验证码或 403**：重新运行 `scripts\\douyin_login.ps1` 登录，并确认当前网络可以打开抖音。程序不会绕过验证码或平台限制。
 - **下载目录在哪里**：默认是项目目录下的 `downloads`；可以在调用时传入 `output_dir` 指定其他目录。
+- **设置了数量但结果不足**：先比较返回结果中的候选、下载、已存在、重复、拒绝和失败数量。提高 `max_posts` 或 `per_post_limit` 只能扩大检索范围，无法让平台返回不存在或不可访问的内容。
+- **CLI 是否不会触发风控**：CLI 负责隔离平台实现和保持结构化输入输出，但请求仍使用当前账号、Cookie、IP 和网络。验证码、403、412、429 和 Cookie 失效仍可能发生；大批量任务应保留分页间隔，并使用断点续传继续。
 
 ### X 平台为什么以前下载不了，如何修复
 
@@ -179,15 +189,15 @@ X 的公开搜索接口通常只给图片缩略图；视频还必须从 `media.v
 ## 能力
 
 - `search_images`：默认走“推荐采集项目召回 + 本地语义重排”，支持抖音、小红书、微博、B 站、X 和 Instagram 的关键词、平台内容 ID、帖子/笔记/视频 URL；多平台并发检索后统一排序，可通过 `download=true` 直接下载。配置本地 CLIP 后会追加视觉重排；`retrieval_mode=hybrid` 才会额外叠加公共索引或旧平台适配器。
-- 其他网页图片：在本地应用选择“其他平台”并粘贴完整的 `http(s)` 网页地址，或在 `search_images` 中传入 `platforms: ["other"]`，服务会提取网页主图、`img`、懒加载图片和 `srcset` 图片并交给统一下载器。普通平台链接仍按对应平台处理；其他平台目前只提取图片，不下载视频。
-- `fetch_creator_images`：按抖音、微博或 B 站博主账号抓取主页作品图片或视频。抖音支持 `creator_id`、`creator_name`（昵称）和完整 `profile_url`；微博与 B 站支持数字 UID 或完整主页链接。`media_type=images|videos|all` 分别获取图片、原视频或两者；分页、日期范围、作品/媒体上限和断点续传保持一致。
+- 其他网页媒体：在本地应用选择“其他平台”并粘贴完整的 `http(s)` 网页地址，或在 `search_images` 中传入 `platforms: ["other"]`。服务会提取正文、相册和同站内容详情页中的原图及可直接访问的 MP4/WebM 视频，并过滤 Logo、头像、图标、小图和跨站详情页。HLS/DASH 分段流或嵌入播放器会明确返回限制说明。
+- `fetch_creator_images`：按抖音、微博、B 站或 X 博主账号抓取主页作品图片或视频。抖音、微博和 B 站支持数字账号、精确昵称或完整主页链接，B 站昵称会先解析并核验 UID。`media_type=images|videos|all` 分别获取图片、原视频或两者；图片与视频独立计数，分页、日期范围、作品/媒体上限和断点续传保持一致。
 - 账号内容筛选：只有提供 `content_query` 才启用。对象要求会先按人物、穿搭、风景、场景、建筑、食物、饮品、包和身体部位等类别做粗粒度视觉分类，再按 include/exclude/required 规则过滤；没有可用模型时 `optional` 回退账号结果，`required` 失败关闭。
 - `inspect_item`：按平台和 ID 获取单条内容的图片候选。
-- `download_images`：按候选结果下载原图，自动重试、校验图片尺寸、按内容哈希去重并写入 `manifest.jsonl`。
+- `download_images`：按候选结果下载原图或原视频，自动重试、校验类型与图片尺寸、按内容哈希去重并写入 `manifest.jsonl`。文件按平台及媒体类型分类，名称由时间戳、作品号和作品名组成。
 - `list_platforms`：查看平台能力、凭据和配置状态。
 - 轻量语义理解：中英文分词、同义词扩展、否定词、ID 精确匹配、方向偏好和质量加权。
 - 可选视觉语义重排：对召回图的缩略图/原图运行 CLIP 图文相似度，减少“文字相关但画面不对”的结果；普通关键词请求按候选短名单执行，账号请求一旦提供 `content_query` 即会进行视觉相关性校验（即使 `quality_mode=fast`），避免抖音/微博只凭文案误下载。
-- 推荐来源项目：dy-cli（抖音关键词/图集/详情）、MediaCrawler（小红书/微博）、gallery-dl（X/Instagram/微博）、XHS-Downloader（小红书高分辨率）。来源项目只做候选召回，排序和下载由本项目统一完成。
+- 推荐来源项目：dy-cli（抖音）、MediaCrawler（小红书/微博）、Bilibili CLI（B 站）、gallery-dl（X/Instagram）和 XHS-Downloader（小红书高分辨率）。来源项目只做候选召回，账号确认、排序、去重和下载由本项目统一完成。
 - SQLite 查询缓存，降低重复检索延迟。
 - 可选本地语义重排：设置 `SEMANTIC_MODEL` 后启用 `sentence-transformers`，默认不下载模型、不增加启动成本。
 
@@ -297,7 +307,7 @@ social-image-mcp --check
 
 视频下载与图片下载共用账号身份校验、分页和断点续传，但使用独立的视频地址和 MIME 校验，结果中的 `media_type` 为 `video`。
 
-B 站关键词和视频 ID 使用公开 API 返回视频封面；账号抓取支持 B 站 UID/空间主页。原视频仅在平台返回完整渐进式播放地址时下载，受限接口会在 `warnings` 或 `error` 中说明。
+B 站关键词和视频 ID 使用独立 CLI 获取视频封面和播放地址；账号抓取支持精确昵称、UID 和空间主页，并按页采集作品。原视频仅在平台返回完整渐进式播放地址时下载，WBI 校验、Cookie 缺失或受限接口会在 `warnings` 或 `error` 中说明。
 
 Codex 推荐使用项目自带的绝对路径启动器，避免客户端工作目录变化导致缓存和下载目录漂移：
 

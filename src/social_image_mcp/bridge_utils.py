@@ -10,9 +10,11 @@ import html
 import re
 from collections.abc import Iterable
 from typing import Any
+from urllib.parse import urlparse
 
 
 _URL_RE = re.compile(r"^https?://", re.I)
+_AUDIO_EXTENSIONS = (".aac", ".flac", ".m4a", ".mp3", ".wav", ".wma")
 
 
 def _as_text(value: Any) -> str:
@@ -34,6 +36,14 @@ def _first(mapping: dict[str, Any], *keys: str) -> Any:
 def _url(value: Any) -> str | None:
     text = _as_text(value)
     return text if _URL_RE.match(text) else None
+
+
+def _video_url(value: Any) -> str | None:
+    """Return a media URL only when it is not an obvious audio track."""
+    url = _url(value)
+    if not url or urlparse(url).path.lower().endswith(_AUDIO_EXTENSIONS):
+        return None
+    return url
 
 
 def _dedupe(values: Iterable[str]) -> list[str]:
@@ -135,7 +145,11 @@ def extract_media_urls(platform: str, record: Any, include_video_covers: bool = 
         source = record.get("mblog") if isinstance(record.get("mblog"), dict) else record
         pics = source.get("pics") or []
         urls = _urls_from_items(pics, ("large", "original", "url", "large_url", "original_url"))
-        return urls or _urls_from_mapping(source)
+        if urls:
+            return urls
+        if include_video_covers and isinstance(source.get("page_info"), dict):
+            return _urls_from_mapping(source["page_info"].get("page_pic") or {})
+        return []
 
     return _urls_from_mapping(record)
 
@@ -153,15 +167,15 @@ def extract_video_urls(platform: str, record: Any) -> list[str]:
                 for key in ("url_list", "urlList", "urls"):
                     child = value.get(key)
                     if isinstance(child, list):
-                        values = [item for item in (_url(x) for x in child) if item]
+                        values = [item for item in (_video_url(x) for x in child) if item]
                         if values:
                             return [values[-1]]
-                    elif (item := _url(child)):
+                    elif (item := _video_url(child)):
                         return [item]
                 return [item for child in value.values() for item in best(child)]
             if isinstance(value, list):
                 return [item for child in value for item in best(child)]
-            return [_url(value)] if _url(value) else []
+            return [_video_url(value)] if _video_url(value) else []
 
         for key in ("play_addr", "download_addr", "play_url", "download_url", "bit_rate", "bitRate"):
             urls = _dedupe(best(video.get(key)))
@@ -172,15 +186,16 @@ def extract_video_urls(platform: str, record: Any) -> list[str]:
         source = record.get("mblog") if isinstance(record.get("mblog"), dict) else record
         page_info = source.get("page_info") or {}
         media_info = page_info.get("media_info") if isinstance(page_info, dict) else {}
-        values: list[str] = []
         if isinstance(media_info, dict):
             for key in ("mp4_720p_mp4", "mp4_hd_mp4", "mp4_sd_mp4", "video_url", "stream_url", "h5_url", "url"):
                 value = media_info.get(key)
                 if isinstance(value, dict):
-                    values.extend(_urls_from_mapping(value))
+                    urls = _urls_from_mapping(value)
+                    if urls:
+                        return urls[:1]
                 elif (url := _url(value)):
-                    values.append(url)
-        return _dedupe(values)
+                    return [url]
+        return []
     return []
 
 

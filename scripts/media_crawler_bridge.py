@@ -116,15 +116,43 @@ def _install_capture(platform: str, records: list[Any]) -> None:
 
 
 async def _fetch_weibo_creator(client: Any, request: CreatorFetchRequest) -> dict[str, Any]:
-    requested = request.profile_url or request.creator_id
-    target = creator_target("weibo", requested)
+    requested = request.profile_url or request.creator_id or request.creator_name or ""
+    if request.creator_name:
+        name = request.creator_name.strip()
+        if not name or len(name) > 200:
+            raise ValueError("invalid Weibo nickname")
+        data = await client.get(
+            "/api/container/getIndex",
+            {"containerid": f"100103type=3&q={name}", "page_type": "searchall", "page": 1},
+        )
+        matches: dict[str, dict[str, Any]] = {}
+        def collect(value: Any) -> None:
+            if isinstance(value, dict):
+                user = value.get("user") if isinstance(value.get("user"), dict) else value
+                uid = str(user.get("idstr") or user.get("id") or "")
+                if user.get("screen_name") == name and uid.isdigit():
+                    matches[uid] = user
+                for child in value.values():
+                    if isinstance(child, (dict, list)):
+                        collect(child)
+            elif isinstance(value, list):
+                for child in value:
+                    collect(child)
+        collect(data.get("cards") if isinstance(data, dict) else data)
+        if len(matches) != 1:
+            raise ValueError(f"creator_identity_unresolved: exact nickname matched {len(matches)} users; provide the full Weibo profile URL")
+        target = next(iter(matches))
+    else:
+        target = creator_target("weibo", requested)
     response = await client.get_creator_info_by_id(creator_id=target)
     profile = response.get("userInfo") or {}
     if str(profile.get("idstr") or profile.get("id") or "") != target:
         raise ValueError("creator_identity_mismatch: Weibo profile UID differs from the requested UID")
+    if request.creator_name and str(profile.get("screen_name") or "") != request.creator_name.strip():
+        raise ValueError("creator_identity_mismatch: Weibo profile nickname differs from the requested name")
     identity = CreatorIdentity(platform=Platform.WEIBO, requested_id=requested, canonical_id=target,
                                name=str(profile.get("screen_name") or ""), profile_url=f"https://weibo.com/u/{target}",
-                               source="media-crawler", matched_by="exact_uid")
+                               source="media-crawler", matched_by="exact_account_name" if request.creator_name else "exact_uid")
     collector = CreatorCollector(identity, request)
     while True:
         try:
@@ -142,6 +170,37 @@ async def _fetch_weibo_creator(client: Any, request: CreatorFetchRequest) -> dic
             collector.warnings.append(str(exc))
             break
     return collector.result()
+
+
+async def _weibo_creator_session_ready(client: Any, request: CreatorFetchRequest) -> bool:
+    """Check the requested creator, since /api/config can say logged out while the saved session works."""
+    try:
+        if request.creator_name:
+            name = request.creator_name.strip()
+            data = await client.get(
+                "/api/container/getIndex",
+                {"containerid": f"100103type=3&q={name}", "page_type": "searchall", "page": 1},
+            )
+            return isinstance(data, dict) and isinstance(data.get("cards"), list)
+        target = creator_target("weibo", request.profile_url or request.creator_id)
+        data = await client.get_creator_info_by_id(creator_id=target)
+        profile = data.get("userInfo") if isinstance(data, dict) else None
+        return isinstance(profile, dict) and str(profile.get("idstr") or profile.get("id") or "") == target
+    except Exception:
+        return False
+
+
+async def _weibo_search_session_ready(client: Any, query: str) -> bool:
+    """Use a real search/detail response when /api/config reports a false logout."""
+    try:
+        value = str(query or "").strip() or "微博"
+        data = await client.get(
+            "/api/container/getIndex",
+            {"containerid": f"100103type=1&q={value}", "page_type": "searchall", "page": 1},
+        )
+        return isinstance(data, dict) and isinstance(data.get("cards"), list)
+    except Exception:
+        return False
 
 
 def _resolve_douyin_identity(request: CreatorFetchRequest) -> CreatorIdentity:
@@ -217,8 +276,10 @@ async def _run(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, Any
     old_cwd = Path.cwd()
     creator_result = None
     original_creator_method = None
+    original_weibo_pong = None
     creator_request = None
     WeiboCrawler = None
+    WeiboClient = None
     DouYinCrawler = None
     creator_cli_target = ""
     try:
@@ -230,6 +291,16 @@ async def _run(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, Any
 
         platform = {"dy": "douyin", "xhs": "xhs", "wb": "weibo"}[PLATFORM_MAP[args.platform.lower()]]
         creator_request = CreatorFetchRequest.model_validate_json(os.environ["SOCIAL_IMAGE_CREATOR_REQUEST"]) if os.getenv("SOCIAL_IMAGE_CREATOR_REQUEST") else None
+        if platform == "weibo":
+            from media_platform.weibo.client import WeiboClient
+
+            async def weibo_session_pong(client):
+                if creator_request:
+                    return await _weibo_creator_session_ready(client, creator_request)
+                return await _weibo_search_session_ready(client, args.query or args.url or args.item_id)
+
+            original_weibo_pong = WeiboClient.pong
+            WeiboClient.pong = weibo_session_pong
         if creator_request:
             if platform not in {"weibo", "douyin"} or creator_request.platform.value != platform:
                 raise ValueError("MediaCrawler creator bridge supports only matching douyin or weibo requests")
@@ -247,7 +318,7 @@ async def _run(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, Any
                 original_creator_method = DouYinCrawler.get_creators_and_videos
                 DouYinCrawler.get_creators_and_videos = bounded_douyin_creator
             else:
-                creator_cli_target = creator_target("weibo", creator_request.profile_url or creator_request.creator_id)
+                creator_cli_target = "0" if creator_request.creator_name else creator_target("weibo", creator_request.profile_url or creator_request.creator_id)
                 async def bounded_weibo_creator(crawler):
                     nonlocal creator_result
                     creator_result = await _fetch_weibo_creator(crawler.wb_client, creator_request)
@@ -290,6 +361,8 @@ async def _run(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, Any
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             await media_main.main()
     finally:
+        if original_weibo_pong and WeiboClient:
+            WeiboClient.pong = original_weibo_pong
         if original_creator_method:
             if platform == "douyin" and DouYinCrawler:
                 DouYinCrawler.get_creators_and_videos = original_creator_method

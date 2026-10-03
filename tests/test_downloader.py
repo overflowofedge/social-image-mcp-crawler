@@ -1,5 +1,6 @@
 import asyncio
 import io
+import re
 
 import httpx
 from PIL import Image
@@ -52,6 +53,64 @@ def test_weibo_image_download_sends_page_referer(tmp_path):
     asyncio.run(run())
 
 
+def test_weibo_video_download_writes_mp4_with_page_referer(tmp_path):
+    seen = {}
+    def handler(request):
+        seen["referer"] = request.headers.get("referer")
+        return httpx.Response(200, headers={"content-type": "video/mp4"}, content=b"weibo-video", request=request)
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            item = ImageCandidate(id="post:1", platform=Platform.WEIBO, image_url="https://video.test/play",
+                                  media_type="video", permalink="https://m.weibo.cn/detail/post")
+            return (await ImageDownloader(client).download_many([item], tmp_path))[0]
+    record = asyncio.run(run())
+    assert record.status == "downloaded"
+    assert record.path.endswith(".mp4")
+    assert seen["referer"] == "https://m.weibo.cn/detail/post"
+
+
+def test_douyin_video_download_sends_site_referer(tmp_path):
+    seen = {}
+
+    def handler(request):
+        seen.update(request.headers)
+        return httpx.Response(200, content=b"video", headers={"content-type": "video/mp4"})
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            item = ImageCandidate(id="v1", platform=Platform.DOUYIN, image_url="https://cdn.test/play", media_type="video")
+            record = (await ImageDownloader(client).download_many([item], tmp_path))[0]
+            assert record.status == "downloaded"
+
+    asyncio.run(run())
+    assert seen["referer"] == "https://www.douyin.com/"
+    assert seen["origin"] == "https://www.douyin.com"
+    assert "Chrome/" in seen["user-agent"]
+
+
+def test_bilibili_video_download_sends_page_origin(tmp_path):
+    seen = {}
+
+    def handler(request):
+        seen.update(request.headers)
+        return httpx.Response(200, content=b"video", headers={"content-type": "video/mp4"}, request=request)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            item = ImageCandidate(
+                id="BV1:video", platform=Platform.BILIBILI,
+                image_url="https://upos.example.test/video.mp4", media_type="video",
+                permalink="https://www.bilibili.com/video/BV1",
+            )
+            return (await ImageDownloader(client).download_many([item], tmp_path))[0]
+
+    record = asyncio.run(run())
+    assert record.status == "downloaded"
+    assert seen["referer"] == "https://www.bilibili.com/video/BV1"
+    assert seen["origin"] == "https://www.bilibili.com"
+    assert "Chrome/" in seen["user-agent"]
+
+
 def test_downloader_deduplicates_near_identical_images(tmp_path):
     first = io.BytesIO()
     second = io.BytesIO()
@@ -96,6 +155,27 @@ def test_downloader_resume_reuses_verified_existing_file(tmp_path):
     asyncio.run(run())
 
 
+def test_downloader_names_work_with_timestamp_id_title_and_platform_namespace(tmp_path):
+    buffer = io.BytesIO()
+    Image.new("RGB", (40, 30), "green").save(buffer, format="JPEG")
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, headers={"content-type": "image/jpeg"}, content=buffer.getvalue(), request=request)
+        )) as client:
+            item = ImageCandidate(
+                id="work-1:1", platform=Platform.DOUYIN, image_url="https://cdn.test/work.jpg",
+                creator_id="sec-1", post_id="work-1", media_index=1,
+                title="春日穿搭/原图", published_at="2026-10-03T12:34:56+08:00",
+            )
+            return (await ImageDownloader(client).download_many([item], tmp_path))[0]
+
+    record = asyncio.run(run())
+    path = __import__("pathlib").Path(record.path)
+    assert path.parent == tmp_path / "douyin" / "images"
+    assert re.match(r"^20261003_043456_work-1_春日穿搭_原图\.jpg$", path.name)
+
+
 def test_downloader_accepts_video_media_and_keeps_media_type(tmp_path):
     payload = b"fake-mp4-payload"
 
@@ -110,5 +190,22 @@ def test_downloader_accepts_video_media_and_keeps_media_type(tmp_path):
             assert record.status == "downloaded"
             assert record.media_type == "video"
             assert record.path and record.path.endswith(".mp4")
+
+    asyncio.run(run())
+
+
+def test_webpage_download_rejects_tiny_images_even_without_user_size_filter(tmp_path):
+    buffer = io.BytesIO()
+    Image.new("RGB", (96, 96), "red").save(buffer, format="PNG")
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=buffer.getvalue(), headers={"content-type": "image/png"})
+        )) as client:
+            item = ImageCandidate(id="hashed-icon", platform=Platform.OTHER, image_url="https://example.org/a")
+            record = (await ImageDownloader(client).download_many([item], tmp_path))[0]
+        assert record.status == "rejected"
+        assert record.path is None
+        assert not list(tmp_path.glob("*.png"))
 
     asyncio.run(run())
