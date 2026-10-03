@@ -79,6 +79,33 @@ def _preview_referer(image_url: str, referer: str = "") -> str:
     return ""
 
 
+def _creator_hint(query: str, selected_platform: str | None, detected: str | None) -> tuple[str | None, str | None]:
+    """Infer an account target for the single-platform desktop form."""
+    if detected or selected_platform not in {"douyin", "weibo", "bilibili", "x"}:
+        return None, None
+    compact = query.strip()
+    looks_like_name = (
+        len(compact) <= 50
+        and "\n" not in compact
+        and "\r" not in compact
+        and not compact.startswith(("http://", "https://"))
+    )
+    if not looks_like_name:
+        return None, None
+    # Bilibili account IDs (mid) are numeric. Every other short single-field
+    # input is a display nickname, including English names and names with
+    # spaces; treating those as IDs makes ``creator_target`` reject them before
+    # the account search can run.
+    if selected_platform == "bilibili":
+        if compact.isdigit():
+            return None, compact
+        return compact.lstrip("@"), None
+    has_chinese = any("\u4e00" <= char <= "\u9fff" for char in compact)
+    if compact.isdigit() or (selected_platform in {"douyin", "x"} and not has_chinese):
+        return None, compact.lstrip("@")
+    return compact.lstrip("@"), None
+
+
 async def _fetch_preview(image_url: str, referer: str = "") -> tuple[str, bytes]:
     parsed = urlparse(image_url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -183,24 +210,9 @@ class Handler(BaseHTTPRequestHandler):
                 platforms = None
             selected_platform = platforms[0] if platforms and len(platforms) == 1 else None
             # The checkbox is intentionally gone: short, single-platform
-            # names are first tried as exact creator names. If no account is
-            # found, the same input is retried as a normal keyword search.
-            auto_creator = None
-            auto_creator_id = None
-            if not detected and selected_platform in {"douyin", "weibo", "x"}:
-                compact = query.strip()
-                looks_like_name = (
-                    len(compact) <= 24
-                    and " " not in compact
-                    and "\n" not in compact
-                    and not compact.startswith(("http://", "https://"))
-                )
-                if looks_like_name:
-                    has_chinese = any("\u4e00" <= char <= "\u9fff" for char in compact)
-                    if compact.isdigit() or (selected_platform in {"douyin", "x"} and not has_chinese):
-                        auto_creator_id = compact.lstrip("@")
-                    else:
-                        auto_creator = compact.lstrip("@")
+            # names are first tried as creator names. If no account is found,
+            # the same input is retried as a normal keyword search.
+            auto_creator, auto_creator_id = _creator_hint(query, selected_platform, detected)
             def optional_int(name):
                 value = body.get(name)
                 return int(value) if value not in (None, "", 0, "0") else None
@@ -218,7 +230,10 @@ class Handler(BaseHTTPRequestHandler):
             error = result.get("error") if isinstance(result, dict) else None
             if (auto_creator or auto_creator_id) and isinstance(error, dict):
                 message = str(error.get("message", "")).lower()
-                if any(marker in message for marker in ("matched 0", "not found", "invalid creator")):
+                if any(marker in message for marker in (
+                    "matched 0", "not found", "invalid creator",
+                    "creator_identity_unresolved", "identity_unresolved",
+                )):
                     result = self.runner.call(search_images(**search_kwargs, creator_name=None, creator_id=None))
             self._send(200, result)
         except Exception as exc:

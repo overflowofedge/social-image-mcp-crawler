@@ -18,11 +18,11 @@
    powershell -ExecutionPolicy Bypass -File .\scripts\install_desktop.ps1
    ```
 
-4. 只使用“其他平台”时可以直接启动。需要抖音时，先安装 `third_party\dy-cli`，尚未配置浏览器时执行 `.\.venv\Scripts\python.exe -m playwright install chromium`，然后运行 `scripts\douyin_login.ps1`；需要微博或小红书时，运行 `powershell -ExecutionPolicy Bypass -File .\scripts\install_sources.ps1 -UseGit`，首次搜索时按浏览器提示登录。
+4. 只使用“其他平台”时可以直接启动。需要抖音时，先安装 `third_party\dy-cli`，尚未配置浏览器时执行 `.\.venv\Scripts\python.exe -m playwright install chromium`，然后运行 `scripts\douyin_login.ps1`；需要抖音、小红书、微博或 B 站时，运行 `powershell -ExecutionPolicy Bypass -File .\scripts\install_desktop.ps1 -InstallSources`，安装来源及桌面桥接依赖。四个平台的检索和账号采集都通过独立 CLI 子进程运行，首次采集时按浏览器提示完成登录。
 
 ## 启动
 
-双击 `启动应用.bat`。启动前会自动检查 Python 依赖、Playwright 浏览器、来源桥接、抖音 Cookie，并执行一次轻量抖音链路检查；缺少 Chromium 会尝试安装，Cookie 缺失或过期会打开扫码登录流程。详细结果保存在 `.cache\preflight-latest.json`。检查通过后浏览器打开 `http://127.0.0.1:8765/` 即可使用。关闭启动它的 PowerShell 窗口即可停止应用。
+双击 `启动应用.bat`。启动前会自动检查 Python 依赖、Playwright 浏览器、来源桥接、抖音 Cookie，并执行轻量抖音和微博接口检查；缺少 MediaCrawler 桥接依赖会尝试修复。详细结果保存在 `.cache\preflight-latest.json`，微博浏览器登录状态需在首次采集时核验。检查通过后浏览器打开 `http://127.0.0.1:8765/` 即可使用。关闭启动它的 PowerShell 窗口即可停止应用。
 
 如果旧版启动时出现 `init_import_site` / `UnicodeDecodeError`，更新后直接双击启动即可。程序会在 Python 加载依赖前修复中文安装路径的编码，并备份原路径文件；不需要删除 `.venv`、`.env`、登录缓存或已下载的文件。安装脚本也会执行同样的修复。
 
@@ -34,6 +34,6 @@
 - 选择“其他平台”并粘贴主页地址时，会提取正文图片和直接视频文件，并按“最大作品数”访问同站内容卡片的详情页（只检索一层）。支持懒加载、原图链接、响应式图片和结构化媒体；自动过滤导航、Logo、图标以及宽高不足 160 像素的小图。
 - 图片和视频可同时采集，分别计数；每篇图片上限不影响视频。动态内容会尝试浏览器加载，需已安装 Chromium 或配置 `WEBPAGE_BROWSER_PATH`。HLS/DASH 分段视频和只有嵌入式播放器的页面目前会明确提示限制。
 - 图片模式不要求填写视频数量；只有视频或全部模式才填写视频数量。
-- 点击开始采集后，图片会下载到 `downloads`，页面会显示采集数量、下载状态和缩略图。微博图片通过本地预览代理加载，避免浏览器跨域或 Referer 导致破图。
+- 点击开始采集后，页面会按作品类型列出图片、视频和混合作品清单；文件按平台与媒体类型保存到 `downloads/<platform>/<images|videos>`，命名为 `时间戳_作品号_作品名`。重复采集会读取作品清单和 `manifest.jsonl`，只下载新增作品，已校验的文件显示为已存在。微博图片通过本地预览代理加载，避免浏览器跨域或 Referer 导致破图。
 
 桌面版与 MCP 使用同一套采集、筛选、下载和断点逻辑，但桌面版日常使用不要求安装或注册 MCP 客户端。

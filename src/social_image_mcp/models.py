@@ -162,5 +162,7 @@ class DownloadRecord(BaseModel):
     creator_id: str | None = None
     post_id: str | None = None
     media_index: int | None = None
+    title: str = ""
+    published_at: str | None = None
     status: str
     error: str | None = None

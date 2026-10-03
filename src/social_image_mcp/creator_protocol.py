@@ -99,7 +99,7 @@ def creator_items(platform: str, record: dict[str, Any], identity: CreatorIdenti
         return []
     # Never recursively extract avatars, reposted media or link preview pictures.
     data = record.get("mblog", record) if platform == "weibo" else record
-    if platform == "weibo" and not data.get("pics"):
+    if platform == "weibo" and not data.get("pics") and not data.get("page_info"):
         return []
     items = normalize_native_record(platform, record, identity.source, include_video_covers=covers, media_type=media_type)
     for item in items:
@@ -126,23 +126,51 @@ def douyin_identity(client: Any, requested: str, nickname: bool = False) -> Crea
         for row in payload.get("data") or []:
             if isinstance(row, dict):
                 rows.extend(row.get("user_list") or [])
-        matches = {}
+        matches: dict[str, dict[str, Any]] = {}
         for row in rows:
             user = row.get("user_info") or row
             keys = ("nickname", "nick_name", "display_name") if nickname else ("unique_id", "short_id", "uid")
             if any(str(user.get(key) or "") == target for key in keys) and user.get("sec_uid"):
-                matches[str(user["sec_uid"])] = user
-        if len(matches) != 1:
+                # Dict insertion order preserves Douyin's relevance ranking
+                # while collapsing duplicate representations of one account.
+                matches.setdefault(str(user["sec_uid"]), user)
+        if not matches:
             target_kind = "nickname" if nickname else "account ID"
-            raise ValueError(f"creator_identity_unresolved: exact {target_kind} matched {len(matches)} users; provide the full Douyin profile URL")
-        sec_uid = next(iter(matches))
-        matched_by = "exact_account_name" if nickname else "exact_account_id"
-    profile = client.get_user_profile(sec_uid)
+            raise ValueError(f"creator_identity_unresolved: exact {target_kind} matched 0 users")
+        profile = None
+        profile_error: Exception | None = None
+        for candidate_uid in matches:
+            try:
+                candidate_profile = client.get_user_profile(candidate_uid)
+            except Exception as exc:
+                profile_error = profile_error or exc
+                continue
+            if str(candidate_profile.get("sec_uid") or "") != candidate_uid:
+                continue
+            if nickname:
+                confirmed = any(str(candidate_profile.get(key) or "") == target for key in ("nickname", "nick_name", "display_name"))
+            else:
+                confirmed = any(str(candidate_profile.get(key) or "") == target for key in ("unique_id", "short_id", "uid"))
+            if confirmed:
+                sec_uid, profile = candidate_uid, candidate_profile
+                break
+        if profile is None:
+            if profile_error:
+                raise profile_error
+            raise ValueError("creator_identity_mismatch: no ranked search result confirmed the requested account")
+        matched_by = (
+            "ranked_exact_account_name" if nickname and len(matches) > 1
+            else "exact_account_name" if nickname
+            else "ranked_exact_account_id" if len(matches) > 1
+            else "exact_account_id"
+        )
+    else:
+        profile = client.get_user_profile(sec_uid)
     if str(profile.get("sec_uid") or "") != sec_uid:
         raise ValueError("creator_identity_mismatch: profile did not confirm the requested sec_uid")
-    if matched_by == "exact_account_id" and not any(str(profile.get(k) or "") == target for k in ("unique_id", "short_id", "uid")):
+    if matched_by in {"exact_account_id", "ranked_exact_account_id"} and not any(str(profile.get(k) or "") == target for k in ("unique_id", "short_id", "uid")):
         raise ValueError("creator_identity_mismatch: profile account ID differs from the requested ID")
-    if matched_by == "exact_account_name" and not any(str(profile.get(k) or "") == target for k in ("nickname", "nick_name", "display_name")):
+    if matched_by in {"exact_account_name", "ranked_exact_account_name"} and not any(str(profile.get(k) or "") == target for k in ("nickname", "nick_name", "display_name")):
         raise ValueError("creator_identity_mismatch: profile nickname differs from the requested name")
     return CreatorIdentity(platform=Platform.DOUYIN, requested_id=requested, canonical_id=sec_uid,
                            name=str(profile.get("nickname") or ""), profile_url=f"https://www.douyin.com/user/{sec_uid}",

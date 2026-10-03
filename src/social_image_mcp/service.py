@@ -57,7 +57,7 @@ class SocialImageService:
             label_map=getattr(self.settings, "object_label_map", None),
             vision=self.vision,
         )
-        self.sources = SourceHub(self.settings.media_crawler_command, self.settings.xhs_downloader_command, self.settings.gallery_dl_binary, self.settings.gallery_dl_config, self.settings.source_timeout_seconds, self.settings.douyin_source_command, self.settings.douyin_source_timeout_seconds, self.settings.gallery_dl_cookies_from_browser, self.settings.source_failure_cooldown_seconds, self.settings.source_verification_path, self.settings.source_verification_ttl_seconds, self.settings.gallery_dl_cookies_file, getattr(self.settings, "douyin_media_crawler_fallback", False))
+        self.sources = SourceHub(self.settings.media_crawler_command, self.settings.xhs_downloader_command, self.settings.gallery_dl_binary, self.settings.gallery_dl_config, self.settings.source_timeout_seconds, self.settings.douyin_source_command, self.settings.douyin_source_timeout_seconds, self.settings.gallery_dl_cookies_from_browser, self.settings.source_failure_cooldown_seconds, self.settings.source_verification_path, self.settings.source_verification_ttl_seconds, self.settings.gallery_dl_cookies_file, getattr(self.settings, "douyin_media_crawler_fallback", False), getattr(self.settings, "bilibili_source_command", None))
         self.creators = CreatorImageService(
             self.settings, self.sources, self.downloader, self.reranker, self.vision, self.object_detector,
             bilibili=getattr(self.adapters.get(Platform.BILIBILI), "api", None),
@@ -184,7 +184,24 @@ class SocialImageService:
             if request.retrieval_mode in ("discovery", "hybrid"):
                 await collect("discovery", self.discovery.search(platform, intent, requested_total * 2))
             if request.retrieval_mode in ("sources", "hybrid"):
-                if platform in (Platform.BILIBILI, Platform.WEIBO):
+                if platform == Platform.BILIBILI:
+                    # Bilibili uses the same isolated JSON CLI contract as
+                    # the other domestic platforms. The native API remains a
+                    # bounded fallback when no CLI has been installed.
+                    await collect("sources", self.sources.search(platform, intent, source_limit, request=request))
+                    if not candidates:
+                        await collect(
+                            "platform",
+                            adapter.search(
+                                intent,
+                                requested_total * 2,
+                                request.safe_mode,
+                                request.media_type,
+                                image_limit=request.image_limit,
+                                video_limit=request.video_limit,
+                            ),
+                        )
+                elif platform == Platform.WEIBO:
                     media_crawler = getattr(self.sources, "media_crawler", None)
                     if platform == Platform.WEIBO and getattr(media_crawler, "command_template", None):
                         # Prefer an already configured authenticated source;
@@ -561,7 +578,7 @@ class SocialImageService:
 
     def source_statuses(self) -> list[dict]:
         if self.sources is None:
-            self.sources = SourceHub(self.settings.media_crawler_command, self.settings.xhs_downloader_command, self.settings.gallery_dl_binary, self.settings.gallery_dl_config, self.settings.source_timeout_seconds, self.settings.douyin_source_command, self.settings.douyin_source_timeout_seconds, self.settings.gallery_dl_cookies_from_browser, self.settings.source_failure_cooldown_seconds, self.settings.source_verification_path, self.settings.source_verification_ttl_seconds, self.settings.gallery_dl_cookies_file, getattr(self.settings, "douyin_media_crawler_fallback", False))
+            self.sources = SourceHub(self.settings.media_crawler_command, self.settings.xhs_downloader_command, self.settings.gallery_dl_binary, self.settings.gallery_dl_config, self.settings.source_timeout_seconds, self.settings.douyin_source_command, self.settings.douyin_source_timeout_seconds, self.settings.gallery_dl_cookies_from_browser, self.settings.source_failure_cooldown_seconds, self.settings.source_verification_path, self.settings.source_verification_ttl_seconds, self.settings.gallery_dl_cookies_file, getattr(self.settings, "douyin_media_crawler_fallback", False), getattr(self.settings, "bilibili_source_command", None))
         return self.sources.statuses()
 
 

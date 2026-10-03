@@ -145,7 +145,11 @@ def extract_media_urls(platform: str, record: Any, include_video_covers: bool = 
         source = record.get("mblog") if isinstance(record.get("mblog"), dict) else record
         pics = source.get("pics") or []
         urls = _urls_from_items(pics, ("large", "original", "url", "large_url", "original_url"))
-        return urls or _urls_from_mapping(source)
+        if urls:
+            return urls
+        if include_video_covers and isinstance(source.get("page_info"), dict):
+            return _urls_from_mapping(source["page_info"].get("page_pic") or {})
+        return []
 
     return _urls_from_mapping(record)
 
@@ -182,15 +186,16 @@ def extract_video_urls(platform: str, record: Any) -> list[str]:
         source = record.get("mblog") if isinstance(record.get("mblog"), dict) else record
         page_info = source.get("page_info") or {}
         media_info = page_info.get("media_info") if isinstance(page_info, dict) else {}
-        values: list[str] = []
         if isinstance(media_info, dict):
             for key in ("mp4_720p_mp4", "mp4_hd_mp4", "mp4_sd_mp4", "video_url", "stream_url", "h5_url", "url"):
                 value = media_info.get(key)
                 if isinstance(value, dict):
-                    values.extend(_urls_from_mapping(value))
+                    urls = _urls_from_mapping(value)
+                    if urls:
+                        return urls[:1]
                 elif (url := _url(value)):
-                    values.append(url)
-        return _dedupe(values)
+                    return [url]
+        return []
     return []
 
 

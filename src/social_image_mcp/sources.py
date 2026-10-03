@@ -814,7 +814,7 @@ class GalleryDlSource:
 
 
 class SourceHub:
-    def __init__(self, media_crawler_command: str | None, xhs_downloader_command: str | None, gallery_dl_binary: str, gallery_dl_config: str | None = None, timeout_seconds: int = 120, douyin_source_command: str | None = None, douyin_timeout_seconds: int = 45, gallery_dl_cookies_from_browser: str | None = None, failure_cooldown_seconds: int = 120, verification_path: str | None = None, verification_ttl_seconds: int = 86400, gallery_dl_cookies_file: str | None = None, douyin_media_crawler_fallback: bool = False) -> None:
+    def __init__(self, media_crawler_command: str | None, xhs_downloader_command: str | None, gallery_dl_binary: str, gallery_dl_config: str | None = None, timeout_seconds: int = 120, douyin_source_command: str | None = None, douyin_timeout_seconds: int = 45, gallery_dl_cookies_from_browser: str | None = None, failure_cooldown_seconds: int = 120, verification_path: str | None = None, verification_ttl_seconds: int = 86400, gallery_dl_cookies_file: str | None = None, douyin_media_crawler_fallback: bool = False, bilibili_source_command: str | None = None) -> None:
         # Douyin is intentionally handled by dy-cli. MediaCrawler's Douyin
         # browser-login path is not used when embedded in an MCP stdio server.
         # MediaCrawler remains available as an opt-in Douyin creator fallback.
@@ -825,11 +825,12 @@ class SourceHub:
         self.media_crawler = ExternalJsonSource("media-crawler", media_crawler_command, domestic, timeout_seconds, failure_cooldown_seconds, verification)
         self.xhs_downloader = ExternalJsonSource("xhs-downloader", xhs_downloader_command, (Platform.XHS,), timeout_seconds, failure_cooldown_seconds, verification)
         self.douyin_source = ExternalJsonSource("dy-cli", douyin_source_command, (Platform.DOUYIN,), douyin_timeout_seconds, failure_cooldown_seconds, verification)
+        self.bilibili_source = ExternalJsonSource("bilibili-cli", bilibili_source_command, (Platform.BILIBILI,), timeout_seconds, failure_cooldown_seconds, verification)
         self.douyin_media_crawler_fallback = douyin_media_crawler_fallback
         self.gallery_dl = GalleryDlSource(gallery_dl_binary, gallery_dl_config, timeout_seconds, gallery_dl_cookies_from_browser, failure_cooldown_seconds, verification, gallery_dl_cookies_file)
 
     def statuses(self) -> list[dict[str, Any]]:
-        return [{"name": status.name, "configured": status.configured, "verified": status.verified, "verified_platforms": list(status.verified_platforms), "ready_platforms": list(status.ready_platforms), "mode": status.mode, "detail": status.detail, "platforms": list(status.platforms), "platform_status": status.platform_status or {}} for status in (self.douyin_source.status, self.media_crawler.status, self.xhs_downloader.status, self.gallery_dl.status)]
+        return [{"name": status.name, "configured": status.configured, "verified": status.verified, "verified_platforms": list(status.verified_platforms), "ready_platforms": list(status.ready_platforms), "mode": status.mode, "detail": status.detail, "platforms": list(status.platforms), "platform_status": status.platform_status or {}} for status in (self.douyin_source.status, self.bilibili_source.status, self.media_crawler.status, self.xhs_downloader.status, self.gallery_dl.status)]
 
     async def fetch_creator(self, request: CreatorFetchRequest) -> CreatorSourceResult:
         if request.platform == Platform.DOUYIN:
@@ -845,6 +846,8 @@ class SourceHub:
                 except (SourceError, SourceUnavailable) as exc:
                     errors.append(f"media-crawler: {exc}")
             raise SourceError("; ".join(errors) or "No creator source configured for douyin")
+        if request.platform == Platform.BILIBILI and self.bilibili_source.command_template:
+            return await self.bilibili_source.fetch_creator(request)
         if request.platform == Platform.WEIBO:
             return await self.media_crawler.fetch_creator(request)
         if request.platform == Platform.BILIBILI:
@@ -861,6 +864,8 @@ class SourceHub:
             sources.append(self.media_crawler)
         if platform == Platform.XHS and self.xhs_downloader.command_template and (intent.url or intent.identifier):
             sources.append(self.xhs_downloader)
+        if platform == Platform.BILIBILI and self.bilibili_source.command_template:
+            sources.append(self.bilibili_source)
         if platform in self.gallery_dl.platforms and self.gallery_dl.status.configured and (platform != Platform.WEIBO or intent.url or intent.identifier):
             sources.append(self.gallery_dl)
         if not sources:

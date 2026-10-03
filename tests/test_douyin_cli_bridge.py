@@ -155,6 +155,16 @@ def test_browser_user_search_matches_exact_nickname():
     assert _browser_user_matches(payload, "放学小野猪", nickname=True) == [payload["data"][0]["user_info"]]
 
 
+def test_browser_user_search_preserves_rank_for_duplicate_exact_nicknames():
+    payload = {"data": [
+        {"user_info": {"sec_uid": "sec-ranked", "nickname": "同名账号"}},
+        {"user_info": {"sec_uid": "sec-later", "nickname": "同名账号"}},
+    ]}
+    assert [row["sec_uid"] for row in _browser_user_matches(payload, "同名账号", nickname=True)] == [
+        "sec-ranked", "sec-later",
+    ]
+
+
 def test_browser_post_cursor_normalizes_string_booleans_and_query_cursor():
     url = "https://www.douyin.com/aweme/v1/web/aweme/post/?sec_user_id=sec-1&max_cursor=18"
     assert _browser_endpoint(url) == "posts"

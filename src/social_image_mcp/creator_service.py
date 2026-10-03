@@ -6,6 +6,7 @@ import json
 import re
 import sqlite3
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .creator_protocol import creator_target, timestamp
@@ -89,7 +90,11 @@ class CreatorImageService:
                 "cursor": request.cursor,
                 "pending": [],
                 "seen": [],
+                "catalog": {},
+                "completed": [],
                 "exhausted": False,
+                "last_refresh_at": None,
+                "refresh_count": 0,
                 "posts_fetched": 0,
                 "post_ids": [],
                 "pages_fetched": 0,
@@ -128,9 +133,19 @@ class CreatorImageService:
             state.setdefault("object_decisions", {})
             state.setdefault("object_rejected", 0)
             state.setdefault("object_unverified", 0)
+            state.setdefault("last_refresh_at", None)
+            state.setdefault("refresh_count", 0)
+            state.setdefault("catalog", {})
+            state.setdefault("completed", [])
         warnings = []
         source_result = None
-        if not state["pending"] and not state["exhausted"]:
+        # Once the previous batch is drained, probe the source again even if
+        # its old cursor was exhausted. Creator timelines are append-only in
+        # normal use, so the first page acts as a cheap incremental sync: old
+        # post/media keys are discarded by ``seen`` and only new works enter
+        # the pending queue. A pending batch is left untouched so a failed
+        # download can be retried without advancing the source cursor.
+        if not state["pending"] and (not state["exhausted"] or request.resume):
             source_data = request.model_dump(mode="python")
             source_data["cursor"] = state["cursor"]
             # A successful first lookup resolves a Douyin handle to sec_uid.
@@ -141,12 +156,29 @@ class CreatorImageService:
                 source_data["creator_name"] = None
                 source_data["profile_url"] = state["identity"]["profile_url"]
             source_request = CreatorFetchRequest.model_validate(source_data)
-            if request.platform.value in {"bilibili", "weibo"} and getattr(self, request.platform.value, None) is not None:
+            cli_source = getattr(self.sources, "bilibili_source", None) if request.platform.value == "bilibili" else None
+            if request.platform.value == "bilibili" and cli_source is not None and cli_source.command_template:
+                source_result = await self.sources.fetch_creator(source_request)
+            elif request.platform.value == "weibo" and getattr(getattr(self.sources, "media_crawler", None), "command_template", None):
+                # Keep Weibo account retrieval in the isolated CLI process,
+                # matching Douyin/XHS/Bilibili.  The public API remains a
+                # bounded fallback for installations that have no working
+                # MediaCrawler session.
+                try:
+                    source_result = await self.sources.fetch_creator(source_request)
+                except SourceError as exc:
+                    if self.weibo is None:
+                        raise
+                    try:
+                        source_result = await self.weibo.fetch_creator(source_request)
+                    except WeiboError as fallback_exc:
+                        raise SourceError(f"weibo CLI: {exc}; public API fallback: {fallback_exc}") from fallback_exc
+            elif request.platform.value in {"bilibili", "weibo"} and getattr(self, request.platform.value, None) is not None:
                 native_api = getattr(self, request.platform.value)
                 try:
                     source_result = await native_api.fetch_creator(source_request)
                 except (BilibiliError, WeiboError) as exc:
-                    if request.platform.value == "bilibili" or request.creator_name:
+                    if request.platform.value == "bilibili":
                         raise SourceError(str(exc)) from exc
                     # Weibo's mobile endpoint is rate limited in some
                     # regions; retain MediaCrawler as an authenticated,
@@ -169,6 +201,7 @@ class CreatorImageService:
                     state["post_ids"].append(post_id)
                     known_post_ids.add(post_id)
             seen = set(state["seen"])
+            catalog = state.get("catalog") if isinstance(state.get("catalog"), dict) else {}
             valid = []
             rejected = source_result.rejected_posts
             for item in source_result.items:
@@ -176,6 +209,7 @@ class CreatorImageService:
                     rejected += 1
                     continue
                 media_key = f"{item.post_id}:{item.media_index}"
+                catalog[media_key] = item.model_dump(mode="json")
                 if media_key in seen:
                     continue
                 seen.add(media_key)
@@ -201,8 +235,10 @@ class CreatorImageService:
             if request.content_query:
                 valid, filter_meta = await self._filter_content(valid, request)
                 state.update(filter_meta)
-            state.update({"seen": list(seen), "pending": [item.model_dump(mode="json") for item in valid],
+            state.update({"seen": list(seen), "catalog": catalog, "pending": [item.model_dump(mode="json") for item in valid],
                           "cursor": source_result.next_cursor, "exhausted": source_result.next_cursor is None})
+            state["last_refresh_at"] = timestamp(datetime.now(timezone.utc).isoformat())
+            state["refresh_count"] = int(state.get("refresh_count") or 0) + 1
             state["warnings"].extend(warnings)
             self.store.save(key, state)
         selected = self._select_with_quotas(
@@ -212,6 +248,13 @@ class CreatorImageService:
         if request.download and selected:
             records = await self.downloader.download_many(selected, output, request.max_concurrency, request.min_width, request.min_height, resume=request.resume)
             finished = {record.candidate_id for record in records if record.status in {"downloaded", "existing", "duplicate", "rejected"}}
+            completed = set(state.get("completed") or [])
+            by_id = {item.id: item for item in selected}
+            for record in records:
+                if record.candidate_id in finished and record.candidate_id in by_id:
+                    item = by_id[record.candidate_id]
+                    completed.add(f"{item.post_id}:{item.media_index}")
+            state["completed"] = sorted(completed)
             state["pending"] = [item for item in state["pending"] if item["id"] not in finished]
             self.store.save(key, state)
         elif warnings:
@@ -221,10 +264,26 @@ class CreatorImageService:
         error = None
         if state.get("filter_error"):
             error = {"code": "content_filter_required", "message": str(state["filter_error"])}
-        return {"identity": state["identity"], "items": [item.model_dump(mode="json") for item in selected],
+        selected_payload = [item.model_dump(mode="json") for item in selected]
+        pending_keys = {
+            f"{item.get('post_id') or item.get('id')}:{item.get('media_index')}"
+            for item in state.get("pending", [])
+            if isinstance(item, dict)
+        }
+        # ``catalog`` is the durable de-duplication ledger.  The response
+        # describes the batch selected for this call so the desktop list does
+        # not repeat every historical work after an incremental refresh.
+        display_items = selected or [ImageCandidate.model_validate(item) for item in state.get("pending", [])]
+        works = self._group_works(display_items, set(state.get("completed") or []), pending_keys)
+        new_work_ids = sorted({item.post_id or item.id for item in selected})
+        return {"identity": state["identity"], "items": selected_payload, "works": works,
+                "work_types": self._work_type_counts(works),
+                "new_work_ids": new_work_ids,
                 "downloads": [record.model_dump(mode="json") for record in records], "output_dir": str(output),
                 "next_cursor": state["cursor"], "pending_images": len(state["pending"]),
                 "has_more": bool(state["pending"]) or not state["exhausted"],
+                "last_refresh_at": state.get("last_refresh_at"),
+                "refresh_count": int(state.get("refresh_count") or 0),
                 "posts_fetched": state["posts_fetched"],
                 "post_ids": list(state["post_ids"]),
                 "pages_fetched": state["pages_fetched"],
@@ -252,6 +311,57 @@ class CreatorImageService:
                 "object_decisions": state.get("object_decisions") or {},
                 "object_rejected": int(state.get("object_rejected") or 0),
                 "object_unverified": int(state.get("object_unverified") or 0)}
+
+    @staticmethod
+    def _group_works(items: list[ImageCandidate], completed: set[str] | None = None, pending: set[str] | None = None) -> list[dict]:
+        """Present a creator response as works with media children.
+
+        Source adapters return one row per downloadable asset. Grouping at
+        this boundary gives every platform the same browsable work list while
+        keeping adapter-specific parsing isolated.
+        """
+        completed = completed or set()
+        pending = pending or set()
+        grouped: dict[str, list[ImageCandidate]] = {}
+        order: list[str] = []
+        for item in items:
+            work_id = item.post_id or item.id
+            if work_id not in grouped:
+                grouped[work_id] = []
+                order.append(work_id)
+            grouped[work_id].append(item)
+        works: list[dict] = []
+        for work_id in order:
+            media = grouped[work_id]
+            kinds = {item.media_type for item in media}
+            work_type = "mixed" if len(kinds) > 1 else next(iter(kinds), "unknown")
+            first = media[0]
+            work_payload = {
+                "work_id": work_id,
+                "title": first.title,
+                "published_at": first.published_at,
+                "media_type": work_type,
+                "media_count": len(media),
+                "image_count": sum(item.media_type == "image" for item in media),
+                "video_count": sum(item.media_type == "video" for item in media),
+                "items": [],
+            }
+            for item in media:
+                item_payload = item.model_dump(mode="json")
+                media_key = f"{item.post_id}:{item.media_index}"
+                item_payload["download_status"] = "downloaded" if media_key in completed else ("pending" if media_key in pending else "known")
+                work_payload["items"].append(item_payload)
+            work_payload["download_status"] = "downloaded" if all(item.get("download_status") == "downloaded" for item in work_payload["items"]) else ("pending" if any(item.get("download_status") == "pending" for item in work_payload["items"]) else "known")
+            works.append(work_payload)
+        return works
+
+    @staticmethod
+    def _work_type_counts(works: list[dict]) -> dict[str, int]:
+        counts = {"image": 0, "video": 0, "mixed": 0}
+        for work in works:
+            kind = str(work.get("media_type") or "mixed")
+            counts[kind] = counts.get(kind, 0) + 1
+        return counts
 
     @staticmethod
     def _select_with_quotas(items: list[ImageCandidate], request: CreatorFetchRequest) -> list[ImageCandidate]:

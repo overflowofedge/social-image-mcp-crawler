@@ -69,6 +69,28 @@ print(json.dumps({"id":"v1", "media_type":"video", "image_url":"https://cdn.test
     asyncio.run(run())
 
 
+def test_source_hub_routes_bilibili_search_to_its_own_cli(tmp_path):
+    script = tmp_path / "bilibili.py"
+    script.write_text(
+        "import json, os\n"
+        "assert os.environ['SOCIAL_IMAGE_PLATFORM'] == 'bilibili'\n"
+        "print(json.dumps({'id':'BV1cli', 'post_id':'BV1cli', 'image_url':'https://cdn.test/cover.jpg', 'title':'cli'}))\n",
+        encoding="utf-8",
+    )
+
+    async def run():
+        source = SourceHub(
+            None, None, "not-installed-gallery", None,
+            bilibili_source_command=f'"{sys.executable}" "{script}"',
+            verification_path=str(tmp_path / "verification.json"),
+        )
+        items = await source.search(Platform.BILIBILI, parse_intent("咖啡"), 3)
+        assert items[0].post_id == "BV1cli"
+        assert source.bilibili_source.status.ready_platforms == ("bilibili",)
+
+    asyncio.run(run())
+
+
 def test_source_process_output_decodes_utf8_and_windows_gb18030():
     assert _decode_process_output("微博账号不存在".encode("utf-8")) == "微博账号不存在"
     assert _decode_process_output("微博账号不存在".encode("gb18030")) == "微博账号不存在"
@@ -92,7 +114,7 @@ def test_gallery_dl_directory_and_queue_messages_are_not_images():
 def test_source_hub_reports_recommended_projects_without_platform_credentials():
     statuses = SourceHub(None, None, "definitely-not-installed-gallery-dl", None).statuses()
     names = {status["name"] for status in statuses}
-    assert names == {"dy-cli", "media-crawler", "xhs-downloader", "gallery-dl"}
+    assert names == {"dy-cli", "bilibili-cli", "media-crawler", "xhs-downloader", "gallery-dl"}
     assert all(status["configured"] is False for status in statuses)
     assert all(status["verified"] is False for status in statuses)
 

@@ -70,10 +70,10 @@ def cookie_file_path() -> Path:
     return Path.home() / ".dy" / "cookies" / f"{account}.json"
 
 
-def _run(command: list[str], timeout: float, env: dict[str, str] | None = None) -> tuple[int, str, str]:
+def _run(command: list[str], timeout: float, env: dict[str, str] | None = None, cwd: Path | None = None) -> tuple[int, str, str]:
     process: subprocess.Popen[str] | None = None
     try:
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", env=env)
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", env=env, cwd=cwd)
         stdout, stderr = process.communicate(timeout=timeout)
         return process.returncode, stdout.strip(), stderr.strip()
     except subprocess.TimeoutExpired:
@@ -141,6 +141,70 @@ def _check_douyin_health(project_root: Path, python: Path) -> dict[str, Any]:
     return {"ok": rc == 0 and isinstance(response, dict) and response.get("ok") is True, "returncode": rc, "detail": (stderr or stdout)[-1200:], "response": response}
 
 
+def _check_weibo_bridge(project_root: Path, python: Path) -> dict[str, Any]:
+    source_root = project_root / "third_party" / "MediaCrawler"
+    if not (source_root / "main.py").is_file():
+        return {"ok": False, "configured": False, "detail": "MediaCrawler source is not installed"}
+    code = "import main; print('ok')"
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(source_root) + os.pathsep + env.get("PYTHONPATH", "")
+    rc, out, err = _run([str(python), "-c", code], 35, env, source_root)
+    ready = rc == 0 and out.endswith("ok")
+    return {"ok": ready, "configured": True, "returncode": rc,
+            "detail": "bridge imports ready; browser login not verified" if ready else (err or out)[-1200:]}
+
+
+def _check_bilibili_bridge(project_root: Path, python: Path) -> dict[str, Any]:
+    """Check the dedicated Bilibili CLI without making startup depend on it."""
+    bridge = project_root / "scripts" / "bilibili_cli_bridge.py"
+    if not bridge.is_file():
+        return {"ok": False, "configured": False, "detail": "Bilibili CLI bridge is missing"}
+    env = os.environ.copy()
+    env.update({"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"})
+    timeout = max(8, int(os.getenv("PREFLIGHT_HEALTH_TIMEOUT_SECONDS", "35")))
+    rc, stdout, stderr = _run([str(python), str(bridge), "--health-check"], timeout, env)
+    response: Any = None
+    try:
+        response = json.loads(stdout.splitlines()[-1])
+    except (json.JSONDecodeError, IndexError):
+        pass
+    return {
+        "ok": rc == 0 and isinstance(response, dict) and response.get("ok") is True,
+        "configured": True,
+        "returncode": rc,
+        "detail": (stderr or stdout)[-1200:],
+        "response": response,
+    }
+
+
+def _check_weibo_api() -> dict[str, Any]:
+    try:
+        import httpx
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0 Safari/537.36", "Referer": "https://m.weibo.cn/"}
+        if cookie := os.getenv("WEIBO_COOKIE"):
+            headers["Cookie"] = cookie
+        response = httpx.get("https://m.weibo.cn/api/config", headers=headers, timeout=8, follow_redirects=True)
+        if response.status_code != 200 or "json" not in response.headers.get("content-type", ""):
+            return {"ok": False, "status_code": response.status_code, "detail": "Weibo API is blocked or requires login"}
+        payload = response.json()
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        authenticated = bool(data.get("login"))
+        if not authenticated:
+            return {"ok": True, "authenticated": False, "creator_lookup_ok": False,
+                    "detail": "API reachable; no native Weibo login session"}
+        lookup = httpx.get(
+            "https://m.weibo.cn/api/container/getIndex",
+            params={"containerid": "100103type=3&q=微博", "page_type": "searchall", "page": 1},
+            headers=headers, timeout=8, follow_redirects=True,
+        )
+        lookup_payload = lookup.json() if lookup.status_code == 200 and "json" in lookup.headers.get("content-type", "") else None
+        lookup_ok = isinstance(lookup_payload, dict) and lookup_payload.get("ok") in (1, "1", True)
+        return {"ok": True, "authenticated": True, "creator_lookup_ok": lookup_ok,
+                "detail": "creator lookup reachable" if lookup_ok else f"creator lookup blocked (HTTP {lookup.status_code})"}
+    except Exception as exc:
+        return {"ok": False, "detail": f"Weibo API check failed: {type(exc).__name__}: {exc}"}
+
+
 def _run_login(project_root: Path, python: Path) -> dict[str, Any]:
     login = project_root / "scripts" / "douyin_login.ps1"
     if not login.is_file():
@@ -156,6 +220,11 @@ def _looks_like_auth_failure(check: dict[str, Any]) -> bool:
 
 def run_preflight(project_root: Path, python: Path, *, auto_repair: bool = True) -> dict[str, Any]:
     project_root, python = project_root.resolve(), python.resolve()
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(project_root / ".env", override=False)
+    except ImportError:
+        pass
     cache_dir = project_root / ".cache"
     (project_root / "downloads").mkdir(parents=True, exist_ok=True)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -166,6 +235,9 @@ def run_preflight(project_root: Path, python: Path, *, auto_repair: bool = True)
     checks["bridge"] = _check_bridge(project_root)
     checks["cookie"] = inspect_cookie_file(cookie_file_path())
     checks["browser"] = _check_browser(python) if checks["imports"].get("ok") else {"ok": False, "detail": "imports are unavailable"}
+    checks["weibo_bridge"] = _check_weibo_bridge(project_root, python) if checks["python"]["ok"] else {"ok": False, "detail": "Python executable is missing"}
+    checks["bilibili_bridge"] = _check_bilibili_bridge(project_root, python) if checks["python"]["ok"] else {"ok": False, "detail": "Python executable is missing"}
+    checks["weibo_api"] = _check_weibo_api() if checks["imports"].get("ok") else {"ok": False, "detail": "httpx is unavailable"}
     if all(checks[name].get("ok") for name in ("python", "imports", "browser", "bridge")):
         checks["douyin"] = _check_douyin_health(project_root, python)
     else:
@@ -183,6 +255,13 @@ def run_preflight(project_root: Path, python: Path, *, auto_repair: bool = True)
         report["repairs"].append({"action": "install Playwright Chromium", "ok": rc == 0, "detail": (err or out)[-1200:]})
         if rc == 0:
             checks["browser"] = _check_browser(python)
+
+    if auto_repair and checks["weibo_bridge"].get("configured") and not checks["weibo_bridge"].get("ok"):
+        requirements = project_root / "scripts" / "requirements_media_crawler_bridge.txt"
+        rc, out, err = _run([str(python), "-m", "pip", "install", "-r", str(requirements)], 300)
+        report["repairs"].append({"action": "repair MediaCrawler bridge dependencies", "ok": rc == 0, "detail": (err or out)[-1200:]})
+        if rc == 0:
+            checks["weibo_bridge"] = _check_weibo_bridge(project_root, python)
 
     if checks["bridge"].get("configured") and checks["bridge"].get("ok") and checks["douyin"].get("skipped") and all(checks[name].get("ok") for name in ("python", "imports", "browser")):
         checks["douyin"] = _check_douyin_health(project_root, python)
@@ -209,6 +288,9 @@ def run_preflight(project_root: Path, python: Path, *, auto_repair: bool = True)
     douyin_configured = bool(checks["bridge"].get("configured"))
     report["ok"] = local_ok and (not douyin_configured or (checks["bridge"].get("ok") and checks["cookie"].get("state") == "valid" and checks["douyin"].get("ok")))
     report["douyin_ready"] = bool(checks["douyin"].get("ok"))
+    report["weibo_bridge_available"] = bool(checks["weibo_bridge"].get("ok"))
+    report["weibo_ready"] = bool(checks["weibo_api"].get("creator_lookup_ok"))
+    report["bilibili_ready"] = bool(checks["bilibili_bridge"].get("ok"))
     report["finished_at"] = time.time()
     report["report_path"] = str(cache_dir / "preflight-latest.json")
     (cache_dir / "preflight-latest.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -233,6 +315,8 @@ def main() -> int:
         return 1
     if not report["douyin_ready"]:
         print("提示：抖音链路动态检查未通过，请查看 preflight-latest.json。", file=sys.stderr)
+    if not report["weibo_ready"]:
+        print("提示：微博登录链路尚未验证，请查看 preflight-latest.json 中的 weibo_api 和 weibo_bridge。", file=sys.stderr)
     return 0
 
 

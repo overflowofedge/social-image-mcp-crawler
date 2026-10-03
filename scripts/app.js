@@ -3,6 +3,7 @@ const form = $("form");
 const button = $("submit");
 const status = $("status");
 const itemsBox = $("items");
+const worksBox = $("works");
 const mediaType = $("media_type");
 const imageLimit = $("image_limit");
 const videoLimit = $("video_limit");
@@ -31,6 +32,32 @@ function syncMediaLimits() {
   updateDownloadSummary();
 }
 
+function renderWorks(works) {
+  worksBox.innerHTML = "";
+  if (!Array.isArray(works) || works.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "hint";
+    empty.textContent = "本次没有新的作品。已下载作品会在下一次刷新时自动跳过。";
+    worksBox.appendChild(empty);
+    return;
+  }
+  const labels = {image: "图片作品", video: "视频作品", mixed: "图文/视频混合作品"};
+  works.forEach(work => {
+    const row = document.createElement("div");
+    row.className = "work-row";
+    const title = document.createElement("span");
+    title.className = "work-title";
+    title.textContent = work.title || work.work_id || "未命名作品";
+    title.title = work.title || work.work_id || "未命名作品";
+    const meta = document.createElement("span");
+    meta.className = "work-meta";
+    const kind = labels[work.media_type] || "作品";
+    meta.textContent = `${kind} · ${work.media_count || 0} 个媒体`;
+    row.append(title, meta);
+    worksBox.appendChild(row);
+  });
+}
+
 mediaType.addEventListener("change", syncMediaLimits);
 [imageLimit, videoLimit, perPostLimit].forEach(input => input.addEventListener("input", updateDownloadSummary));
 syncMediaLimits();
@@ -40,6 +67,7 @@ form.addEventListener("submit", async event => {
   if (!form.reportValidity()) return;
   button.disabled = true;
   itemsBox.innerHTML = "";
+  renderWorks([]);
   status.textContent = "正在采集并下载，请稍候…";
   const platform = document.querySelector('input[name="platform"]:checked').value;
   const mediaTypeValue = mediaType.value;
@@ -68,6 +96,7 @@ form.addEventListener("submit", async event => {
     });
     const data = await response.json();
     status.textContent = JSON.stringify(data, null, 2);
+    renderWorks(data.works);
     (data.items || []).forEach(item => {
       const card = document.createElement("div");
       card.className = "item";

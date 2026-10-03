@@ -500,9 +500,16 @@ class BilibiliAdapter(PlatformAdapter):
     def status(self) -> AdapterStatus:
         return AdapterStatus(self.platform, True, "public-api", "Public Bilibili API; login is optional and may improve rate limits")
 
-    async def search(self, intent: Intent, limit: int, safe_mode: bool) -> list[ImageCandidate]:
+    async def search(self, intent: Intent, limit: int, safe_mode: bool, media_type: str = "images", *, image_limit: int | None = None, video_limit: int | None = None) -> list[ImageCandidate]:
         try:
-            return await self.api.search(intent, limit, safe_mode)
+            return await self.api.search(
+                intent,
+                limit,
+                safe_mode,
+                media_type=media_type,
+                image_limit=image_limit,
+                video_limit=video_limit,
+            )
         except BilibiliError as exc:
             raise AdapterError(str(exc)) from exc
 

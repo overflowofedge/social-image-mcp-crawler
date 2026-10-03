@@ -15,6 +15,7 @@ assert _SPEC and _SPEC.loader
 _MODULE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_MODULE)
 _preview_referer = _MODULE._preview_referer
+_creator_hint = _MODULE._creator_hint
 
 
 @contextmanager
@@ -81,3 +82,9 @@ def test_preview_referer_preserves_item_permalink():
         "https://wx2.sinaimg.cn/mw2000/a.jpg",
         "https://m.weibo.cn/detail/123",
     ) == "https://m.weibo.cn/detail/123"
+
+
+def test_desktop_form_treats_bilibili_nickname_as_creator_name():
+    assert _creator_hint("机械人读书笔记", "bilibili", None) == ("机械人读书笔记", None)
+    assert _creator_hint("Tech World", "bilibili", None) == ("Tech World", None)
+    assert _creator_hint("288159073", "bilibili", None) == (None, "288159073")

@@ -435,7 +435,10 @@ async def _fetch_creator_via_browser(request: CreatorFetchRequest, account: str 
                         if _browser_endpoint(response_url) == "user_search":
                             matches.extend(_browser_user_matches(payload, target, nickname=bool(request.creator_name)))
                     unique = {str(row.get("sec_uid")): row for row in matches if row.get("sec_uid")}
-                    if len(unique) == 1:
+                    if unique:
+                        # User-search results are relevance ordered. The
+                        # timeline collector below still validates every post
+                        # against this sec_uid before accepting any media.
                         identity_data = next(iter(unique.values()))
                         break
                     await page.wait_for_timeout(max(100, int(os.getenv("DOUYIN_BROWSER_POLL_MS", "400"))))
@@ -510,11 +513,6 @@ def _fetch_creator_with_fallback(client: Any, request: CreatorFetchRequest, acco
         return _fetch_creator(client, request)
     except Exception as exc:
         http_error = exc
-
-    # A completed exact lookup is authoritative. Browser fallback cannot
-    # disambiguate a duplicate nickname or turn zero exact matches into one.
-    if http_error and "creator_identity_unresolved:" in str(http_error):
-        raise http_error
 
     # The browser route is intentionally attempted after the native client. It
     # is slower, but can still work when the API client's manually signed
