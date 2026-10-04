@@ -58,3 +58,18 @@ def test_x_video_uses_highest_bitrate_variant_instead_of_cover():
             assert items[0].thumbnail_url.endswith("cover.jpg")
 
     asyncio.run(run())
+
+
+def test_x_video_excludes_hdr_and_prefers_hevc_at_the_highest_resolution():
+    media = {
+        "width": 7680, "height": 4320,
+        "variants": [
+            {"content_type": "video/mp4", "bit_rate": 90000000,
+             "url": "https://video.twimg.com/vid/hevc/7680x4320/hdr-video.mp4"},
+            {"content_type": "video/mp4", "bit_rate": 80000000,
+             "url": "https://video.twimg.com/vid/avc1/3840x2160/video.mp4"},
+            {"content_type": "video/mp4", "bit_rate": 70000000,
+             "url": "https://video.twimg.com/vid/hevc/3840x2160/video.mp4"},
+        ],
+    }
+    assert XAdapter._best_video_variant(media).endswith("hevc/3840x2160/video.mp4")

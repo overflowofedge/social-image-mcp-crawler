@@ -12,6 +12,7 @@ import httpx
 
 from ..config import Settings
 from ..intent import Intent
+from ..media_quality import is_hdr_video, video_stream_score
 from ..models import ImageCandidate, Platform
 from ..bilibili import BilibiliApi, BilibiliError
 from ..weibo import WeiboApi, WeiboError
@@ -373,16 +374,26 @@ class XAdapter(PlatformAdapter):
     @staticmethod
     def _best_video_variant(media: dict[str, Any]) -> str | None:
         variants = media.get("variants") or []
+        base_metadata = {
+            key: media.get(key) for key in ("width", "height", "duration_ms")
+            if media.get(key) not in (None, "")
+        }
         usable = [
             variant for variant in variants
             if isinstance(variant, dict)
             and str(variant.get("content_type", "")).lower() in {"video/mp4", "video/webm"}
             and str(variant.get("url", "")).startswith(("http://", "https://"))
+            and not is_hdr_video({**base_metadata, **variant}, str(variant.get("url") or ""))
         ]
         if not usable:
             return None
-        # Prefer the highest bitrate; GIFs generally expose only one variant.
-        return str(max(usable, key=lambda variant: float(variant.get("bit_rate") or 0)).get("url"))
+        selected = max(
+            usable,
+            key=lambda variant: video_stream_score(
+                {**base_metadata, **variant}, str(variant.get("url") or "")
+            ),
+        )
+        return str(selected.get("url"))
 
     async def search(self, intent: Intent, limit: int, safe_mode: bool) -> list[ImageCandidate]:
         if not self.token:

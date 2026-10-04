@@ -117,6 +117,60 @@ def test_bilibili_video_link_returns_original_video_when_requested():
     assert result[0].image_url == "https://video.test/original.mp4"
 
 
+def test_bilibili_video_prefers_highest_non_hdr_hevc_and_best_audio():
+    seen_playurl = {}
+
+    def handler(request):
+        if request.url.path == "/x/web-interface/view":
+            return httpx.Response(200, json={"code": 0, "data": {
+                "bvid": "BV1quality", "pic": "//img.test/cover.jpg", "title": "最高画质",
+                "owner": {"mid": 7, "name": "作者"}, "pages": [{"cid": 9}],
+            }})
+        if request.url.path == "/x/player/playurl":
+            seen_playurl.update(dict(request.url.params))
+            return httpx.Response(200, json={"code": 0, "data": {
+                "durl": [{"url": "https://video.test/fallback.mp4"}],
+                "support_formats": [{"quality": 127, "new_description": "8K 超高清"}],
+                "dash": {
+                    "video": [
+                        {"id": 127, "width": 7680, "height": 4320, "codecs": "hev1.1.6.L180", "hdr_type": 1,
+                         "bandwidth": 90000000, "baseUrl": "https://video.test/hdr-hevc.m4s"},
+                        {"id": 127, "width": 7680, "height": 4320, "codecs": "avc1.640033",
+                         "bandwidth": 80000000, "baseUrl": "https://video.test/8k-h264.m4s"},
+                        {"id": 127, "width": 7680, "height": 4320, "codecs": "hev1.1.6.L180",
+                         "bandwidth": 70000000, "baseUrl": "https://video.test/8k-hevc.m4s",
+                         "backupUrl": ["https://backup.test/8k-hevc.m4s"]},
+                        {"id": 120, "width": 3840, "height": 2160, "codecs": "hev1.1.6.L150",
+                         "bandwidth": 50000000, "baseUrl": "https://video.test/4k-hevc.m4s"},
+                    ],
+                    "audio": [{"id": 30280, "codecs": "mp4a.40.2", "bandwidth": 320000,
+                               "baseUrl": "https://audio.test/aac.m4s"}],
+                    "dolby": {"audio": [{"id": 30250, "codecs": "ec-3", "bandwidth": 640000,
+                                           "baseUrl": "https://audio.test/dolby.m4s"}]},
+                    "flac": {"audio": {"id": 30251, "codecs": "fLaC", "bandwidth": 1200000,
+                                         "baseUrl": "https://audio.test/flac.m4s"}},
+                },
+            }})
+        return httpx.Response(404, json={"code": -404})
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await BilibiliApi(client).search(
+                parse_intent("https://www.bilibili.com/video/BV1quality"), 1, media_type="videos"
+            )
+
+    item = asyncio.run(run())[0]
+    download = item.source_payload["download"]
+    assert item.image_url == "https://video.test/8k-hevc.m4s"
+    assert item.width == 7680 and item.height == 4320
+    assert download["audio_url"] == "https://audio.test/flac.m4s"
+    assert download["fallback_url"] == "https://video.test/fallback.mp4"
+    assert download["video_urls"][-1] == "https://backup.test/8k-hevc.m4s"
+    assert seen_playurl["qn"] == "127"
+    assert seen_playurl["fnval"] == "4048"
+    assert seen_playurl["high_quality"] == "1"
+
+
 def test_weibo_creator_request_accepts_numeric_uid():
     request = CreatorFetchRequest(platform=Platform.WEIBO, creator_id="123456789", download=False)
     assert request.creator_id == "123456789"

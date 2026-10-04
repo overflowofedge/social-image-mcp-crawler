@@ -94,7 +94,7 @@ def _run(command: list[str], timeout: float, env: dict[str, str] | None = None, 
 
 
 def _check_imports(python: Path) -> dict[str, Any]:
-    rc, out, err = _run([str(python), "-c", "import httpx, mcp, PIL, playwright; print('ok')"], 20)
+    rc, out, err = _run([str(python), "-c", "import httpx, imageio_ffmpeg, mcp, PIL, playwright; print('ok')"], 20)
     return {"ok": rc == 0 and out.endswith("ok"), "returncode": rc, "detail": err or out}
 
 

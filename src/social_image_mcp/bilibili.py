@@ -20,6 +20,7 @@ import httpx
 from urllib.parse import urlencode
 
 from .creator_protocol import creator_target, pack_cursor, unpack_cursor
+from .media_quality import audio_stream_score, is_hdr_video, video_stream_score
 from .models import CreatorFetchRequest, CreatorIdentity, ImageCandidate, Platform
 
 
@@ -51,6 +52,26 @@ def _url(value: Any) -> str:
     if value.startswith("//"):
         return "https:" + value
     return value if value.startswith(("http://", "https://")) else ""
+
+
+def _stream_urls(stream: dict[str, Any]) -> list[str]:
+    values: list[str] = []
+    for key in ("baseUrl", "base_url", "url"):
+        if value := _url(stream.get(key)):
+            values.append(value)
+    for key in ("backupUrl", "backup_url"):
+        backups = stream.get(key)
+        if isinstance(backups, list):
+            values.extend(value for raw in backups if (value := _url(raw)))
+    return list(dict.fromkeys(values))
+
+
+def _stream_list(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    return []
 
 
 def _number(value: Any, default: float = 0.0) -> float:
@@ -325,7 +346,7 @@ class BilibiliApi:
                 pass
             raise exc
 
-    async def _video_url(self, row: dict[str, Any]) -> str | None:
+    async def _video_stream(self, row: dict[str, Any]) -> dict[str, Any] | None:
         identifier = _bvid(row.get("bvid")) or _text(row.get("aid"))
         if not identifier:
             return None
@@ -343,16 +364,69 @@ class BilibiliApi:
             video_id_param = "bvid" if identifier.lower().startswith("bv") else "avid"
             payload = await self._get(
                 "/x/player/playurl",
-                # Progressive ``durl`` is a complete audio/video file. DASH
-                # tracks require muxing and therefore cannot be handed to the
-                # shared single-file downloader.
-                {video_id_param: identifier, "cid": str(cid), "fnval": 1, "fnver": 0, "fourk": 1, "qn": 80},
+                # Request all modern qualities, including 8K and premium audio.
+                # HDR/Dolby Vision tracks are removed explicitly below.
+                {
+                    video_id_param: identifier, "cid": str(cid), "fnval": 4048,
+                    "fnver": 0, "fourk": 1, "high_quality": 1, "qn": 127,
+                },
             )
             data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
             durl = data.get("durl") if isinstance(data.get("durl"), list) else []
-            urls = [_url(item.get("url")) for item in durl if isinstance(item, dict)]
-            if urls:
-                return urls[0]
+            fallback_urls = [_url(item.get("url")) for item in durl if isinstance(item, dict)]
+            fallback_url = next((value for value in fallback_urls if value), "")
+            dash = data.get("dash") if isinstance(data.get("dash"), dict) else {}
+            formats = data.get("support_formats") if isinstance(data.get("support_formats"), list) else []
+            descriptions = {
+                int(_number(item.get("quality"))): _text(item.get("new_description") or item.get("display_desc") or item.get("description"))
+                for item in formats if isinstance(item, dict)
+            }
+            videos = []
+            for stream in _stream_list(dash.get("video")):
+                urls = _stream_urls(stream)
+                context = descriptions.get(int(_number(stream.get("id"))), "")
+                if not urls or is_hdr_video(stream, urls[0], context):
+                    continue
+                videos.append((video_stream_score(stream, urls[0], context), stream, urls, context))
+
+            audio_sources = [(stream, "standard") for stream in _stream_list(dash.get("audio"))]
+            dolby = dash.get("dolby") if isinstance(dash.get("dolby"), dict) else {}
+            flac = dash.get("flac") if isinstance(dash.get("flac"), dict) else {}
+            audio_sources.extend((stream, "dolby atmos") for stream in _stream_list(dolby.get("audio")))
+            audio_sources.extend((stream, "hi-res lossless flac") for stream in _stream_list(flac.get("audio")))
+            audios = []
+            for stream, context in audio_sources:
+                urls = _stream_urls(stream)
+                if urls:
+                    audios.append((audio_stream_score(stream, urls[0], context), stream, urls, context))
+
+            if videos and audios:
+                _, video, video_urls, video_description = max(videos, key=lambda item: item[0])
+                _, audio, audio_urls, audio_description = max(audios, key=lambda item: item[0])
+                return {
+                    "url": video_urls[0],
+                    "video_urls": video_urls,
+                    "audio_url": audio_urls[0],
+                    "audio_urls": audio_urls,
+                    "fallback_url": fallback_url or None,
+                    "width": int(_number(video.get("width"))) or None,
+                    "height": int(_number(video.get("height"))) or None,
+                    "video_codec": _text(video.get("codecs") or video.get("codec")),
+                    "video_quality": video_description,
+                    "audio_codec": _text(audio.get("codecs") or audio.get("codec")),
+                    "audio_quality": audio_description,
+                }
+            if fallback_url:
+                return {"url": fallback_url, "fallback_url": fallback_url}
+            if videos:
+                _, video, video_urls, video_description = max(videos, key=lambda item: item[0])
+                return {
+                    "url": video_urls[0], "video_urls": video_urls,
+                    "width": int(_number(video.get("width"))) or None,
+                    "height": int(_number(video.get("height"))) or None,
+                    "video_codec": _text(video.get("codecs") or video.get("codec")),
+                    "video_quality": video_description,
+                }
         except BilibiliError:
             return None
         return None
@@ -361,15 +435,18 @@ class BilibiliApi:
         base = self._cover_candidate(row, 2)
         if base is None:
             return None
-        video_url = await self._video_url(row)
-        if not video_url:
+        stream = await self._video_stream(row)
+        if not stream:
             return None
         return base.model_copy(update={
             "id": f"{base.post_id}:video",
-            "image_url": video_url,
+            "image_url": stream["url"],
             "media_type": "video",
             "thumbnail_url": base.image_url,
+            "width": stream.get("width"),
+            "height": stream.get("height"),
             "media_index": 2,
+            "source_payload": {**base.source_payload, "download": stream},
         })
 
     async def resolve_identity(self, request: CreatorFetchRequest) -> CreatorIdentity:

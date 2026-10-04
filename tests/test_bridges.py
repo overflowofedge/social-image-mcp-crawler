@@ -81,6 +81,43 @@ def test_douyin_video_extraction_drops_music_track_urls():
     assert extract_video_urls("douyin", record) == []
 
 
+def test_douyin_video_prefers_highest_non_hdr_hevc_variant():
+    record = {"video": {
+        "width": 7680,
+        "height": 4320,
+        "bit_rate": [
+            {"gear_name": "8k_hdr_hevc", "width": 7680, "height": 4320, "codec_type": "h265", "hdr_type": 1,
+             "bit_rate": 90000000, "play_addr": {"url_list": ["https://cdn.test/8k-hdr-hevc.mp4"]}},
+            {"gear_name": "4k_h264", "width": 3840, "height": 2160, "codec_type": "h264",
+             "bit_rate": 60000000, "play_addr": {"url_list": ["https://cdn.test/4k-h264.mp4"]}},
+            {"gear_name": "4k_hevc", "width": 3840, "height": 2160, "codec_type": "h265",
+             "bit_rate": 50000000, "play_addr": {"url_list": ["https://cdn.test/4k-hevc.mp4"]}},
+            {"gear_name": "1080p_hevc", "width": 1920, "height": 1080, "codec_type": "h265",
+             "bit_rate": 20000000, "play_addr": {"url_list": ["https://cdn.test/1080p-hevc.mp4"]}},
+        ],
+    }}
+    assert extract_video_urls("douyin", record) == ["https://cdn.test/4k-hevc.mp4"]
+
+
+def test_weibo_video_prefers_original_non_hdr_hevc_variant():
+    record = {"mblog": {"page_info": {"media_info": {
+        "mp4_8k_hdr_hevc": "https://video.test/8k-hdr-hevc.mp4",
+        "mp4_4k_h264": "https://video.test/4k-h264.mp4",
+        "mp4_4k_hevc": "https://video.test/4k-hevc.mp4",
+        "mp4_1080p_hevc": "https://video.test/1080p-hevc.mp4",
+    }}}}
+    assert extract_video_urls("weibo", record) == ["https://video.test/4k-hevc.mp4"]
+
+
+def test_native_images_prefer_original_quality_field():
+    record = {"note_id": "n1", "image_list": [{
+        "url_default": "https://img.test/default.jpg",
+        "original_url": "https://img.test/original.jpg",
+    }]}
+    items = normalize_native_record("xhs", record, "media-crawler")
+    assert items[0]["image_url"] == "https://img.test/original.jpg"
+
+
 def test_gallery_candidates_have_unique_ids_and_keep_post_id():
     record = {
         "aweme_id": "42",
