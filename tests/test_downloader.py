@@ -112,6 +112,73 @@ def test_bilibili_video_download_sends_page_origin(tmp_path):
     assert "Chrome/" in seen["user-agent"]
 
 
+def test_bilibili_best_video_and_audio_tracks_are_muxed_without_transcoding(tmp_path, monkeypatch):
+    requested = []
+
+    def handler(request):
+        requested.append(str(request.url))
+        if request.url.host == "audio.test":
+            return httpx.Response(200, content=b"best-audio", headers={"content-type": "audio/mp4"}, request=request)
+        return httpx.Response(200, content=b"best-video", headers={"content-type": "video/mp4"}, request=request)
+
+    async def fake_mux(self, executable, video, audio, output):
+        assert executable == "ffmpeg-test"
+        output.write_bytes(video.read_bytes() + b"+" + audio.read_bytes())
+
+    monkeypatch.setattr(ImageDownloader, "_ffmpeg_executable", staticmethod(lambda: "ffmpeg-test"))
+    monkeypatch.setattr(ImageDownloader, "_mux_streams", fake_mux)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            item = ImageCandidate(
+                id="BV1:video", platform=Platform.BILIBILI,
+                image_url="https://video.test/8k-hevc.m4s", media_type="video",
+                permalink="https://www.bilibili.com/video/BV1",
+                width=7680, height=4320,
+                source_payload={"download": {
+                    "video_urls": ["https://video.test/8k-hevc.m4s"],
+                    "audio_url": "https://audio.test/flac.m4s",
+                    "audio_urls": ["https://audio.test/flac.m4s"],
+                    "fallback_url": "https://video.test/fallback.mp4",
+                }},
+            )
+            return (await ImageDownloader(client).download_many([item], tmp_path))[0]
+
+    record = asyncio.run(run())
+    assert record.status == "downloaded"
+    assert record.path.endswith(".mkv")
+    assert record.width == 7680 and record.height == 4320
+    assert Path(record.path).read_bytes() == b"best-video+best-audio"
+    assert requested == ["https://video.test/8k-hevc.m4s", "https://audio.test/flac.m4s"]
+
+
+def test_bilibili_uses_complete_fallback_when_muxer_is_unavailable(tmp_path, monkeypatch):
+    requested = []
+
+    def handler(request):
+        requested.append(str(request.url))
+        return httpx.Response(200, content=b"complete-video", headers={"content-type": "video/mp4"}, request=request)
+
+    monkeypatch.setattr(ImageDownloader, "_ffmpeg_executable", staticmethod(lambda: None))
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            item = ImageCandidate(
+                id="BV1:video", platform=Platform.BILIBILI,
+                image_url="https://video.test/video-only.m4s", media_type="video",
+                source_payload={"download": {
+                    "audio_url": "https://audio.test/audio-only.m4s",
+                    "fallback_url": "https://video.test/complete.mp4",
+                }},
+            )
+            return (await ImageDownloader(client).download_many([item], tmp_path))[0]
+
+    record = asyncio.run(run())
+    assert record.status == "downloaded"
+    assert record.path.endswith(".mp4")
+    assert requested == ["https://video.test/complete.mp4"]
+
+
 def test_downloader_deduplicates_near_identical_images(tmp_path):
     first = io.BytesIO()
     second = io.BytesIO()

@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+from typing import Any
 from urllib.parse import unquote, urldefrag, urljoin, urlparse
 
 from bs4 import BeautifulSoup, Tag
@@ -13,6 +14,7 @@ from PIL import ImageFile
 
 from .adapters.base import AdapterError, AdapterStatus, PlatformAdapter
 from .intent import Intent
+from .media_quality import is_hdr_video, video_stream_score
 from .models import ImageCandidate, Platform, SearchRequest
 
 
@@ -174,13 +176,25 @@ def extract_page(html: str, page_url: str) -> PageMedia:
                     original |= any(chosen == _url(base, node.get(key)) for key in ("data-original", "data-full", "data-large"))
                     add(chosen, alt=alt, post_url=post, original=original)
             elif node.name == "video":
-                sources = [node.get("data-src"), node.get("src")]
-                sources += [source.get("src") or source.get("data-src") for source in node.find_all("source")]
-                for value in sources:
-                    if absolute := _url(base, value):
+                sources: list[tuple[Any, dict[str, Any], str]] = [
+                    (node.get("data-src"), dict(node.attrs), _label(node)),
+                    (node.get("src"), dict(node.attrs), _label(node)),
+                ]
+                sources.extend(
+                    (source.get("src") or source.get("data-src"), dict(source.attrs), _label(source))
+                    for source in node.find_all("source")
+                )
+                direct: list[tuple[tuple[int, int, int, float, float], Any]] = []
+                for value, metadata, context in sources:
+                    absolute = _url(base, value)
+                    if not absolute:
+                        continue
+                    if _path(absolute).endswith(_STREAM_EXTENSIONS):
                         add(value, "video", alt, node.get("poster"))
-                        if not _path(absolute).endswith(_STREAM_EXTENSIONS):
-                            break
+                    elif not is_hdr_video(metadata, absolute, context):
+                        direct.append((video_stream_score(metadata, absolute, context), value))
+                if direct:
+                    add(max(direct, key=lambda item: item[0])[1], "video", alt, node.get("poster"))
             elif node.name == "a":
                 absolute = _url(base, node.get("href"))
                 if absolute and _path(absolute).endswith((*_VIDEO_EXTENSIONS, *_STREAM_EXTENSIONS)):

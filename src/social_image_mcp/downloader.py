@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import re
+import shutil
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -133,6 +134,14 @@ def _hash_distance(left: int, right: int) -> int:
     return (left ^ right).bit_count()
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 class ImageDownloader:
     def __init__(self, client: httpx.AsyncClient) -> None:
         self.client = client
@@ -152,7 +161,7 @@ class ImageDownloader:
                     if not record.path or not record.sha256:
                         continue
                     path = Path(record.path)
-                    if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != record.sha256:
+                    if not path.is_file() or _file_sha256(path) != record.sha256:
                         continue
                     content_minimum = 160 if record.platform.value == "other" and record.media_type == "image" else 0
                     if (record.width or 0) < max(min_width, content_minimum) or (record.height or 0) < max(min_height, content_minimum):
@@ -262,7 +271,61 @@ class ImageDownloader:
         lock: asyncio.Lock,
         headers: dict[str, str],
     ) -> DownloadRecord:
-        """Stream large video bodies to disk so batch memory stays bounded."""
+        """Download a complete file, or mux the selected best video/audio tracks."""
+        download = item.source_payload.get("download") if isinstance(item.source_payload, dict) else {}
+        download = download if isinstance(download, dict) else {}
+        video_urls = [item.image_url]
+        if isinstance(download.get("video_urls"), list):
+            video_urls.extend(str(value) for value in download["video_urls"] if value)
+        video_urls = list(dict.fromkeys(video_urls))
+        audio_urls: list[str] = []
+        if download.get("audio_url"):
+            audio_urls.append(str(download["audio_url"]))
+        if isinstance(download.get("audio_urls"), list):
+            audio_urls.extend(str(value) for value in download["audio_urls"] if value)
+        audio_urls = list(dict.fromkeys(audio_urls))
+        fallback_url = str(download.get("fallback_url") or "")
+
+        if audio_urls:
+            executable = self._ffmpeg_executable()
+            if executable:
+                try:
+                    return await self._download_muxed_video(
+                        item, output_dir, seen_hashes, lock, headers,
+                        video_urls, audio_urls, executable,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    if not fallback_url:
+                        raise
+            elif not fallback_url:
+                raise RuntimeError("FFmpeg is required to combine the selected highest-quality video and audio tracks")
+            item = item.model_copy(update={"image_url": fallback_url})
+
+        return await self._download_direct_video(item, output_dir, seen_hashes, lock, headers)
+
+    @staticmethod
+    def _ffmpeg_executable() -> str | None:
+        if executable := shutil.which("ffmpeg"):
+            return executable
+        try:
+            import imageio_ffmpeg
+
+            executable = imageio_ffmpeg.get_ffmpeg_exe()
+            return executable if executable and Path(executable).is_file() else None
+        except (ImportError, OSError, RuntimeError):
+            return None
+
+    async def _download_direct_video(
+        self,
+        item: ImageCandidate,
+        output_dir: Path,
+        seen_hashes: dict[tuple[str, str], set[str]],
+        lock: asyncio.Lock,
+        headers: dict[str, str],
+    ) -> DownloadRecord:
+        """Stream a self-contained video file without loading it into memory."""
         last_error = ""
         for attempt in range(3):
             temporary: Path | None = None
@@ -313,6 +376,7 @@ class ImageDownloader:
                         candidate_id=item.id, platform=item.platform,
                         image_url=item.image_url, media_type="video",
                         path=str(path.resolve()), sha256=digest,
+                        width=item.width, height=item.height,
                         content_type=content_type, status="downloaded",
                     )
             except asyncio.CancelledError:
@@ -330,3 +394,117 @@ class ImageDownloader:
                     temporary.unlink(missing_ok=True)
                 raise
         raise RuntimeError(last_error or "video request failed")
+
+    async def _stream_track(
+        self,
+        urls: list[str],
+        path: Path,
+        headers: dict[str, str],
+        media_kind: str,
+    ) -> tuple[str, str]:
+        last_error = ""
+        for url in list(dict.fromkeys(urls)):
+            for attempt in range(2):
+                try:
+                    async with self.client.stream(
+                        "GET", url, headers=headers, follow_redirects=True,
+                        timeout=httpx.Timeout(180.0, connect=10.0),
+                    ) as response:
+                        response.raise_for_status()
+                        content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
+                        accepted = (
+                            content_type in {"application/octet-stream", "application/mp4"}
+                            or content_type.startswith(f"{media_kind}/")
+                            or (media_kind == "audio" and content_type == "video/mp4")
+                        )
+                        if content_type and not accepted:
+                            raise ValueError(f"not a {media_kind} response: {content_type}")
+                        size = 0
+                        with path.open("wb") as handle:
+                            async for chunk in response.aiter_bytes(1024 * 1024):
+                                if chunk:
+                                    handle.write(chunk)
+                                    size += len(chunk)
+                        if size <= 0:
+                            raise ValueError(f"empty {media_kind} response")
+                        return content_type, url
+                except asyncio.CancelledError:
+                    path.unlink(missing_ok=True)
+                    raise
+                except (httpx.HTTPError, OSError, ValueError) as exc:
+                    path.unlink(missing_ok=True)
+                    last_error = str(exc)
+                    if attempt == 0:
+                        await asyncio.sleep(0.4)
+        raise RuntimeError(last_error or f"{media_kind} track request failed")
+
+    async def _mux_streams(self, executable: str, video: Path, audio: Path, output: Path) -> None:
+        process = await asyncio.create_subprocess_exec(
+            executable,
+            "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(video), "-i", str(audio),
+            "-map", "0:v:0", "-map", "1:a:0", "-c", "copy",
+            "-f", "matroska", str(output),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, stderr = await asyncio.wait_for(process.communicate(), timeout=900)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            process.kill()
+            await process.wait()
+            raise
+        if process.returncode:
+            detail = stderr.decode("utf-8", errors="replace").strip()[-1000:]
+            raise RuntimeError(f"FFmpeg failed to combine video and audio: {detail or process.returncode}")
+
+    async def _download_muxed_video(
+        self,
+        item: ImageCandidate,
+        output_dir: Path,
+        seen_hashes: dict[tuple[str, str], set[str]],
+        lock: asyncio.Lock,
+        headers: dict[str, str],
+        video_urls: list[str],
+        audio_urls: list[str],
+        executable: str,
+    ) -> DownloadRecord:
+        async with lock:
+            filename = _filename(item, "mkv")
+            path = _unique_path(_media_dir(output_dir, item) / filename)
+            merged = path.with_suffix(path.suffix + ".part")
+            merged.touch(exist_ok=False)
+        video_part = path.with_suffix(path.suffix + ".video.part")
+        audio_part = path.with_suffix(path.suffix + ".audio.part")
+        try:
+            await self._stream_track(video_urls, video_part, headers, "video")
+            await self._stream_track(audio_urls, audio_part, headers, "audio")
+            await self._mux_streams(executable, video_part, audio_part, merged)
+            if not merged.is_file() or merged.stat().st_size <= 0:
+                raise RuntimeError("FFmpeg produced an empty media file")
+            digest = _file_sha256(merged)
+            scope = _scope(item)
+            async with lock:
+                hashes = seen_hashes.setdefault(scope, set())
+                if digest in hashes:
+                    merged.unlink(missing_ok=True)
+                    return DownloadRecord(
+                        candidate_id=item.id, platform=item.platform,
+                        image_url=item.image_url, media_type="video",
+                        sha256=digest, width=item.width, height=item.height,
+                        status="duplicate",
+                    )
+                merged.replace(path)
+                hashes.add(digest)
+            return DownloadRecord(
+                candidate_id=item.id, platform=item.platform,
+                image_url=item.image_url, media_type="video",
+                path=str(path.resolve()), sha256=digest,
+                width=item.width, height=item.height,
+                content_type="video/x-matroska", status="downloaded",
+            )
+        finally:
+            video_part.unlink(missing_ok=True)
+            audio_part.unlink(missing_ok=True)
+            merged.unlink(missing_ok=True)

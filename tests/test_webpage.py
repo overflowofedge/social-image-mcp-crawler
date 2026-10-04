@@ -144,6 +144,19 @@ def test_structured_video_does_not_treat_embed_page_or_poster_as_video():
     assert items[0].thumbnail_url == "https://example.org/poster.jpg"
 
 
+def test_webpage_video_prefers_highest_non_hdr_hevc_source():
+    html = '''<main><video poster="/poster.jpg">
+    <source src="/8k-hdr-hevc.mp4" data-quality="8k hdr hevc">
+    <source src="/4k-h264.mp4" data-quality="3840x2160 h264">
+    <source src="/4k-hevc.mp4" data-quality="3840x2160 hevc">
+    <source src="/1080p-hevc.mp4" data-quality="1920x1080 hevc">
+    </video></main>'''
+    items = extract_page(html, "https://example.org/").items
+    assert len(items) == 1
+    assert items[0].image_url == "https://example.org/4k-hevc.mp4"
+    assert items[0].thumbnail_url == "https://example.org/poster.jpg"
+
+
 def test_homepage_follows_only_bounded_content_links_and_keeps_both_media_types():
     calls = []
     homepage = '''<nav><a href="/navigation"><img src="/nav.jpg"></a></nav><main>

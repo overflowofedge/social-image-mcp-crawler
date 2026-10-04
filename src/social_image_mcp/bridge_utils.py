@@ -12,6 +12,8 @@ from collections.abc import Iterable
 from typing import Any
 from urllib.parse import urlparse
 
+from .media_quality import is_hdr_video, video_stream_score
+
 
 _URL_RE = re.compile(r"^https?://", re.I)
 _AUDIO_EXTENSIONS = (".aac", ".flac", ".m4a", ".mp3", ".wav", ".wma")
@@ -118,7 +120,7 @@ def extract_media_urls(platform: str, record: Any, include_video_covers: bool = 
 
     if platform == "xhs":
         images = record.get("image_list") or record.get("imageList") or []
-        urls = _urls_from_items(images, ("url_default", "urlDefault", "url", "original_url"))
+        urls = _urls_from_items(images, ("original_url", "originalUrl", "origin_url", "url_default", "urlDefault", "url"))
         return urls or _urls_from_mapping(record)
 
     if platform == "douyin":
@@ -133,7 +135,7 @@ def extract_media_urls(platform: str, record: Any, include_video_covers: bool = 
             or record.get("imageInfos")
             or []
         )
-        urls = _urls_from_items(images, ("url_list", "urlList", "origin_url", "url"))
+        urls = _urls_from_items(images, ("origin_url", "original_url", "download_url", "url_list", "urlList", "url"))
         # Video posts still have a useful cover image when no gallery exists.
         if not urls and include_video_covers:
             video = record.get("video") or {}
@@ -144,7 +146,7 @@ def extract_media_urls(platform: str, record: Any, include_video_covers: bool = 
     if platform == "weibo":
         source = record.get("mblog") if isinstance(record.get("mblog"), dict) else record
         pics = source.get("pics") or []
-        urls = _urls_from_items(pics, ("large", "original", "url", "large_url", "original_url"))
+        urls = _urls_from_items(pics, ("original", "original_url", "large", "large_url", "url"))
         if urls:
             return urls
         if include_video_covers and isinstance(source.get("page_info"), dict):
@@ -160,7 +162,6 @@ def extract_video_urls(platform: str, record: Any) -> list[str]:
         return []
     if platform == "douyin":
         video = record.get("video") or {}
-        urls: list[str] = []
 
         def best(value: Any) -> list[str]:
             if isinstance(value, dict):
@@ -177,24 +178,53 @@ def extract_video_urls(platform: str, record: Any) -> list[str]:
                 return [item for child in value for item in best(child)]
             return [_video_url(value)] if _video_url(value) else []
 
-        for key in ("play_addr", "download_addr", "play_url", "download_url", "bit_rate", "bitRate"):
-            urls = _dedupe(best(video.get(key)))
-            if urls:
-                return urls[-1:]
-        return []
+        parent_metadata = {
+            key: video.get(key) for key in ("width", "height", "ratio", "duration")
+            if video.get(key) not in (None, "")
+        }
+        variants: list[tuple[tuple[int, int, int, float, float], str]] = []
+
+        def add_variant(value: Any, metadata: dict[str, Any], context: str) -> None:
+            for url in _dedupe(best(value)):
+                combined = {**parent_metadata, **metadata}
+                if not is_hdr_video(combined, url, context):
+                    variants.append((video_stream_score(combined, url, context), url))
+
+        for key in ("bit_rate", "bitRate"):
+            for variant in video.get(key) or []:
+                if not isinstance(variant, dict):
+                    continue
+                address = _first(variant, "play_addr", "playAddr", "play_url", "playUrl", "download_addr", "downloadAddr")
+                add_variant(address or variant, variant, f"{key} {_as_text(_first(variant, 'gear_name', 'quality_type', 'format'))}")
+        for key, value in video.items():
+            key_lower = key.lower()
+            if key in {"bit_rate", "bitRate"} or not any(token in key_lower for token in ("play", "download")):
+                continue
+            add_variant(value, {}, key)
+        if not variants:
+            return []
+        return [max(variants, key=lambda item: item[0])[1]]
     if platform == "weibo":
         source = record.get("mblog") if isinstance(record.get("mblog"), dict) else record
         page_info = source.get("page_info") or {}
         media_info = page_info.get("media_info") if isinstance(page_info, dict) else {}
         if isinstance(media_info, dict):
-            for key in ("mp4_720p_mp4", "mp4_hd_mp4", "mp4_sd_mp4", "video_url", "stream_url", "h5_url", "url"):
-                value = media_info.get(key)
+            variants: list[tuple[tuple[int, int, int, float, float], str]] = []
+            for key, value in media_info.items():
+                if not any(token in key.lower() for token in ("mp4", "video", "stream", "play", "url")):
+                    continue
                 if isinstance(value, dict):
                     urls = _urls_from_mapping(value)
-                    if urls:
-                        return urls[:1]
+                    metadata = value
                 elif (url := _url(value)):
-                    return [url]
+                    urls = [url]
+                    metadata = {}
+                else:
+                    continue
+                for url in urls:
+                    if not is_hdr_video(metadata, url, key):
+                        variants.append((video_stream_score(metadata, url, key), url))
+            return [max(variants, key=lambda item: item[0])[1]] if variants else []
         return []
     return []
 
