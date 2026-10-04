@@ -479,3 +479,104 @@ def test_creator_resume_refreshes_exhausted_source_and_returns_new_work_list(tmp
     assert first_result["works"][0]["work_id"] == "old"
     assert second_result["works"][0]["work_id"] == "new"
     assert second_result["work_types"] == {"image": 1, "video": 0, "mixed": 0}
+
+
+def test_creator_service_continues_source_cursor_until_target_is_filled(tmp_path):
+    class Settings:
+        cache_path = str(tmp_path / "cache.sqlite3")
+        output_dir = str(tmp_path / "out")
+        creator_timeout_seconds = 5
+
+        def ensure_output_dir(self, value=None):
+            from pathlib import Path
+            path = Path(value or self.output_dir)
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+
+    class Sources:
+        calls = []
+
+        async def fetch_creator(self, request):
+            page = len(self.calls) + 1
+            self.calls.append(request.cursor)
+            item = ImageCandidate(
+                id=f"p{page}:1", platform=Platform.DOUYIN,
+                image_url=f"https://img.test/{page}.jpg", creator_id="sec-1",
+                post_id=f"p{page}", media_index=1,
+            )
+            return CreatorSourceResult(
+                identity=_identity(), items=[item], posts_fetched=1,
+                post_ids=(item.post_id,), pages_fetched=1,
+                next_cursor=pack_cursor(page + 1) if page < 3 else None,
+            )
+
+    async def run():
+        sources = Sources()
+        service = CreatorImageService(Settings(), sources, object())
+        result = await service.fetch(CreatorFetchRequest(
+            platform=Platform.DOUYIN, creator_id="Gracebb0722",
+            max_posts=3, max_images=3, download=False, resume=False,
+        ))
+        return sources, result
+
+    sources, result = asyncio.run(run())
+    assert sources.calls == [None, pack_cursor(2), pack_cursor(3)]
+    assert [item["post_id"] for item in result["items"]] == ["p1", "p2", "p3"]
+    assert result["pages_fetched"] == 3
+
+
+def test_creator_download_replaces_duplicate_candidates_from_the_same_job(tmp_path):
+    class Settings:
+        cache_path = str(tmp_path / "cache.sqlite3")
+        output_dir = str(tmp_path / "out")
+        creator_timeout_seconds = 5
+
+        def ensure_output_dir(self, value=None):
+            from pathlib import Path
+            path = Path(value or self.output_dir)
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+
+    items = [
+        ImageCandidate(
+            id=f"p{index}:1", platform=Platform.DOUYIN,
+            image_url=f"https://img.test/{index}.jpg", creator_id="sec-1",
+            post_id=f"p{index}", media_index=1,
+        )
+        for index in range(1, 4)
+    ]
+
+    class Sources:
+        async def fetch_creator(self, request):
+            return CreatorSourceResult(
+                identity=_identity(), items=items, posts_fetched=3,
+                post_ids=tuple(item.post_id for item in items), pages_fetched=1,
+            )
+
+    class Downloader:
+        calls = []
+
+        async def download_many(self, batch, *args, **kwargs):
+            self.calls.append([item.id for item in batch])
+            return [
+                DownloadRecord(
+                    candidate_id=item.id, platform=item.platform,
+                    image_url=item.image_url,
+                    status="duplicate" if item.id == "p1:1" else "downloaded",
+                )
+                for item in batch
+            ]
+
+    async def run():
+        downloader = Downloader()
+        service = CreatorImageService(Settings(), Sources(), downloader)
+        result = await service.fetch(CreatorFetchRequest(
+            platform=Platform.DOUYIN, creator_id="Gracebb0722",
+            max_posts=3, max_images=2, download=True, resume=False,
+        ))
+        return downloader, result
+
+    downloader, result = asyncio.run(run())
+    assert downloader.calls == [["p1:1", "p2:1"], ["p3:1"]]
+    assert [record["status"] for record in result["downloads"]] == ["duplicate", "downloaded", "downloaded"]
+    assert len(result["items"]) == 3

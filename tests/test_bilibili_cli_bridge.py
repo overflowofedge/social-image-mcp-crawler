@@ -55,3 +55,36 @@ def test_bilibili_cli_collects_multiple_creator_pages(monkeypatch):
     assert result["pages_fetched"] == 3
     assert result["post_ids"] == ["post-1", "post-2", "post-3"]
     assert len(result["items"]) == 3
+
+
+def test_bilibili_cli_keeps_completed_pages_when_a_later_page_fails(monkeypatch):
+    class FakeApi:
+        calls = 0
+
+        async def fetch_creator(self, request):
+            self.calls += 1
+            if self.calls == 2:
+                raise RuntimeError("temporary page failure")
+            return SimpleNamespace(
+                identity=CreatorIdentity(
+                    platform=Platform.BILIBILI, requested_id="42", canonical_id="42",
+                    name="UP主", source="test", matched_by="exact_uid",
+                ),
+                items=(ImageCandidate(
+                    id="video-1", platform=Platform.BILIBILI,
+                    image_url="https://cdn.test/1.jpg", post_id="post-1",
+                ),),
+                posts_fetched=50,
+                next_cursor='{"native":"2","offset":0}',
+                post_ids=("post-1",), rejected_posts=0, pages_fetched=1, warnings=(),
+            )
+
+    monkeypatch.setenv("BILIBILI_CREATOR_SLEEP_SECONDS", "0.1")
+    result = asyncio.run(_MODULE._fetch_creator_pages(FakeApi(), CreatorFetchRequest(
+        platform=Platform.BILIBILI, creator_id="42", max_posts=100,
+        max_images=100, download=False,
+    )))
+
+    assert result["posts_fetched"] == 50
+    assert result["post_ids"] == ["post-1"]
+    assert any("temporary page failure" in warning for warning in result["warnings"])

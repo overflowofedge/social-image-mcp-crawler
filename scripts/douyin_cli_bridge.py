@@ -471,7 +471,8 @@ async def _fetch_creator_via_browser(request: CreatorFetchRequest, account: str 
             )
             collector = CreatorCollector(identity, request)
             consumed: set[tuple[str, str]] = set()
-            for _ in range(10):
+            page_limit = min(100, max(10, (request.max_posts + 9) // 10 + 5))
+            for _ in range(page_limit):
                 await page.wait_for_timeout(max(150, int(os.getenv("DOUYIN_BROWSER_POLL_MS", "400"))))
                 progressed = False
                 for response_url, payload in list(captured):
@@ -486,7 +487,7 @@ async def _fetch_creator_via_browser(request: CreatorFetchRequest, account: str 
                     consumed.add(key)
                     if _browser_items_from_payload(payload, identity, request, collector, response_url):
                         progressed = True
-                    if collector.posts_fetched >= request.max_posts or collector.pages_fetched >= 10:
+                    if collector.posts_fetched >= request.max_posts or collector.pages_fetched >= page_limit:
                         break
                     if not has_more and collector.pages_fetched:
                         break

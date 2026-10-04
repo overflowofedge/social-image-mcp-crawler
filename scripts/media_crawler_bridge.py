@@ -347,7 +347,12 @@ async def _run(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, Any
             "--type", crawler_type,
             "--keywords", args.query,
             "--specified_id", specified,
-            "--crawler_max_notes_count", str(max(1, min(args.limit, 100))),
+            "--crawler_max_notes_count", str(max(1, min(
+                creator_request.max_posts if creator_request else (
+                    int(os.getenv("SOCIAL_IMAGE_SEARCH_MAX_POSTS", "0")) or args.limit
+                ),
+                500,
+            ))),
             "--save_data_option", "jsonl",
             "--save_data_path", str(vendor_root / ".bridge-data"),
             "--get_comment", "false",

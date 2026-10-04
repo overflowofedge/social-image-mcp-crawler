@@ -10,6 +10,7 @@ validation, retries and persistence.
 import asyncio
 import hashlib
 import html
+import os
 import random
 import re
 import time
@@ -184,7 +185,7 @@ class BilibiliApi:
             "api error -352", "api error -799", "risk control", "验证码",
         ))
 
-    async def _video_search_rows(self, query: str, page_size: int) -> list[dict[str, Any]]:
+    async def _video_search_rows(self, query: str, page_size: int, page: int = 1) -> list[dict[str, Any]]:
         """Return normalized video rows with a second public endpoint fallback.
 
         Bilibili has two anonymous search responses in production. The typed
@@ -196,7 +197,7 @@ class BilibiliApi:
             payload = await self._get_wbi(
                 "/x/web-interface/search/type",
                 {
-                    "search_type": "video", "keyword": query, "page": 1,
+                    "search_type": "video", "keyword": query, "page": max(1, page),
                     "page_size": min(max(page_size, 1), 50), "order": "totalrank",
                 },
             )
@@ -207,7 +208,7 @@ class BilibiliApi:
             try:
                 payload = await self._get_wbi(
                     "/x/web-interface/search/all/v2",
-                    {"keyword": query, "page": 1, "order": "totalrank"},
+                    {"keyword": query, "page": max(1, page), "order": "totalrank"},
                 )
                 data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
                 blocks = data.get("result") if isinstance(data.get("result"), list) else []
@@ -480,13 +481,33 @@ class BilibiliApi:
                     result.append(candidate)
             return result
         query = intent.raw.strip()
-        rows = await self._video_search_rows(
-            query, max(limit, image_limit or 0, video_limit or 0, 1)
-        )
+        row_target = max(limit, image_limit or 0, video_limit or 0, 1)
+        rows: list[dict[str, Any]] = []
+        seen_rows: set[str] = set()
+        page_limit = min(50, max(1, (row_target + 49) // 50 + 2))
+        for page in range(1, page_limit + 1):
+            page_rows = await self._video_search_rows(query, min(row_target, 50), page)
+            added = 0
+            for row in page_rows:
+                row_id = _bvid(row.get("bvid")) or _text(row.get("aid"))
+                if not row_id or row_id in seen_rows:
+                    continue
+                seen_rows.add(row_id)
+                rows.append(row)
+                added += 1
+            if len(rows) >= row_target or not page_rows or not added:
+                break
+            await asyncio.sleep(max(0.1, float(os.getenv("BILIBILI_SEARCH_SLEEP_SECONDS", "0.25"))))
         result: list[ImageCandidate] = []
         image_target = max(1, image_limit or limit)
         video_target = max(1, video_limit or limit)
         video_tasks: list[asyncio.Task[ImageCandidate | None]] = []
+        video_semaphore = asyncio.Semaphore(8)
+
+        async def resolve_video(row: dict[str, Any]) -> ImageCandidate | None:
+            async with video_semaphore:
+                return await self._original_video_candidate(row)
+
         for row in rows:
             if not isinstance(row, dict):
                 continue
@@ -495,7 +516,7 @@ class BilibiliApi:
                 if candidate:
                     result.append(candidate)
             if media_type in ("videos", "all") and len(video_tasks) < video_target:
-                video_tasks.append(asyncio.create_task(self._original_video_candidate(row)))
+                video_tasks.append(asyncio.create_task(resolve_video(row)))
             if media_type == "images" and len(result) >= image_target:
                 break
             if media_type == "all" and len(result) >= image_target and len(video_tasks) >= video_target:
@@ -535,25 +556,52 @@ class BilibiliApi:
             # optional pinned-video endpoint; the search rows are filtered by
             # both UID and author name so another account cannot leak in.
             warnings.append(f"creator timeline unavailable: {exc}")
-            search_rows: list[dict[str, Any]] = []
-            try:
-                search_rows = await self._video_search_rows(identity.name, max(page_size, 20))
-            except BilibiliError:
-                search_rows = []
             normalized_name = re.sub(r"\s+", "", identity.name).casefold()
-            matching_rows = []
-            for row in search_rows:
-                owner = row.get("owner") if isinstance(row.get("owner"), dict) else {}
-                row_mid = _text(owner.get("mid") or row.get("mid"))
-                row_name = _text(owner.get("name") or row.get("author") or row.get("uname"))
-                if row_mid == identity.canonical_id or (
-                    normalized_name and re.sub(r"\s+", "", row_name).casefold() == normalized_name
-                ):
+            matching_rows: list[dict[str, Any]] = []
+            matching_ids: set[str] = set()
+            empty_match_pages = 0
+            search_page_size = max(page_size, 20)
+            fallback_page_limit = min(50, max(3, request.max_posts))
+            scanned_pages = 0
+            for search_page in range(1, fallback_page_limit + 1):
+                try:
+                    search_rows = await self._video_search_rows(identity.name, search_page_size, search_page)
+                except BilibiliError as search_exc:
+                    if not matching_rows:
+                        search_rows = []
+                    else:
+                        warnings.append(f"creator fallback search stopped at page {search_page}: {search_exc}")
+                        break
+                scanned_pages += 1
+                new_matches = 0
+                for row in search_rows:
+                    owner = row.get("owner") if isinstance(row.get("owner"), dict) else {}
+                    row_mid = _text(owner.get("mid") or row.get("mid"))
+                    row_name = _text(owner.get("name") or row.get("author") or row.get("uname"))
+                    exact_name = normalized_name and re.sub(r"\s+", "", row_name).casefold() == normalized_name
+                    if (row_mid and row_mid != identity.canonical_id) or (not row_mid and not exact_name):
+                        continue
+                    row_id = _bvid(row.get("bvid")) or _text(row.get("aid"))
+                    if not row_id or row_id in matching_ids:
+                        continue
+                    matching_ids.add(row_id)
                     matching_rows.append(row)
+                    new_matches += 1
+                if len(matching_rows) >= request.max_posts or not search_rows:
+                    break
+                empty_match_pages = 0 if new_matches else empty_match_pages + 1
+                if empty_match_pages >= 3:
+                    break
+                await asyncio.sleep(max(0.1, float(os.getenv("BILIBILI_CREATOR_SLEEP_SECONDS", "0.5"))))
             if matching_rows:
-                rows = matching_rows[:page_size]
+                rows = matching_rows[:request.max_posts]
                 page_info = {"count": len(matching_rows)}
                 fallback_only = True
+                if len(rows) < request.max_posts:
+                    warnings.append(
+                        f"creator fallback search scanned {scanned_pages} pages and matched "
+                        f"{len(rows)} of {request.max_posts} requested posts"
+                    )
             else:
                 try:
                     fallback = await self._get("/x/space/top/arc", {"vmid": identity.canonical_id})
@@ -566,6 +614,12 @@ class BilibiliApi:
         items: list[ImageCandidate] = []
         post_ids: list[str] = []
         video_tasks: list[tuple[dict[str, Any], asyncio.Task[ImageCandidate | None]]] = []
+        video_semaphore = asyncio.Semaphore(max(1, min(8, request.max_concurrency)))
+
+        async def resolve_video(row: dict[str, Any]) -> ImageCandidate | None:
+            async with video_semaphore:
+                return await self._original_video_candidate(row)
+
         for row in rows:
             if not isinstance(row, dict):
                 continue
@@ -577,7 +631,7 @@ class BilibiliApi:
                 if candidate:
                     items.append(candidate.model_copy(update={"creator_id": identity.canonical_id, "creator_name": identity.name, "author": identity.name}))
             if request.media_type in ("videos", "all"):
-                video_tasks.append((row, asyncio.create_task(self._original_video_candidate(row))))
+                video_tasks.append((row, asyncio.create_task(resolve_video(row))))
         if video_tasks:
             results = await asyncio.gather(*(task for _, task in video_tasks), return_exceptions=True)
             for (row, _), result in zip(video_tasks, results):
