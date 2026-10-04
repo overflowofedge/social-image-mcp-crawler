@@ -15,7 +15,7 @@ from .object_semantics import parse_content_spec
 from .models import CreatorFetchRequest, CreatorSort, ImageCandidate
 from .ranking import rank_candidates
 from .semantic import SemanticReranker
-from .sources import SourceError
+from .sources import CreatorSourceResult, SourceError
 from .vision import VisionReranker
 from .object_detector import ObjectDetector
 from .bilibili import BilibiliError
@@ -59,16 +59,130 @@ class CreatorImageService:
         target = request.profile_url or request.creator_id or request.creator_name or "creator"
         return f"{request.platform.value}:{target}"
 
+    async def _fetch_source_page(self, request: CreatorFetchRequest):
+        """Read one logical source batch while preserving platform fallbacks."""
+        cli_source = getattr(self.sources, "bilibili_source", None) if request.platform.value == "bilibili" else None
+        if request.platform.value == "bilibili" and cli_source is not None and cli_source.command_template:
+            return await self.sources.fetch_creator(request)
+        if request.platform.value == "weibo" and getattr(getattr(self.sources, "media_crawler", None), "command_template", None):
+            try:
+                return await self.sources.fetch_creator(request)
+            except SourceError as exc:
+                if self.weibo is None:
+                    raise
+                try:
+                    return await self.weibo.fetch_creator(request)
+                except WeiboError as fallback_exc:
+                    raise SourceError(f"weibo CLI: {exc}; public API fallback: {fallback_exc}") from fallback_exc
+        if request.platform.value in {"bilibili", "weibo"} and getattr(self, request.platform.value, None) is not None:
+            native_api = getattr(self, request.platform.value)
+            try:
+                return await native_api.fetch_creator(request)
+            except (BilibiliError, WeiboError) as exc:
+                if request.platform.value == "bilibili":
+                    raise SourceError(str(exc)) from exc
+                try:
+                    return await self.sources.fetch_creator(request)
+                except SourceError as fallback_exc:
+                    raise SourceError(f"weibo public API: {exc}; media-crawler fallback: {fallback_exc}") from fallback_exc
+        return await self.sources.fetch_creator(request)
+
+    @staticmethod
+    def _candidate_targets_met(items: list[ImageCandidate], request: CreatorFetchRequest) -> bool:
+        """Stop paging after filling the requested quota plus a small replacement reserve."""
+        image_target = request.max_images if request.media_type != "videos" else 0
+        video_target = (request.max_videos if request.max_videos is not None else request.max_images) if request.media_type != "images" else 0
+        reserve = min(20, max(2, (image_target + video_target + 9) // 10)) if request.download else 0
+        image_needed = image_target + (reserve if image_target else 0)
+        video_needed = video_target + (reserve if video_target else 0)
+        images = videos = 0
+        per_post: dict[str, int] = {}
+        for item in items:
+            if item.media_type == "image":
+                post = item.post_id or item.id
+                if request.per_post_limit is not None and per_post.get(post, 0) >= request.per_post_limit:
+                    continue
+                per_post[post] = per_post.get(post, 0) + 1
+                images += 1
+            elif item.media_type == "video":
+                videos += 1
+        return images >= image_needed and videos >= video_needed
+
+    async def _collect_source_pages(self, request: CreatorFetchRequest) -> CreatorSourceResult:
+        """Continue any source cursor until targets or the post budget are exhausted."""
+        remaining = request.max_posts
+        cursor = request.cursor
+        visited = {cursor} if cursor else set()
+        identity = None
+        items: dict[tuple[str, str, int, str], ImageCandidate] = {}
+        post_ids: list[str] = []
+        known_posts: set[str] = set()
+        warnings: list[str] = []
+        rejected_posts = posts_fetched = pages_fetched = 0
+
+        while remaining > 0:
+            page_request = request.model_copy(update={"cursor": cursor, "max_posts": remaining})
+            try:
+                result = await self._fetch_source_page(page_request)
+            except (SourceError, BilibiliError, WeiboError, ValueError) as exc:
+                if identity is None:
+                    raise
+                warnings.append(f"creator pagination stopped after {pages_fetched} pages: {exc}")
+                break
+            if identity is None:
+                identity = result.identity
+            elif result.identity.canonical_id != identity.canonical_id:
+                raise SourceError("creator identity changed while paging; stopped before mixing accounts")
+
+            for item in result.items:
+                key = (item.post_id or item.id, item.media_type, item.media_index or 1, item.image_url)
+                items[key] = item
+            for post_id in result.post_ids:
+                if post_id not in known_posts:
+                    known_posts.add(post_id)
+                    post_ids.append(post_id)
+            warnings.extend(result.warnings)
+            rejected_posts += result.rejected_posts
+            progress = max(0, int(result.posts_fetched))
+            posts_fetched += progress
+            pages_fetched += max(1, int(result.pages_fetched or 0))
+            remaining = max(0, request.max_posts - posts_fetched)
+            next_cursor = result.next_cursor
+
+            if self._candidate_targets_met(list(items.values()), request) or not next_cursor or remaining <= 0:
+                cursor = next_cursor
+                break
+            if next_cursor == cursor or next_cursor in visited or progress <= 0:
+                warnings.append("creator pagination stopped because the source cursor made no progress")
+                cursor = next_cursor
+                break
+            visited.add(next_cursor)
+            cursor = next_cursor
+
+        if identity is None:
+            raise SourceError("creator source returned no identity")
+        return CreatorSourceResult(
+            identity=identity,
+            items=list(items.values()),
+            posts_fetched=posts_fetched,
+            next_cursor=cursor,
+            post_ids=tuple(post_ids),
+            rejected_posts=rejected_posts,
+            pages_fetched=pages_fetched,
+            warnings=tuple(dict.fromkeys(warnings)),
+        )
+
     async def fetch(self, request: CreatorFetchRequest) -> dict:
         started = time.monotonic()
         try:
             lock = self._locks.setdefault(self._request_key(request), asyncio.Lock())
-            media_target = request.max_images + (request.max_videos or 0)
+            video_target = (request.max_videos if request.max_videos is not None else request.max_images) if request.media_type != "images" else 0
+            image_target = request.max_images if request.media_type != "videos" else 0
             task_timeout = min(
-                1800.0,
+                7200.0,
                 max(
                     float(self.settings.creator_timeout_seconds),
-                    60.0 + request.max_posts * 0.75 + media_target * 1.25,
+                    90.0 + request.max_posts * 1.5 + image_target * 3.0 + video_target * 20.0,
                 ),
             )
             async with lock:
@@ -166,39 +280,7 @@ class CreatorImageService:
                 source_data["creator_name"] = None
                 source_data["profile_url"] = state["identity"]["profile_url"]
             source_request = CreatorFetchRequest.model_validate(source_data)
-            cli_source = getattr(self.sources, "bilibili_source", None) if request.platform.value == "bilibili" else None
-            if request.platform.value == "bilibili" and cli_source is not None and cli_source.command_template:
-                source_result = await self.sources.fetch_creator(source_request)
-            elif request.platform.value == "weibo" and getattr(getattr(self.sources, "media_crawler", None), "command_template", None):
-                # Keep Weibo account retrieval in the isolated CLI process,
-                # matching Douyin/XHS/Bilibili.  The public API remains a
-                # bounded fallback for installations that have no working
-                # MediaCrawler session.
-                try:
-                    source_result = await self.sources.fetch_creator(source_request)
-                except SourceError as exc:
-                    if self.weibo is None:
-                        raise
-                    try:
-                        source_result = await self.weibo.fetch_creator(source_request)
-                    except WeiboError as fallback_exc:
-                        raise SourceError(f"weibo CLI: {exc}; public API fallback: {fallback_exc}") from fallback_exc
-            elif request.platform.value in {"bilibili", "weibo"} and getattr(self, request.platform.value, None) is not None:
-                native_api = getattr(self, request.platform.value)
-                try:
-                    source_result = await native_api.fetch_creator(source_request)
-                except (BilibiliError, WeiboError) as exc:
-                    if request.platform.value == "bilibili":
-                        raise SourceError(str(exc)) from exc
-                    # Weibo's mobile endpoint is rate limited in some
-                    # regions; retain MediaCrawler as an authenticated,
-                    # bounded fallback when it is configured.
-                    try:
-                        source_result = await self.sources.fetch_creator(source_request)
-                    except SourceError as fallback_exc:
-                        raise SourceError(f"weibo public API: {exc}; media-crawler fallback: {fallback_exc}") from fallback_exc
-            else:
-                source_result = await self.sources.fetch_creator(source_request)
+            source_result = await self._collect_source_pages(source_request)
             identity = source_result.identity
             if state["identity"] and state["identity"]["canonical_id"] != identity.canonical_id:
                 raise SourceError("creator identity changed since the saved checkpoint; inspect the account before restarting")
@@ -251,22 +333,57 @@ class CreatorImageService:
             state["refresh_count"] = int(state.get("refresh_count") or 0) + 1
             state["warnings"].extend(warnings)
             self.store.save(key, state)
-        selected = self._select_with_quotas(
-            [ImageCandidate.model_validate(item) for item in state["pending"]], request
-        )
+        pending = [ImageCandidate.model_validate(item) for item in state["pending"]]
+        selected = self._select_with_quotas(pending, request)
         records = []
         if request.download and selected:
-            records = await self.downloader.download_many(selected, output, request.max_concurrency, request.min_width, request.min_height, resume=request.resume)
-            finished = {record.candidate_id for record in records if record.status in {"downloaded", "existing", "duplicate", "rejected"}}
+            selected = []
+            attempted: set[str] = set()
+            successful = {"image": 0, "video": 0}
+            successful_per_post: dict[str, int] = {}
             completed = set(state.get("completed") or [])
-            by_id = {item.id: item for item in selected}
-            for record in records:
-                if record.candidate_id in finished and record.candidate_id in by_id:
-                    item = by_id[record.candidate_id]
+            target_total = (request.max_images if request.media_type != "videos" else 0) + (
+                (request.max_videos if request.max_videos is not None else request.max_images)
+                if request.media_type != "images" else 0
+            )
+            attempt_budget = min(len(pending), max(target_total * 3, target_total + 50))
+            while len(attempted) < attempt_budget and not self._download_targets_met(successful, request):
+                batch = self._select_download_batch(
+                    pending, request, attempted, successful, successful_per_post,
+                    attempt_budget - len(attempted),
+                )
+                if not batch:
+                    break
+                selected.extend(batch)
+                attempted.update(item.id for item in batch)
+                batch_records = await self.downloader.download_many(
+                    batch, output, request.max_concurrency, request.min_width,
+                    request.min_height, resume=request.resume or bool(records),
+                )
+                records.extend(batch_records)
+                by_id = {item.id: item for item in batch}
+                terminal = {
+                    record.candidate_id for record in batch_records
+                    if record.status in {"downloaded", "existing", "duplicate", "rejected"}
+                }
+                batch_successes = 0
+                for record in batch_records:
+                    item = by_id.get(record.candidate_id)
+                    if item is None or record.status not in {"downloaded", "existing"}:
+                        continue
+                    batch_successes += 1
+                    successful[item.media_type] += 1
+                    if item.media_type == "image":
+                        post = item.post_id or item.id
+                        successful_per_post[post] = successful_per_post.get(post, 0) + 1
                     completed.add(f"{item.post_id}:{item.media_index}")
-            state["completed"] = sorted(completed)
-            state["pending"] = [item for item in state["pending"] if item["id"] not in finished]
-            self.store.save(key, state)
+                state["completed"] = sorted(completed)
+                state["pending"] = [item for item in state["pending"] if item["id"] not in terminal]
+                self.store.save(key, state)
+                # A whole batch of transport failures usually means the
+                # platform/CDN is unavailable; avoid multiplying the failure.
+                if not batch_successes and all(record.status == "failed" for record in batch_records):
+                    break
         elif warnings:
             state["warnings"].extend(warnings)
             self.store.save(key, state)
@@ -405,6 +522,54 @@ class CreatorImageService:
             if request.media_type == "all" and images >= request.max_images and videos >= video_limit:
                 break
         return selected
+
+    @staticmethod
+    def _download_targets_met(counts: dict[str, int], request: CreatorFetchRequest) -> bool:
+        image_target = request.max_images if request.media_type != "videos" else 0
+        video_target = (request.max_videos if request.max_videos is not None else request.max_images) if request.media_type != "images" else 0
+        return counts.get("image", 0) >= image_target and counts.get("video", 0) >= video_target
+
+    @staticmethod
+    def _select_download_batch(
+        items: list[ImageCandidate],
+        request: CreatorFetchRequest,
+        attempted: set[str],
+        successful: dict[str, int],
+        successful_per_post: dict[str, int],
+        budget: int,
+    ) -> list[ImageCandidate]:
+        """Choose replacements without letting failed/duplicate candidates consume the quota."""
+        image_target = request.max_images if request.media_type != "videos" else 0
+        video_target = (request.max_videos if request.max_videos is not None else request.max_images) if request.media_type != "images" else 0
+        batch: list[ImageCandidate] = []
+        batch_counts = {"image": 0, "video": 0}
+        batch_per_post: dict[str, int] = {}
+        for item in items:
+            if item.id in attempted:
+                continue
+            if request.media_type == "images" and item.media_type != "image":
+                continue
+            if request.media_type == "videos" and item.media_type != "video":
+                continue
+            target = image_target if item.media_type == "image" else video_target
+            if successful[item.media_type] + batch_counts[item.media_type] >= target:
+                continue
+            post = item.post_id or item.id
+            if item.media_type == "image" and request.per_post_limit is not None:
+                used = successful_per_post.get(post, 0) + batch_per_post.get(post, 0)
+                if used >= request.per_post_limit:
+                    continue
+                batch_per_post[post] = batch_per_post.get(post, 0) + 1
+            batch.append(item)
+            batch_counts[item.media_type] += 1
+            if len(batch) >= budget:
+                break
+            if (
+                successful["image"] + batch_counts["image"] >= image_target
+                and successful["video"] + batch_counts["video"] >= video_target
+            ):
+                break
+        return batch
                 
 
     async def _filter_content(self, items: list[ImageCandidate], request: CreatorFetchRequest) -> tuple[list[ImageCandidate], dict]:

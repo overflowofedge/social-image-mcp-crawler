@@ -156,6 +156,10 @@ def _warning_guidance(message: str, platform: str) -> tuple[str, str]:
     label = _PLATFORM_LABELS.get(platform, platform or "当前平台")
     if "creator timeline unavailable" in lowered:
         return f"{label}账号作品列表暂时无法完整读取，已保留其他方式找到的内容。", "稍后重试；频繁出现时更新该平台 Cookie 或重新登录。"
+    if "fallback search scanned" in lowered:
+        return f"{label}主页接口受限，备用搜索已翻页并保留精确匹配该账号的作品。", "若仍未达到目标，请更新该平台 Cookie 后重试；备用搜索不保证覆盖账号全部历史作品。"
+    if "pagination stopped" in lowered or "cursor made no progress" in lowered:
+        return f"{label}分页在后续页面中断，已保留中断前取得的内容。", "稍后从断点继续；频繁出现时更新登录状态或降低单次作品数。"
     if "video url unavailable" in lowered:
         return "部分作品没有取得可直接下载的视频地址。", "确认作品可以公开播放后重试，或减少单次检索作品数。"
     if "missing or mismatched author" in lowered:
@@ -228,6 +232,13 @@ def _task_report(body: dict, result: dict, elapsed_seconds: float) -> dict:
     if requested["videos"]:
         actual_parts.append(f"找到 {found['videos']} 个视频")
     logs.append({"level": "info", "message": f"采集结果：{'，'.join(actual_parts) or '没有找到媒体'}。"})
+    pages_fetched = int(result.get("pages_fetched") or 0)
+    posts_fetched = int(result.get("posts_fetched") or 0)
+    if pages_fetched or posts_fetched:
+        logs.append({
+            "level": "info",
+            "message": f"检索范围：读取 {pages_fetched} 页，检查 {posts_fetched} 个作品。",
+        })
 
     new_total = sum(status_counts["downloaded"].values())
     existing_total = sum(status_counts["existing"].values())
@@ -290,7 +301,10 @@ def _task_report(body: dict, result: dict, elapsed_seconds: float) -> dict:
         if not shortfalls[media] or raw_errors:
             continue
         reason = f"实际可用数量比目标少 {shortfalls[media]} {unit}。"
-        action = "增加“最多检索作品数”后重试；若仍不足，说明平台当前可访问内容少于目标。"
+        if requested["max_posts"] and posts_fetched >= requested["max_posts"]:
+            action = "已检查完本次设置的作品范围；可增加“最多检索作品数”，或更新平台登录状态后重试。"
+        else:
+            action = "程序已自动翻页补齐；若仍不足，请更新平台登录状态后重试。"
         if media == "images" and requested["per_post_limit"] and requested["max_posts"]:
             capacity = requested["per_post_limit"] * requested["max_posts"]
             if requested["images"] > capacity:
@@ -322,6 +336,15 @@ def _task_report(body: dict, result: dict, elapsed_seconds: float) -> dict:
         "issues": issues,
         "logs": logs,
     }
+
+
+def _request_timeout(body: dict) -> float:
+    """Give large media jobs enough wall time without making small jobs unbounded."""
+    media_type = str(body.get("media_type") or "images")
+    images = int(body.get("image_limit") or 0) if media_type != "videos" else 0
+    videos = int(body.get("video_limit") or 0) if media_type != "images" else 0
+    posts = int(body.get("max_posts") or 20)
+    return min(7200.0, max(300.0, 120.0 + posts * 1.5 + images * 3.0 + videos * 20.0))
 
 
 async def _fetch_preview(image_url: str, referer: str = "") -> tuple[str, bytes]:
@@ -446,7 +469,11 @@ class Handler(BaseHTTPRequestHandler):
                 filter_mode=str(body.get("filter_mode", "off")), quality_mode=str(body.get("quality_mode", "fast")),
                 retrieval_mode="sources", use_cache=False,
             )
-            result = self.runner.call(search_images(**search_kwargs, creator_name=auto_creator, creator_id=auto_creator_id))
+            request_timeout = _request_timeout(body)
+            result = self.runner.call(
+                search_images(**search_kwargs, creator_name=auto_creator, creator_id=auto_creator_id),
+                timeout=request_timeout,
+            )
             error = result.get("error") if isinstance(result, dict) else None
             if (auto_creator or auto_creator_id) and isinstance(error, dict):
                 message = str(error.get("message", "")).lower()
@@ -454,7 +481,10 @@ class Handler(BaseHTTPRequestHandler):
                     "matched 0", "not found", "invalid creator",
                     "creator_identity_unresolved", "identity_unresolved",
                 )):
-                    result = self.runner.call(search_images(**search_kwargs, creator_name=None, creator_id=None))
+                    result = self.runner.call(
+                        search_images(**search_kwargs, creator_name=None, creator_id=None),
+                        timeout=request_timeout,
+                    )
             if not isinstance(result, dict):
                 raise ValueError("采集服务返回了无法识别的结果")
             result["task_report"] = _task_report(body, result, time.monotonic() - started)

@@ -193,6 +193,81 @@ def test_bilibili_creator_uses_filtered_video_search_when_timeline_is_challenged
     assert any("creator timeline unavailable" in warning for warning in result.warnings)
 
 
+def test_bilibili_creator_fallback_searches_multiple_pages_for_exact_account(monkeypatch):
+    seen_pages = []
+
+    def handler(request):
+        if request.url.path == "/x/web-interface/search/type":
+            search_type = request.url.params.get("search_type")
+            if search_type == "bili_user":
+                return httpx.Response(200, json={"code": 0, "data": {"result": [
+                    {"mid": 42, "uname": "示例账号"},
+                ]}})
+            page = int(request.url.params.get("page", "1"))
+            seen_pages.append(page)
+            rows = {
+                1: [
+                    {"bvid": "BVwrong", "mid": 99, "author": "示例账号", "pic": "//img.test/wrong.jpg"},
+                    {"bvid": "BV1", "mid": 42, "author": "示例账号", "pic": "//img.test/1.jpg"},
+                ],
+                2: [
+                    {"bvid": "BV2", "mid": 42, "author": "示例账号", "pic": "//img.test/2.jpg"},
+                    {"bvid": "BV3", "mid": 42, "author": "示例账号", "pic": "//img.test/3.jpg"},
+                ],
+            }.get(page, [])
+            return httpx.Response(200, json={"code": 0, "data": {"result": rows}})
+        if request.url.path == "/x/web-interface/card":
+            return httpx.Response(200, json={"code": 0, "data": {"card": {"mid": "42", "name": "示例账号"}}})
+        if request.url.path == "/x/space/wbi/arc/search":
+            return httpx.Response(200, json={"code": -352, "message": "风控校验失败"})
+        return httpx.Response(404, json={"code": -404})
+
+    monkeypatch.setenv("BILIBILI_CREATOR_SLEEP_SECONDS", "0.1")
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await BilibiliApi(client).fetch_creator(CreatorFetchRequest(
+                platform=Platform.BILIBILI, creator_name="示例账号",
+                max_posts=3, max_images=3, download=False,
+            ))
+
+    result = asyncio.run(run())
+    assert seen_pages == [1, 2]
+    assert [item.post_id for item in result.items] == ["BV1", "BV2", "BV3"]
+
+
+def test_bilibili_keyword_search_collects_multiple_pages(monkeypatch):
+    seen_pages = []
+
+    def handler(request):
+        if request.url.path != "/x/web-interface/search/type":
+            return httpx.Response(404, json={"code": -404})
+        page = int(request.url.params.get("page", "1"))
+        seen_pages.append(page)
+        start = (page - 1) * 50
+        count = 50 if page == 1 else 25
+        rows = [
+            {
+                "bvid": f"BV{index}", "mid": 42, "author": "示例账号",
+                "pic": f"//img.test/{index}.jpg", "title": "咖啡店室内",
+            }
+            for index in range(start, start + count)
+        ]
+        return httpx.Response(200, json={"code": 0, "data": {"result": rows}})
+
+    monkeypatch.setenv("BILIBILI_SEARCH_SLEEP_SECONDS", "0.1")
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await BilibiliApi(client).search(
+                parse_intent("咖啡店室内"), 75, media_type="images", image_limit=75,
+            )
+
+    result = asyncio.run(run())
+    assert seen_pages == [1, 2]
+    assert len(result) == 75
+
+
 def test_bilibili_nickname_resolves_from_video_author_when_user_search_is_challenged():
     def handler(request):
         if request.url.path == "/x/web-interface/search/type":

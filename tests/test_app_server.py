@@ -20,6 +20,7 @@ _preview_referer = _MODULE._preview_referer
 _creator_hint = _MODULE._creator_hint
 _error_guidance = _MODULE._error_guidance
 _task_report = _MODULE._task_report
+_request_timeout = _MODULE._request_timeout
 
 
 @contextmanager
@@ -179,6 +180,15 @@ def test_large_task_report_explains_cli_rate_limit_risk():
     warning = next(log for log in report["logs"] if "大批量任务" in log["message"])
     assert warning["level"] == "warning"
     assert "CLI 仍受平台访问频率" in warning["action"]
+
+
+def test_large_video_job_gets_a_dynamic_desktop_timeout():
+    timeout = _request_timeout({
+        "media_type": "videos", "video_limit": 50, "max_posts": 50,
+    })
+
+    assert timeout > 300
+    assert timeout <= 7200
 
 
 def test_search_http_response_always_contains_user_facing_report():

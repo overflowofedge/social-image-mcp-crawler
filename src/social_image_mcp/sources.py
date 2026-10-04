@@ -468,7 +468,11 @@ class ExternalJsonSource:
                 *command, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE, env=env, **_process_spawn_options(),
             )
-            task_timeout = min(600.0, max(float(self.timeout_seconds), 30.0 + request.max_posts * 0.9))
+            media_target = request.max_images + (request.max_videos or 0)
+            task_timeout = min(
+                1800.0,
+                max(float(self.timeout_seconds), 60.0 + request.max_posts * 2.0 + media_target * 0.5),
+            )
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=task_timeout)
             if process.returncode:
                 detail = f"{self.name} creator request failed: {_decode_process_output(stderr)[-1500:]}"
@@ -512,6 +516,7 @@ class ExternalJsonSource:
             "SOCIAL_IMAGE_QUERY": intent.raw,
             "SOCIAL_IMAGE_ITEM_ID": intent.identifier or "",
             "SOCIAL_IMAGE_LIMIT": str(limit),
+            "SOCIAL_IMAGE_SEARCH_MAX_POSTS": str(request.max_posts if request else min(limit, 500)),
             # Windows defaults to the active code page (often GBK).  Source
             # bridges emit JSON metadata that may contain emoji or other
             # Unicode, so force UTF-8 for both Python and compatible CLIs.
@@ -770,8 +775,8 @@ class GalleryDlSource:
         target = request.creator_name or request.creator_id or request.profile_url or ""
         target = target.strip().lstrip("@")
         if request.profile_url:
-            path = urlparse(request.profile_url).path.strip("/")
-            target = path.split("/", 1)[0] if path else target
+            parts = [part for part in urlparse(request.profile_url).path.split("/") if part]
+            target = parts[-1] if request.platform == Platform.XHS and parts else (parts[0] if parts else target)
         if not target:
             raise SourceError("X creator username is required")
         if request.platform == Platform.INSTAGRAM:
@@ -783,14 +788,18 @@ class GalleryDlSource:
         else:
             profile_url = f"https://x.com/{target}"
             media_url = f"https://x.com/{target}/media"
-        # The bare profile URL is only a timeline directory. The media
-        # subpage is required for gallery-dl to emit downloadable records.
-        media_url = f"https://x.com/{target}/media"
+        # X requires its media subpage; Instagram and XHS use their profile URL.
+        if request.platform == Platform.X:
+            media_url = f"https://x.com/{target}/media"
         intent = Intent(raw=media_url, normalized=media_url.lower(), tokens=(target.lower(),), negative_tokens=(), url=media_url, identifier_platform=request.platform.value)
         candidates = await self.search(request.platform, intent, max(request.max_images, request.max_videos or 0, request.max_posts * 10))
         items: list[ImageCandidate] = []
         post_ids: list[str] = []
         seen_posts: set[str] = set()
+        media_counts = {"image": 0, "video": 0}
+        post_image_counts: dict[str, int] = {}
+        image_limit = request.max_images
+        video_limit = request.max_videos if request.max_videos is not None else request.max_images
         for item in candidates:
             if request.media_type == "images" and item.media_type != "image":
                 continue
@@ -799,16 +808,33 @@ class GalleryDlSource:
             record = item.source_payload.get("record") if isinstance(item.source_payload, dict) else {}
             post_id = str((record or {}).get("tweet_id") or (record or {}).get("id") or item.id)
             if post_id not in seen_posts:
+                if len(post_ids) >= request.max_posts:
+                    break
                 seen_posts.add(post_id)
                 post_ids.append(post_id)
+            if item.media_type == "image":
+                if media_counts["image"] >= image_limit:
+                    continue
+                if request.per_post_limit is not None and post_image_counts.get(post_id, 0) >= request.per_post_limit:
+                    continue
+                post_image_counts[post_id] = post_image_counts.get(post_id, 0) + 1
+            elif media_counts["video"] >= video_limit:
+                continue
             items.append(item.model_copy(update={
                 "id": f"{post_id}:{item.media_index or 1}",
                 "post_id": post_id,
                 "creator_id": target,
                 "creator_name": target,
-                "permalink": item.permalink or f"https://x.com/{target}/status/{post_id}",
+                "permalink": item.permalink or (
+                    f"https://x.com/{target}/status/{post_id}" if request.platform == Platform.X else profile_url
+                ),
             }))
-            if len(items) >= request.max_images:
+            media_counts[item.media_type] += 1
+            if request.media_type == "images" and media_counts["image"] >= image_limit:
+                break
+            if request.media_type == "videos" and media_counts["video"] >= video_limit:
+                break
+            if request.media_type == "all" and media_counts["image"] >= image_limit and media_counts["video"] >= video_limit:
                 break
         identity = CreatorIdentity(platform=request.platform, requested_id=target, canonical_id=target, name=target, profile_url=profile_url, source="gallery-dl", matched_by="profile_url")
         return CreatorSourceResult(identity=identity, items=items, posts_fetched=len(post_ids), post_ids=tuple(post_ids), pages_fetched=1, next_cursor=None)
@@ -861,7 +887,15 @@ class SourceHub:
         sources: list[Any] = []
         if platform == Platform.DOUYIN and self.douyin_source.command_template:
             sources.append(self.douyin_source)
-        if platform in self.media_crawler.platforms and self.media_crawler.command_template and not (platform == Platform.DOUYIN and self.douyin_source.command_template):
+        if (
+            platform in self.media_crawler.platforms
+            and self.media_crawler.command_template
+            and not (
+                platform == Platform.DOUYIN
+                and self.douyin_source.command_template
+                and limit <= 50
+            )
+        ):
             sources.append(self.media_crawler)
         if platform == Platform.XHS and self.xhs_downloader.command_template and (intent.url or intent.identifier):
             sources.append(self.xhs_downloader)

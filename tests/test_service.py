@@ -244,6 +244,43 @@ def test_video_and_all_limits_drive_source_fetch_budget(tmp_path):
     asyncio.run(run())
 
 
+def test_large_keyword_result_is_not_truncated_to_old_reranking_cap(tmp_path):
+    class Sources:
+        def statuses(self):
+            return [{
+                "name": "bulk", "configured": True, "verified": True,
+                "verified_platforms": ["xhs"], "ready_platforms": ["xhs"],
+                "mode": "test", "detail": "", "platforms": ["xhs"],
+            }]
+
+        async def search(self, platform, intent, limit, *, request=None):
+            assert limit == 500
+            return [
+                ImageCandidate(
+                    id=f"item-{index}", platform=platform,
+                    image_url=f"https://cdn.test/{index}.jpg", title="咖啡店室内",
+                )
+                for index in range(250)
+            ]
+
+    async def run():
+        service = SocialImageService(Settings(
+            cache_path=str(tmp_path / "cache.sqlite3"), vision_model=None,
+        ))
+        await service.start()
+        service.sources = Sources()
+        result = await service.search(SearchRequest(
+            query="咖啡店室内", platforms=[Platform.XHS], max_results=250,
+            image_limit=250, use_cache=False, retrieval_mode="sources",
+        ))
+        await service.close()
+        return result
+
+    result = asyncio.run(run())
+    assert len(result["items"]) == 250
+    assert result["platforms"]["xhs"]["count"] == 250
+
+
 def test_cache_hit_refreshes_current_source_verification_status(tmp_path):
     class DynamicSources:
         def __init__(self):

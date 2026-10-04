@@ -38,10 +38,20 @@ async def _fetch_creator_pages(api: BilibiliApi, request: CreatorFetchRequest) -
     posts_fetched = 0
     pages_fetched = 0
     page_limit = min(50, max(1, (request.max_posts + 9) // 10))
+    visited_cursors = {cursor} if cursor else set()
     while remaining > 0 and pages_fetched < page_limit:
         page_request = request.model_copy(update={"cursor": cursor, "max_posts": remaining})
-        result = await api.fetch_creator(page_request)
+        try:
+            result = await api.fetch_creator(page_request)
+        except Exception as exc:
+            if identity is None:
+                raise
+            warnings.append(f"Bilibili pagination stopped after {pages_fetched} pages: {exc}")
+            break
         identity = identity or result.identity
+        if result.identity.canonical_id != identity.canonical_id:
+            warnings.append("Bilibili pagination stopped because the creator identity changed")
+            break
         for item in result.items:
             items[item.stable_key] = item
         post_ids.extend(result.post_ids)
@@ -50,9 +60,16 @@ async def _fetch_creator_pages(api: BilibiliApi, request: CreatorFetchRequest) -
         posts_fetched += result.posts_fetched
         pages_fetched += result.pages_fetched
         remaining -= result.posts_fetched
-        cursor = result.next_cursor
-        if not cursor or result.posts_fetched <= 0:
+        next_cursor = result.next_cursor
+        if not next_cursor or result.posts_fetched <= 0:
+            cursor = next_cursor
             break
+        if next_cursor == cursor or next_cursor in visited_cursors:
+            warnings.append("Bilibili pagination stopped because the cursor made no progress")
+            cursor = next_cursor
+            break
+        visited_cursors.add(next_cursor)
+        cursor = next_cursor
         await asyncio.sleep(max(0.1, float(os.getenv("BILIBILI_CREATOR_SLEEP_SECONDS", "0.5"))))
     if identity is None:
         raise RuntimeError("Bilibili creator retrieval returned no identity")

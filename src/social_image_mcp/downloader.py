@@ -192,37 +192,28 @@ class ImageDownloader:
 
     async def _download_one(self, item: ImageCandidate, output_dir: Path, seen_hashes: dict[tuple[str, str], set[str]], seen_perceptual: dict[tuple[str, str], list[int]], lock: asyncio.Lock, min_width: int, min_height: int) -> DownloadRecord:
         try:
+            headers = {"User-Agent": "Mozilla/5.0 (social-image-mcp)"}
+            if item.platform.value == "x":
+                headers["Referer"] = "https://x.com/"
+            elif item.platform.value == "weibo":
+                headers["Referer"] = item.permalink or "https://m.weibo.cn/"
+            elif item.platform.value == "douyin":
+                headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36"
+                headers["Referer"] = item.permalink or "https://www.douyin.com/"
+                headers["Origin"] = "https://www.douyin.com"
+            elif item.platform.value == "bilibili":
+                headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36"
+                headers["Referer"] = item.permalink or "https://www.bilibili.com/"
+                headers["Origin"] = "https://www.bilibili.com"
+            elif item.platform.value == "other" and item.permalink:
+                headers["Referer"] = item.permalink
+            if item.media_type == "video":
+                return await self._download_video(item, output_dir, seen_hashes, lock, headers)
+
             response = None
             last_error = ""
             for attempt in range(3):
                 try:
-                    headers = {"User-Agent": "Mozilla/5.0 (social-image-mcp)"}
-                    if item.platform.value == "x":
-                        # X media hosts occasionally reject clients without a
-                        # browser-like referer, even though the URL is public.
-                        headers["Referer"] = "https://x.com/"
-                    elif item.platform.value == "weibo":
-                        # Sina image hosts reject direct requests without a
-                        # Weibo page referer, even when the image URL is
-                        # public. Use the mobile page because creator results
-                        # and share links both resolve through m.weibo.cn.
-                        headers["Referer"] = item.permalink or "https://m.weibo.cn/"
-                    elif item.platform.value == "douyin":
-                        # Douyin's signed play URL redirects to a CDN that
-                        # rejects direct clients without the site referer.
-                        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36"
-                        headers["Referer"] = item.permalink or "https://www.douyin.com/"
-                        headers["Origin"] = "https://www.douyin.com"
-                    elif item.platform.value == "bilibili":
-                        # Bilibili's signed bilivideo URLs return 403 without
-                        # the page origin, even though the same URL works in
-                        # a browser. Keep the referer on both cover and video
-                        # downloads; the CDN validates it before streaming.
-                        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36"
-                        headers["Referer"] = item.permalink or "https://www.bilibili.com/"
-                        headers["Origin"] = "https://www.bilibili.com"
-                    elif item.platform.value == "other" and item.permalink:
-                        headers["Referer"] = item.permalink
                     response = await self.client.get(item.image_url, headers=headers, follow_redirects=True, timeout=30)
                     response.raise_for_status()
                     break
@@ -235,27 +226,6 @@ class ImageDownloader:
                 raise RuntimeError(last_error or "request failed")
             content = response.content
             content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
-            if item.media_type == "video":
-                if content_type and not (content_type.startswith("video/") or content_type == "application/octet-stream"):
-                    raise ValueError(f"not a video response: {content_type}")
-                digest = hashlib.sha256(content).hexdigest()
-                suffix = Path(urlparse(item.image_url).path).suffix.lower().lstrip(".")
-                extension = {
-                    "video/mp4": "mp4", "video/webm": "webm", "video/x-matroska": "mkv",
-                    "video/quicktime": "mov", "video/ogg": "ogv", "video/x-m4v": "m4v",
-                }.get(content_type, suffix if suffix in {"mp4", "webm", "mkv", "mov", "ogv", "ogg", "m4v"} else "mp4")
-                scope = _scope(item)
-                async with lock:
-                    hashes = seen_hashes.setdefault(scope, set())
-                    if digest in hashes:
-                        return DownloadRecord(candidate_id=item.id, platform=item.platform, image_url=item.image_url, media_type="video", sha256=digest, status="duplicate")
-                    filename = _filename(item, extension)
-                    path = _unique_path(_media_dir(output_dir, item) / filename)
-                    temporary = path.with_suffix(path.suffix + ".part")
-                    temporary.write_bytes(content)
-                    temporary.replace(path)
-                    hashes.add(digest)
-                return DownloadRecord(candidate_id=item.id, platform=item.platform, image_url=item.image_url, media_type="video", path=str(path.resolve()), sha256=digest, content_type=content_type, status="downloaded")
             if content_type and not content_type.startswith("image/") and content_type != "application/octet-stream":
                 raise ValueError(f"not an image response: {content_type}")
             digest = hashlib.sha256(content).hexdigest()
@@ -284,3 +254,80 @@ class ImageDownloader:
             return DownloadRecord(candidate_id=item.id, platform=item.platform, image_url=item.image_url, path=str(path.resolve()), sha256=digest, perceptual_hash=format(perceptual, "x"), width=width, height=height, content_type=response.headers.get("content-type"), status="downloaded")
         except Exception as exc:  # Keep one bad platform item from cancelling the batch.
             return DownloadRecord(candidate_id=item.id, platform=item.platform, image_url=item.image_url, media_type=item.media_type, status="failed", error=str(exc))
+
+    async def _download_video(
+        self,
+        item: ImageCandidate,
+        output_dir: Path,
+        seen_hashes: dict[tuple[str, str], set[str]],
+        lock: asyncio.Lock,
+        headers: dict[str, str],
+    ) -> DownloadRecord:
+        """Stream large video bodies to disk so batch memory stays bounded."""
+        last_error = ""
+        for attempt in range(3):
+            temporary: Path | None = None
+            try:
+                async with self.client.stream(
+                    "GET", item.image_url, headers=headers, follow_redirects=True,
+                    timeout=httpx.Timeout(120.0, connect=10.0),
+                ) as response:
+                    response.raise_for_status()
+                    content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
+                    if content_type and not (content_type.startswith("video/") or content_type == "application/octet-stream"):
+                        raise ValueError(f"not a video response: {content_type}")
+                    suffix = Path(urlparse(item.image_url).path).suffix.lower().lstrip(".")
+                    extension = {
+                        "video/mp4": "mp4", "video/webm": "webm", "video/x-matroska": "mkv",
+                        "video/quicktime": "mov", "video/ogg": "ogv", "video/x-m4v": "m4v",
+                    }.get(content_type, suffix if suffix in {"mp4", "webm", "mkv", "mov", "ogv", "ogg", "m4v"} else "mp4")
+                    async with lock:
+                        filename = _filename(item, extension)
+                        path = _unique_path(_media_dir(output_dir, item) / filename)
+                        temporary = path.with_suffix(path.suffix + ".part")
+                        temporary.touch(exist_ok=False)
+                    digest_builder = hashlib.sha256()
+                    size = 0
+                    with temporary.open("wb") as handle:
+                        async for chunk in response.aiter_bytes(1024 * 1024):
+                            if not chunk:
+                                continue
+                            handle.write(chunk)
+                            digest_builder.update(chunk)
+                            size += len(chunk)
+                    if size <= 0:
+                        raise ValueError("empty video response")
+                    digest = digest_builder.hexdigest()
+                    scope = _scope(item)
+                    async with lock:
+                        hashes = seen_hashes.setdefault(scope, set())
+                        if digest in hashes:
+                            temporary.unlink(missing_ok=True)
+                            return DownloadRecord(
+                                candidate_id=item.id, platform=item.platform,
+                                image_url=item.image_url, media_type="video",
+                                sha256=digest, status="duplicate",
+                            )
+                        temporary.replace(path)
+                        hashes.add(digest)
+                    return DownloadRecord(
+                        candidate_id=item.id, platform=item.platform,
+                        image_url=item.image_url, media_type="video",
+                        path=str(path.resolve()), sha256=digest,
+                        content_type=content_type, status="downloaded",
+                    )
+            except asyncio.CancelledError:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+                raise
+            except httpx.HTTPError as exc:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+                last_error = str(exc)
+                if attempt < 2:
+                    await asyncio.sleep(0.4 * (attempt + 1))
+            except Exception:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+                raise
+        raise RuntimeError(last_error or "video request failed")

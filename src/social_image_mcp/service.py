@@ -265,21 +265,23 @@ class SocialImageService:
         requested_total = self._requested_media_total(request)
         if intent.is_keyword:
             target_limit = requested_total
-            ranked = rank_candidates(all_candidates, intent, min(target_limit * 3, 200), request.min_width, request.min_height, require_match=True)
+            ranked = rank_candidates(
+                all_candidates, intent, min(max(target_limit * 3, target_limit), 2000),
+                request.min_width, request.min_height, require_match=True,
+            )
             ranked = [item.model_copy(update={"score": round(item.score + self.feedback.bias(intent, item), 4)}) for item in ranked]
             ranked.sort(key=lambda item: item.score, reverse=True)
             if self.reranker.enabled:
                 try:
-                    ranked = await asyncio.wait_for(
-                        self.reranker.rerank(ranked, intent, min(target_limit * 2, 100)),
+                    semantic_pool = ranked[: min(100, len(ranked))]
+                    semantic_ranked = await asyncio.wait_for(
+                        self.reranker.rerank(semantic_pool, intent, len(semantic_pool)),
                         timeout=max(0.05, float(getattr(self.settings, "semantic_timeout_seconds", 4))),
                     )
+                    ranked = semantic_ranked + ranked[len(semantic_pool):]
                     semantic_applied = bool(getattr(self.reranker, "_last_applied", False))
                 except asyncio.TimeoutError:
                     semantic_deferred = True
-                    ranked = ranked[:min(target_limit * 2, 100)]
-            else:
-                ranked = ranked[:min(target_limit * 2, 100)]
             # Starting CLIP is intentionally asynchronous. A cold model can
             # take longer than the useful request budget, so only use it when
             # the worker is already ready; later requests get visual ranking
