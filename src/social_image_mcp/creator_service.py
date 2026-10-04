@@ -18,6 +18,7 @@ from .semantic import SemanticReranker
 from .sources import CreatorSourceResult, SourceError
 from .vision import VisionReranker
 from .object_detector import ObjectDetector
+from .progress import report_progress
 from .bilibili import BilibiliError
 from .weibo import WeiboError
 
@@ -121,6 +122,14 @@ class CreatorImageService:
         rejected_posts = posts_fetched = pages_fetched = 0
 
         while remaining > 0:
+            report_progress(
+                "retrieving",
+                "正在读取下一批作品；平台采集器会在后台自动翻页。",
+                pages_fetched=pages_fetched,
+                posts_fetched=posts_fetched,
+                images_found=sum(item.media_type == "image" for item in items.values()),
+                videos_found=sum(item.media_type == "video" for item in items.values()),
+            )
             page_request = request.model_copy(update={"cursor": cursor, "max_posts": remaining})
             try:
                 result = await self._fetch_source_page(page_request)
@@ -128,6 +137,11 @@ class CreatorImageService:
                 if identity is None:
                     raise
                 warnings.append(f"creator pagination stopped after {pages_fetched} pages: {exc}")
+                report_progress(
+                    "retrieving", f"后续分页读取失败，已保留前 {pages_fetched} 页结果。",
+                    level="warning", pages_fetched=pages_fetched, posts_fetched=posts_fetched,
+                    stop_reason="pagination_error", warning=str(exc),
+                )
                 break
             if identity is None:
                 identity = result.identity
@@ -149,12 +163,38 @@ class CreatorImageService:
             remaining = max(0, request.max_posts - posts_fetched)
             next_cursor = result.next_cursor
 
-            if self._candidate_targets_met(list(items.values()), request) or not next_cursor or remaining <= 0:
+            report_progress(
+                "retrieving",
+                f"已读取 {pages_fetched} 页，检查 {posts_fetched} 个作品。",
+                pages_fetched=pages_fetched,
+                posts_fetched=posts_fetched,
+                images_found=sum(item.media_type == "image" for item in items.values()),
+                videos_found=sum(item.media_type == "video" for item in items.values()),
+            )
+
+            targets_met = self._candidate_targets_met(list(items.values()), request)
+            if targets_met or not next_cursor or remaining <= 0:
                 cursor = next_cursor
+                if targets_met:
+                    message, reason = "已找到足够的候选内容，停止继续翻页。", "target_reached"
+                elif remaining <= 0:
+                    message, reason = "已达到最多检索作品数，分页结束。", "post_limit_reached"
+                else:
+                    message, reason = "平台未返回下一页游标，分页结束。", "source_exhausted"
+                report_progress(
+                    "retrieving", message, pages_fetched=pages_fetched,
+                    posts_fetched=posts_fetched, stop_reason=reason,
+                )
                 break
             if next_cursor == cursor or next_cursor in visited or progress <= 0:
                 warnings.append("creator pagination stopped because the source cursor made no progress")
                 cursor = next_cursor
+                report_progress(
+                    "retrieving", "下一页游标没有变化，为避免重复采集已停止翻页。",
+                    level="warning", pages_fetched=pages_fetched,
+                    posts_fetched=posts_fetched, stop_reason="cursor_stalled",
+                    warning="source cursor made no progress",
+                )
                 break
             visited.add(next_cursor)
             cursor = next_cursor
@@ -174,6 +214,7 @@ class CreatorImageService:
 
     async def fetch(self, request: CreatorFetchRequest) -> dict:
         started = time.monotonic()
+        report_progress("resolving", "正在确认账号和采集入口。")
         try:
             lock = self._locks.setdefault(self._request_key(request), asyncio.Lock())
             video_target = (request.max_videos if request.max_videos is not None else request.max_images) if request.media_type != "images" else 0
@@ -188,8 +229,10 @@ class CreatorImageService:
             async with lock:
                 result = await asyncio.wait_for(self._fetch(request), timeout=task_timeout)
         except asyncio.TimeoutError:
+            report_progress("failed", "账号采集超时，已保留可续传状态。", level="error")
             result = {"items": [], "downloads": [], "error": {"code": "creator_timeout", "message": "Account retrieval reached its deadline. Retry with resume=true; completed files and pending items were retained."}}
         except (ValueError, SourceError, BilibiliError, WeiboError) as exc:
+            report_progress("failed", f"账号采集失败：{exc}", level="error")
             result = {"items": [], "downloads": [], "error": {"code": "creator_source_error", "message": str(exc)}}
         result.update({"platform": request.platform.value,
                        "media_type": request.media_type,
@@ -285,6 +328,11 @@ class CreatorImageService:
             if state["identity"] and state["identity"]["canonical_id"] != identity.canonical_id:
                 raise SourceError("creator identity changed since the saved checkpoint; inspect the account before restarting")
             state["identity"] = identity.model_dump(mode="json")
+            report_progress(
+                "retrieving", f"已确认账号：{identity.name or identity.canonical_id}。",
+                pages_fetched=source_result.pages_fetched,
+                posts_fetched=source_result.posts_fetched,
+            )
             state["posts_fetched"] += source_result.posts_fetched
             state["pages_fetched"] += source_result.pages_fetched
             known_post_ids = set(state["post_ids"])
@@ -325,6 +373,7 @@ class CreatorImageService:
                 valid.sort(key=lambda item: timestamp(item.published_at) or 0, reverse=True)
 
             if request.content_query:
+                report_progress("filtering", f"正在筛选 {len(valid)} 个候选媒体。")
                 valid, filter_meta = await self._filter_content(valid, request)
                 state.update(filter_meta)
             state.update({"seen": list(seen), "catalog": catalog, "pending": [item.model_dump(mode="json") for item in valid],
@@ -333,6 +382,8 @@ class CreatorImageService:
             state["refresh_count"] = int(state.get("refresh_count") or 0) + 1
             state["warnings"].extend(warnings)
             self.store.save(key, state)
+        elif state["pending"]:
+            report_progress("retrieving", f"正在继续处理上次尚未完成的 {len(state['pending'])} 个候选媒体。")
         pending = [ImageCandidate.model_validate(item) for item in state["pending"]]
         selected = self._select_with_quotas(pending, request)
         records = []
@@ -354,6 +405,12 @@ class CreatorImageService:
                 )
                 if not batch:
                     break
+                report_progress(
+                    "downloading", f"正在下载第 {len(attempted) + 1}-{len(attempted) + len(batch)} 个候选文件。",
+                    download_completed=len(records), download_total=attempt_budget,
+                    images_found=sum(item.media_type == "image" for item in pending),
+                    videos_found=sum(item.media_type == "video" for item in pending),
+                )
                 selected.extend(batch)
                 attempted.update(item.id for item in batch)
                 batch_records = await self.downloader.download_many(
@@ -380,6 +437,14 @@ class CreatorImageService:
                 state["completed"] = sorted(completed)
                 state["pending"] = [item for item in state["pending"] if item["id"] not in terminal]
                 self.store.save(key, state)
+                status_counts = {name: 0 for name in ("downloaded", "existing", "duplicate", "rejected", "failed")}
+                for record in records:
+                    status_counts[record.status if record.status in status_counts else "failed"] += 1
+                report_progress(
+                    "downloading", f"已处理 {len(records)} 个下载候选。",
+                    download_completed=len(records), download_total=attempt_budget,
+                    **status_counts,
+                )
                 # A whole batch of transport failures usually means the
                 # platform/CDN is unavailable; avoid multiplying the failure.
                 if not batch_successes and all(record.status == "failed" for record in batch_records):
@@ -403,6 +468,28 @@ class CreatorImageService:
         display_items = selected or [ImageCandidate.model_validate(item) for item in state.get("pending", [])]
         works = self._group_works(display_items, set(state.get("completed") or []), pending_keys)
         new_work_ids = sorted({item.post_id or item.id for item in selected})
+        current_posts_fetched = source_result.posts_fetched if source_result is not None else 0
+        current_pages_fetched = source_result.pages_fetched if source_result is not None else 0
+        current_stop_reason = None
+        if source_result is not None:
+            warning_text = " ".join(source_result.warnings).lower()
+            if "cursor made no progress" in warning_text:
+                current_stop_reason = "cursor_stalled"
+            elif "pagination stopped" in warning_text:
+                current_stop_reason = "pagination_error"
+            elif current_posts_fetched >= request.max_posts:
+                current_stop_reason = "post_limit_reached"
+            elif source_result.next_cursor is None:
+                current_stop_reason = "source_exhausted"
+            else:
+                current_stop_reason = "target_reached"
+        report_progress(
+            "finalizing", "采集和下载已完成，正在生成本次报告。",
+            pages_fetched=current_pages_fetched,
+            posts_fetched=current_posts_fetched,
+            images_found=sum(item.media_type == "image" for item in selected),
+            videos_found=sum(item.media_type == "video" for item in selected),
+        )
         return {"identity": state["identity"], "items": selected_payload, "works": works,
                 "work_types": self._work_type_counts(works),
                 "new_work_ids": new_work_ids,
@@ -412,8 +499,11 @@ class CreatorImageService:
                 "last_refresh_at": state.get("last_refresh_at"),
                 "refresh_count": int(state.get("refresh_count") or 0),
                 "posts_fetched": state["posts_fetched"],
+                "current_posts_fetched": current_posts_fetched,
                 "post_ids": list(state["post_ids"]),
                 "pages_fetched": state["pages_fetched"],
+                "current_pages_fetched": current_pages_fetched,
+                "current_pagination_stop_reason": current_stop_reason,
                 "rejected_posts": state["rejected_posts"],
                 "warnings": list(state["warnings"]), "status": "partial" if partial else "ok", "error": error,
                 "sort_scope": "fetched_posts", "checkpoint": key,

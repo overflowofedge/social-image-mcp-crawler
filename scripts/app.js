@@ -44,6 +44,7 @@ function renderLogEntries(entries) {
 }
 
 function renderTaskReport(report, fallbackData = {}) {
+  status.classList.remove("task-active");
   if (report && Array.isArray(report.logs)) {
     renderLogEntries(report.logs);
     return;
@@ -55,6 +56,65 @@ function renderTaskReport(report, fallbackData = {}) {
     message: message ? `任务失败：${message}` : "任务失败，服务器没有返回详细原因。",
     action: "检查账号或网址、平台登录状态和网络连接后重试。"
   }]);
+}
+
+const stageLabels = {
+  queued: "等待启动", preparing: "准备任务", resolving: "确认账号",
+  retrieving: "检索并翻页", filtering: "筛选内容", downloading: "下载文件",
+  finalizing: "整理结果", completed: "已完成", failed: "失败"
+};
+
+const stopReasonLabels = {
+  target_reached: "候选内容已达到目标，已停止翻页。",
+  post_limit_reached: "已达到最多检索作品数，分页结束。",
+  source_exhausted: "平台未返回下一页游标，已翻到当前可读取的末页。",
+  cursor_stalled: "下一页游标重复，为避免循环已停止翻页。",
+  pagination_error: "后续分页读取失败，已保留已经取得的内容。"
+};
+
+function renderTaskProgress(task) {
+  status.classList.add("task-active");
+  const elapsed = Number(task.elapsed_seconds || 0).toFixed(1);
+  const entries = [{
+    level: task.state === "failed" ? "error" : "info",
+    message: `${stageLabels[task.stage] || "处理中"} · 已运行 ${elapsed} 秒 · ${task.message || "后台任务正在运行。"}`
+  }];
+  entries.push({
+    level: "info",
+    message: `本次进度：已读取 ${task.pages_fetched || 0} 页，检查 ${task.posts_fetched || 0} 个作品，找到 ${task.images_found || 0} 张图片、${task.videos_found || 0} 个视频。`
+  });
+  if (task.stop_reason && stopReasonLabels[task.stop_reason]) {
+    entries.push({
+      level: ["cursor_stalled", "pagination_error"].includes(task.stop_reason) ? "warning" : "info",
+      message: stopReasonLabels[task.stop_reason]
+    });
+  }
+  if (task.stage === "downloading" || task.download_total || task.download_completed) {
+    entries.push({
+      level: "info",
+      message: `下载进度：已处理 ${task.download_completed || 0} 个候选（候选池最多 ${task.download_total || 0} 个），新下载 ${task.downloaded || 0}，已存在 ${task.existing || 0}，重复 ${task.duplicate || 0}，失败 ${task.failed || 0}。`
+    });
+  }
+  const activity = Array.isArray(task.activity) ? task.activity.slice(-7) : [];
+  activity.forEach(entry => entries.push({
+    level: entry.level || "info",
+    message: `[${Number(entry.elapsed_seconds || 0).toFixed(1)} 秒] ${entry.message}`
+  }));
+  renderLogEntries(entries);
+  status.classList.add("task-active");
+}
+
+const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+
+async function waitForTask(taskId) {
+  while (true) {
+    await wait(850);
+    const response = await fetch(`/api/tasks/${encodeURIComponent(taskId)}`, {cache: "no-store"});
+    if (!response.ok) throw new Error(`无法读取任务进度（HTTP ${response.status}）`);
+    const task = await response.json();
+    renderTaskProgress(task);
+    if (task.state === "completed" || task.state === "failed") return task.result || {};
+  }
 }
 
 function updateDownloadSummary() {
@@ -112,6 +172,37 @@ function renderWorks(works) {
   });
 }
 
+function renderItems(items) {
+  itemsBox.innerHTML = "";
+  (items || []).forEach(item => {
+    const card = document.createElement("div");
+    card.className = "item";
+    if (item.media_type === "image") {
+      const image = document.createElement("img");
+      const previewQuery = new URLSearchParams({url: item.image_url});
+      if (item.permalink) previewQuery.set("referer", item.permalink);
+      image.src = `/api/image?${previewQuery.toString()}`;
+      image.loading = "lazy";
+      image.alt = item.title || item.author || "图片预览";
+      card.appendChild(image);
+    } else {
+      const video = document.createElement("p");
+      video.textContent = "视频文件";
+      card.appendChild(video);
+    }
+    const text = document.createElement("p");
+    text.textContent = item.title || item.author || item.platform || "";
+    const link = document.createElement("a");
+    link.href = item.permalink || item.image_url;
+    link.target = "_blank";
+    link.textContent = "打开原帖";
+    text.appendChild(document.createElement("br"));
+    text.appendChild(link);
+    card.appendChild(text);
+    itemsBox.appendChild(card);
+  });
+}
+
 mediaType.addEventListener("change", syncMediaLimits);
 [imageLimit, videoLimit, perPostLimit, maxPosts].forEach(input => input.addEventListener("input", updateDownloadSummary));
 syncMediaLimits();
@@ -120,6 +211,8 @@ form.addEventListener("submit", async event => {
   event.preventDefault();
   if (!form.reportValidity()) return;
   button.disabled = true;
+  const originalButtonText = button.textContent;
+  button.textContent = "正在采集…";
   itemsBox.innerHTML = "";
   renderWorks([]);
   const platform = document.querySelector('input[name="platform"]:checked').value;
@@ -160,35 +253,17 @@ form.addEventListener("submit", async event => {
     } catch (_error) {
       throw new Error(`服务器返回内容无法读取（HTTP ${response.status}）`);
     }
+    if (!response.ok) {
+      const rawError = data && data.error;
+      throw new Error((rawError && rawError.message) || rawError || `请求失败（HTTP ${response.status}）`);
+    }
+    if (response.status === 202 && data.task_id) {
+      renderTaskProgress(data);
+      data = await waitForTask(data.task_id);
+    }
     renderTaskReport(data.task_report, data);
     renderWorks(data.works);
-    (data.items || []).forEach(item => {
-      const card = document.createElement("div");
-      card.className = "item";
-      if (item.media_type === "image") {
-        const image = document.createElement("img");
-        const previewQuery = new URLSearchParams({url: item.image_url});
-        if (item.permalink) previewQuery.set("referer", item.permalink);
-        image.src = `/api/image?${previewQuery.toString()}`;
-        image.loading = "lazy";
-        image.alt = item.title || item.author || "图片预览";
-        card.appendChild(image);
-      } else {
-        const video = document.createElement("p");
-        video.textContent = "视频文件";
-        card.appendChild(video);
-      }
-      const text = document.createElement("p");
-      text.textContent = item.title || item.author || item.platform || "";
-      const link = document.createElement("a");
-      link.href = item.permalink || item.image_url;
-      link.target = "_blank";
-      link.textContent = "打开原帖";
-      text.appendChild(document.createElement("br"));
-      text.appendChild(link);
-      card.appendChild(text);
-      itemsBox.appendChild(card);
-    });
+    renderItems(data.items);
   } catch (error) {
     renderLogEntries([{
       level: "error",
@@ -197,5 +272,6 @@ form.addEventListener("submit", async event => {
     }]);
   } finally {
     button.disabled = false;
+    button.textContent = originalButtonText;
   }
 });

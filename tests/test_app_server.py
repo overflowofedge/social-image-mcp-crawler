@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 import threading
+import time
 from urllib.request import Request, urlopen
 
 import pytest
@@ -167,6 +168,24 @@ def test_task_report_explains_incremental_run_with_no_new_files():
     assert any("等待账号发布新作品" in issue["action"] for issue in report["issues"])
 
 
+def test_task_report_uses_current_run_counts_and_explains_pagination_end():
+    report = _task_report(
+        {
+            "platforms": ["douyin"], "media_type": "images", "image_limit": 5,
+            "max_posts": 20, "download": False,
+        },
+        {
+            "items": [], "posts_fetched": 90, "pages_fetched": 9,
+            "current_posts_fetched": 12, "current_pages_fetched": 2,
+            "current_pagination_stop_reason": "source_exhausted",
+        },
+        0.2,
+    )
+
+    assert any("本次检索：读取 2 页，检查 12 个作品" in log["message"] for log in report["logs"])
+    assert any("平台未返回下一页游标" in log["message"] for log in report["logs"])
+
+
 def test_large_task_report_explains_cli_rate_limit_risk():
     report = _task_report(
         {
@@ -191,15 +210,37 @@ def test_large_video_job_gets_a_dynamic_desktop_timeout():
     assert timeout <= 7200
 
 
-def test_search_http_response_always_contains_user_facing_report():
+def _read_task(server, task_id):
+    with urlopen(f"http://127.0.0.1:{server.server_port}/api/tasks/{task_id}", timeout=3) as response:
+        return json.loads(response.read())
+
+
+def _wait_for_terminal_task(server, task_id):
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        task = _read_task(server, task_id)
+        if task["state"] in {"completed", "failed"}:
+            return task
+        time.sleep(0.01)
+    raise AssertionError("desktop task did not finish")
+
+
+def test_search_http_returns_task_immediately_and_exposes_running_progress():
     class StubRunner:
-        @staticmethod
-        def call(awaitable, timeout=None):
+        started = threading.Event()
+        release = threading.Event()
+
+        @classmethod
+        def call(cls, awaitable, timeout=None):
             awaitable.close()
+            cls.started.set()
+            assert cls.release.wait(timeout=2)
             return {"items": [], "downloads": []}
 
     previous_runner = getattr(_MODULE.Handler, "runner", None)
+    previous_tasks = _MODULE.Handler.tasks
     _MODULE.Handler.runner = StubRunner()
+    _MODULE.Handler.tasks = _MODULE.TaskRegistry()
     try:
         with running_server(_MODULE.Handler) as server:
             request = Request(
@@ -213,13 +254,57 @@ def test_search_http_response_always_contains_user_facing_report():
                 method="POST",
             )
             with urlopen(request, timeout=3) as response:
+                assert response.status == 202
                 payload = json.loads(response.read())
+            assert payload["task_id"]
+            assert StubRunner.started.wait(timeout=1)
+            running = _read_task(server, payload["task_id"])
+            assert running["state"] == "running"
+            assert running["stage"] == "preparing"
+            StubRunner.release.set()
+            task = _wait_for_terminal_task(server, payload["task_id"])
     finally:
+        StubRunner.release.set()
+        _MODULE.Handler.tasks = previous_tasks
         if previous_runner is None:
             delattr(_MODULE.Handler, "runner")
         else:
             _MODULE.Handler.runner = previous_runner
 
-    assert payload["task_report"]["status"] == "partial"
-    assert payload["task_report"]["requested"]["images"] == 3
-    assert any("实际可用数量比目标少 3 张图片" in log["message"] for log in payload["task_report"]["logs"])
+    assert task["state"] == "completed"
+    assert task["result"]["task_report"]["status"] == "partial"
+    assert task["result"]["task_report"]["requested"]["images"] == 3
+    assert any("实际可用数量比目标少 3 张图片" in log["message"] for log in task["result"]["task_report"]["logs"])
+
+
+def test_search_task_failure_is_visible_through_progress_endpoint():
+    class FailingRunner:
+        @staticmethod
+        def call(awaitable, timeout=None):
+            awaitable.close()
+            raise RuntimeError("source unavailable")
+
+    previous_runner = getattr(_MODULE.Handler, "runner", None)
+    previous_tasks = _MODULE.Handler.tasks
+    _MODULE.Handler.runner = FailingRunner()
+    _MODULE.Handler.tasks = _MODULE.TaskRegistry()
+    try:
+        with running_server(_MODULE.Handler) as server:
+            request = Request(
+                f"http://127.0.0.1:{server.server_port}/api/search",
+                data=json.dumps({"query": "测试账号", "platforms": ["douyin"]}).encode("utf-8"),
+                headers={"Content-Type": "application/json"}, method="POST",
+            )
+            with urlopen(request, timeout=3) as response:
+                payload = json.loads(response.read())
+            task = _wait_for_terminal_task(server, payload["task_id"])
+    finally:
+        _MODULE.Handler.tasks = previous_tasks
+        if previous_runner is None:
+            delattr(_MODULE.Handler, "runner")
+        else:
+            _MODULE.Handler.runner = previous_runner
+
+    assert task["state"] == "failed"
+    assert task["result"]["error"]["message"] == "source unavailable"
+    assert task["activity"][-1]["level"] == "error"

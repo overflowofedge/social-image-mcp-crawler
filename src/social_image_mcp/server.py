@@ -10,6 +10,7 @@ from mcp.server.fastmcp import FastMCP
 
 from .models import CreatorFetchRequest, DownloadRequest, Platform, SearchRequest
 from .intent import parse_intent, requested_media_limit
+from .progress import report_progress
 from .service import SocialImageService
 
 service = SocialImageService()
@@ -43,6 +44,7 @@ def _configure_stdio() -> None:
 
 @mcp.tool(description="Search social platforms by a keyword, content ID, or post URL. Set media_type=images (default), videos, or all to choose downloadable media. Paste a full non-social http(s) webpage URL and select platform=other to retrieve content images and direct video files from that homepage and its same-site content pages; max_posts bounds detail pages. Icons and logos are filtered. For an X creator, use @username, from:username, or x-user:username so the request uses the user's media timeline; do not use a plain X keyword search for a creator timeline. Douyin queries such as douyin-user:<handle> or douyin-name:<nickname> route to exact account retrieval; media_type=videos can return original video files for creator queries.")
 async def search_images(query: str, platforms: list[str] | None = None, max_results: int = 20, min_width: int = 0, min_height: int = 0, safe_mode: bool = True, use_cache: bool = True, download: bool = False, output_dir: str | None = None, retrieval_mode: str = "sources", content_query: str | None = None, filter_mode: str = "off", quality_mode: str = "fast", media_type: str = "images", creator_name: str | None = None, creator_id: str | None = None, image_limit: int | None = None, video_limit: int | None = None, per_post_limit: int | None = None, max_posts: int = 20) -> dict[str, Any]:
+    report_progress("preparing", "正在识别输入内容和目标平台。")
     intent = parse_intent(query)
     max_results = requested_media_limit(query, max_results)
     if creator_name or creator_id:
@@ -72,12 +74,32 @@ async def search_images(query: str, platforms: list[str] | None = None, max_resu
         ))
     selected = [Platform(value) for value in platforms] if platforms else None
     request = SearchRequest(query=query, platforms=selected, max_results=max_results, min_width=min_width, min_height=min_height, safe_mode=safe_mode, use_cache=use_cache, retrieval_mode=retrieval_mode, media_type=media_type, image_limit=image_limit, video_limit=video_limit, per_post_limit=per_post_limit, max_posts=max_posts)
+    report_progress("retrieving", "正在检索平台内容；若来源支持分页，程序会自动继续读取后续页面。")
     result = await service.search(request)
+    items = result.get("items") or []
+    report_progress(
+        "retrieving",
+        f"检索已返回 {len(items)} 个候选媒体。",
+        images_found=sum(1 for item in items if item.get("media_type") != "video"),
+        videos_found=sum(1 for item in items if item.get("media_type") == "video"),
+        pages_fetched=int(result.get("pages_fetched") or 0),
+        posts_fetched=int(result.get("posts_fetched") or 0),
+    )
     if download and result["items"]:
         download_request = DownloadRequest(items=result["items"], output_dir=output_dir, min_width=min_width, min_height=min_height)
+        report_progress("downloading", f"正在下载 {len(download_request.items)} 个媒体文件。", download_total=len(download_request.items))
         records = await service.download(download_request.items, download_request.output_dir, download_request.max_concurrency, download_request.min_width, download_request.min_height)
         result["downloads"] = [record.model_dump(mode="json") for record in records]
         result["output_dir"] = str(service.settings.ensure_output_dir(output_dir).resolve())
+        counts = {name: 0 for name in ("downloaded", "existing", "duplicate", "rejected", "failed")}
+        for record in records:
+            counts[record.status if record.status in counts else "failed"] += 1
+        report_progress(
+            "finalizing", "下载已完成，正在整理结果。",
+            download_completed=len(records), download_total=len(download_request.items), **counts,
+        )
+    else:
+        report_progress("finalizing", "检索已完成，正在整理结果。")
     return result
 
 
