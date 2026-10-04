@@ -89,9 +89,10 @@ def _record_key(record: DownloadRecord) -> tuple[str, str, str, int, str]:
 
 
 def _media_dir(output_dir: Path, item: ImageCandidate) -> Path:
-    # A platform and media-type namespace prevents one source from affecting
-    # another when both are pointed at the same output directory.
-    path = output_dir / _safe_name(item.platform.value) / ("videos" if item.media_type == "video" else "images")
+    # Creator jobs already use a platform-scoped output directory. Keeping the
+    # media folder directly below it avoids paths such as
+    # creators/douyin/name/douyin/images.
+    path = output_dir / ("videos" if item.media_type == "video" else "images")
     path.mkdir(parents=True, exist_ok=True)
     return path
 

@@ -1,5 +1,6 @@
 import asyncio
 import io
+from pathlib import Path
 import re
 
 import httpx
@@ -155,7 +156,7 @@ def test_downloader_resume_reuses_verified_existing_file(tmp_path):
     asyncio.run(run())
 
 
-def test_downloader_names_work_with_timestamp_id_title_and_platform_namespace(tmp_path):
+def test_downloader_names_work_with_timestamp_id_title_and_media_namespace(tmp_path):
     buffer = io.BytesIO()
     Image.new("RGB", (40, 30), "green").save(buffer, format="JPEG")
 
@@ -171,8 +172,8 @@ def test_downloader_names_work_with_timestamp_id_title_and_platform_namespace(tm
             return (await ImageDownloader(client).download_many([item], tmp_path))[0]
 
     record = asyncio.run(run())
-    path = __import__("pathlib").Path(record.path)
-    assert path.parent == tmp_path / "douyin" / "images"
+    path = Path(record.path)
+    assert path.parent == tmp_path / "images"
     assert re.match(r"^20261003_043456_work-1_春日穿搭_原图\.jpg$", path.name)
 
 
