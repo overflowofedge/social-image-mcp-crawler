@@ -95,7 +95,7 @@ async def _run(args: argparse.Namespace) -> None:
             # ``/nav`` is an account endpoint and returns -101 for a perfectly
             # usable anonymous session. Probe the public video search route so
             # startup diagnostics reflect the actual CLI retrieval path.
-            payload = await api._get_wbi(
+            await api._get_wbi(
                 "/x/web-interface/search/type",
                 {
                     "search_type": "video", "keyword": "测试", "page": 1,

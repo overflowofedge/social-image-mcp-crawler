@@ -89,7 +89,9 @@ class CreatorImageService:
         target = creator_target(request.platform.value, request.profile_url or request.creator_id) if not request.creator_name else request.creator_name.strip()
         safe_target = re.sub(r"[^A-Za-z0-9_.\-\u4e00-\u9fff]+", "_", target).strip("._")[:120] or "creator"
         scope = request.model_dump(mode="json", exclude={"max_posts", "max_images", "creator_id", "profile_url", "output_dir", "download", "resume", "max_concurrency"})
-        output = self.settings.ensure_output_dir(request.output_dir or str(Path(self.settings.output_dir) / "creators" / request.platform.value / safe_target)).resolve()
+        # Keep creator downloads in a short, account-specific layout:
+        # downloads/<platform>/<account>/<images|videos>.
+        output = self.settings.ensure_output_dir(request.output_dir or str(Path(self.settings.output_dir) / request.platform.value / safe_target)).resolve()
         key = hashlib.sha256(json.dumps([target, str(output), scope], sort_keys=True).encode()).hexdigest()
         state = self.store.get(key) if request.resume else None
         if state is None:
