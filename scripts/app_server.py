@@ -9,6 +9,7 @@ import socket
 import sys
 import threading
 import time
+import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -20,11 +21,124 @@ if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
 from social_image_mcp.intent import parse_intent
+from social_image_mcp.progress import progress_context
 from social_image_mcp.server import search_images, service
 
 HTML = (ROOT / "scripts" / "app.html").read_text(encoding="utf-8")
 APP_ID = "social-image-mcp-desktop"
 PREFLIGHT_REPORT = ROOT / ".cache" / "preflight-latest.json"
+
+
+class TaskRegistry:
+    """Thread-safe, bounded storage for desktop task progress."""
+
+    _COUNTERS = {
+        "pages_fetched", "posts_fetched", "images_found", "videos_found",
+        "download_completed", "download_total", "downloaded", "existing",
+        "duplicate", "rejected", "failed",
+    }
+
+    def __init__(self, limit: int = 100) -> None:
+        self.limit = limit
+        self._lock = threading.Lock()
+        self._tasks: dict[str, dict] = {}
+
+    def _snapshot(self, task: dict) -> dict:
+        now = task.get("_finished_monotonic") or time.monotonic()
+        started = task.get("_started_monotonic") or task["_created_monotonic"]
+        public = {key: value for key, value in task.items() if not key.startswith("_")}
+        public["elapsed_seconds"] = round(max(0.0, now - started), 1)
+        public["activity"] = [dict(entry) for entry in task.get("activity", [])]
+        return public
+
+    def create(self) -> dict:
+        task_id = uuid.uuid4().hex
+        now = time.monotonic()
+        task = {
+            "task_id": task_id, "state": "queued", "stage": "queued",
+            "message": "任务已排队，正在启动后台采集。", "activity": [],
+            "warnings": [], "stop_reason": None, "result": None,
+            "_created_monotonic": now, "_started_monotonic": None,
+            "_finished_monotonic": None,
+            **{name: 0 for name in self._COUNTERS},
+        }
+        with self._lock:
+            if len(self._tasks) >= self.limit:
+                finished = sorted(
+                    (value for value in self._tasks.values() if value["state"] in {"completed", "failed"}),
+                    key=lambda value: value["_created_monotonic"],
+                )
+                for old in finished[: max(1, len(self._tasks) - self.limit + 1)]:
+                    self._tasks.pop(old["task_id"], None)
+            self._tasks[task_id] = task
+            self._append_activity(task, task["message"], "info")
+            return self._snapshot(task)
+
+    @staticmethod
+    def _append_activity(task: dict, message: str, level: str) -> None:
+        if not message:
+            return
+        elapsed = 0.0
+        if task.get("_started_monotonic"):
+            elapsed = time.monotonic() - task["_started_monotonic"]
+        last = task["activity"][-1] if task["activity"] else None
+        if last and last.get("message") == message:
+            return
+        task["activity"].append({
+            "level": level if level in {"info", "success", "warning", "error"} else "info",
+            "message": message,
+            "elapsed_seconds": round(max(0.0, elapsed), 1),
+        })
+        del task["activity"][:-40]
+
+    def start(self, task_id: str) -> None:
+        with self._lock:
+            task = self._tasks[task_id]
+            task["state"] = "running"
+            task["stage"] = "preparing"
+            task["message"] = "后台任务已启动，正在准备采集。"
+            task["_started_monotonic"] = time.monotonic()
+            self._append_activity(task, task["message"], "info")
+
+    def update(self, task_id: str, event: dict) -> None:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None or task["state"] in {"completed", "failed"}:
+                return
+            if event.get("stage"):
+                task["stage"] = str(event["stage"])
+            if event.get("message"):
+                task["message"] = str(event["message"])
+            for name in self._COUNTERS:
+                if name in event and event[name] is not None:
+                    try:
+                        task[name] = max(0, int(event[name]))
+                    except (TypeError, ValueError):
+                        pass
+            if event.get("stop_reason"):
+                task["stop_reason"] = str(event["stop_reason"])
+            warning = event.get("warning")
+            if warning and str(warning) not in task["warnings"]:
+                task["warnings"].append(str(warning))
+            self._append_activity(task, task["message"], str(event.get("level") or "info"))
+
+    def finish(self, task_id: str, result: dict, failed: bool = False) -> None:
+        with self._lock:
+            task = self._tasks[task_id]
+            task["state"] = "failed" if failed else "completed"
+            task["stage"] = task["state"]
+            task["result"] = result
+            task["message"] = "任务失败，详细原因见完成报告。" if failed else "任务已完成。"
+            task["_finished_monotonic"] = time.monotonic()
+            self._append_activity(task, task["message"], "error" if failed else "success")
+
+    def get(self, task_id: str) -> dict | None:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            return self._snapshot(task) if task else None
+
+
+TASKS = TaskRegistry()
 
 
 class LocalHTTPServer(ThreadingHTTPServer):
@@ -232,12 +346,25 @@ def _task_report(body: dict, result: dict, elapsed_seconds: float) -> dict:
     if requested["videos"]:
         actual_parts.append(f"找到 {found['videos']} 个视频")
     logs.append({"level": "info", "message": f"采集结果：{'，'.join(actual_parts) or '没有找到媒体'}。"})
-    pages_fetched = int(result.get("pages_fetched") or 0)
-    posts_fetched = int(result.get("posts_fetched") or 0)
+    pages_fetched = int(result.get("current_pages_fetched", result.get("pages_fetched")) or 0)
+    posts_fetched = int(result.get("current_posts_fetched", result.get("posts_fetched")) or 0)
     if pages_fetched or posts_fetched:
         logs.append({
             "level": "info",
-            "message": f"检索范围：读取 {pages_fetched} 页，检查 {posts_fetched} 个作品。",
+            "message": f"本次检索：读取 {pages_fetched} 页，检查 {posts_fetched} 个作品。",
+        })
+    stop_messages = {
+        "target_reached": "候选内容已达到目标，程序主动停止翻页。",
+        "post_limit_reached": "已达到本次最多检索作品数，分页结束。",
+        "source_exhausted": "平台未返回下一页游标，已自动翻到当前可读取的末页。",
+        "cursor_stalled": "平台重复返回同一页游标，为避免死循环已停止翻页。",
+        "pagination_error": "后续分页读取失败，已保留中断前取得的内容。",
+    }
+    stop_reason = result.get("current_pagination_stop_reason")
+    if stop_reason in stop_messages:
+        logs.append({
+            "level": "warning" if stop_reason in {"cursor_stalled", "pagination_error"} else "info",
+            "message": stop_messages[stop_reason],
         })
 
     new_total = sum(status_counts["downloaded"].values())
@@ -304,7 +431,7 @@ def _task_report(body: dict, result: dict, elapsed_seconds: float) -> dict:
         if requested["max_posts"] and posts_fetched >= requested["max_posts"]:
             action = "已检查完本次设置的作品范围；可增加“最多检索作品数”，或更新平台登录状态后重试。"
         else:
-            action = "程序已自动翻页补齐；若仍不足，请更新平台登录状态后重试。"
+            action = "程序已自动读取平台返回的后续页面；若仍不足，请更新平台登录状态后重试。"
         if media == "images" and requested["per_post_limit"] and requested["max_posts"]:
             capacity = requested["per_post_limit"] * requested["max_posts"]
             if requested["images"] > capacity:
@@ -389,8 +516,92 @@ class _Loop:
             self.thread.join(timeout=5)
 
 
+async def _search_with_progress(search_kwargs: dict, creator_name: str | None, creator_id: str | None, callback):
+    with progress_context(callback):
+        return await search_images(**search_kwargs, creator_name=creator_name, creator_id=creator_id)
+
+
+def _execute_search(body: dict, runner: _Loop, callback) -> dict:
+    query = str(body["query"])
+    platforms = body.get("platforms") or None
+    detected = parse_intent(query).identifier_platform
+    # A pasted platform URL is authoritative. This prevents a selected radio
+    # button from routing a URL to the wrong adapter.
+    if detected and platforms and detected not in platforms:
+        platforms = None
+    selected_platform = platforms[0] if platforms and len(platforms) == 1 else None
+    auto_creator, auto_creator_id = _creator_hint(query, selected_platform, detected)
+
+    def optional_int(name):
+        value = body.get(name)
+        return int(value) if value not in (None, "", 0, "0") else None
+
+    search_kwargs = dict(
+        query=query, platforms=platforms,
+        max_results=int(body.get("max_results", 20)),
+        media_type=str(body.get("media_type", "images")),
+        image_limit=optional_int("image_limit"), video_limit=optional_int("video_limit"),
+        per_post_limit=optional_int("per_post_limit"), max_posts=int(body.get("max_posts", 20)),
+        download=bool(body.get("download", True)), content_query=body.get("content_query") or None,
+        filter_mode=str(body.get("filter_mode", "off")), quality_mode=str(body.get("quality_mode", "fast")),
+        retrieval_mode="sources", use_cache=False,
+    )
+    request_timeout = _request_timeout(body)
+    result = runner.call(
+        _search_with_progress(search_kwargs, auto_creator, auto_creator_id, callback),
+        timeout=request_timeout,
+    )
+    error = result.get("error") if isinstance(result, dict) else None
+    if (auto_creator or auto_creator_id) and isinstance(error, dict):
+        message = str(error.get("message", "")).lower()
+        if any(marker in message for marker in (
+            "matched 0", "not found", "invalid creator",
+            "creator_identity_unresolved", "identity_unresolved",
+        )):
+            callback({
+                "stage": "retrieving", "level": "warning",
+                "message": "未确认到唯一账号，正在改用关键词检索。",
+            })
+            result = runner.call(
+                _search_with_progress(search_kwargs, None, None, callback),
+                timeout=request_timeout,
+            )
+    if not isinstance(result, dict):
+        raise ValueError("采集服务返回了无法识别的结果")
+    return result
+
+
+def _run_search_task(task_id: str, body: dict, runner: _Loop, tasks: TaskRegistry) -> None:
+    started = time.monotonic()
+    tasks.start(task_id)
+    callback = lambda event: tasks.update(task_id, event)
+    try:
+        result = _execute_search(body, runner, callback)
+        report = _task_report(body, result, time.monotonic() - started)
+        result["task_report"] = report
+        tasks.update(task_id, {
+            "pages_fetched": result.get("current_pages_fetched", result.get("pages_fetched", 0)),
+            "posts_fetched": result.get("current_posts_fetched", result.get("posts_fetched", 0)),
+            "images_found": report["found"]["images"],
+            "videos_found": report["found"]["videos"],
+            **{
+                name: sum(report["downloads"][name].values())
+                for name in ("downloaded", "existing", "duplicate", "rejected", "failed")
+            },
+        })
+        tasks.finish(task_id, result, failed=report["status"] == "failed")
+    except Exception as exc:
+        error_result = {
+            "items": [], "downloads": [],
+            "error": {"code": "request_error", "message": str(exc)},
+        }
+        error_result["task_report"] = _task_report(body, error_result, time.monotonic() - started)
+        tasks.finish(task_id, error_result, failed=True)
+
+
 class Handler(BaseHTTPRequestHandler):
     runner: _Loop
+    tasks: TaskRegistry = TASKS
 
     def log_message(self, *_args) -> None:
         return
@@ -421,6 +632,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"app": APP_ID, "root": str(ROOT), "preflight": _preflight_report()})
         elif parsed.path == "/api/status":
             self._send(200, {"platforms": service.statuses(), "sources": service.source_statuses(), "preflight": _preflight_report()})
+        elif parsed.path.startswith("/api/tasks/"):
+            task_id = parsed.path.removeprefix("/api/tasks/").strip("/")
+            task = self.tasks.get(task_id)
+            self._send(200, task) if task else self._send(404, {"error": "task not found"})
         elif parsed.path == "/api/image":
             query = parse_qs(parsed.query)
             image_url = str((query.get("url") or [""])[0])
@@ -436,67 +651,21 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         if urlparse(self.path).path != "/api/search":
             self._send(404, {"error": "not found"}); return
-        started = time.monotonic()
-        body: dict = {}
         try:
             length = int(self.headers.get("Content-Length", "0"))
             body = json.loads(self.rfile.read(length).decode("utf-8"))
             if not isinstance(body, dict) or not str(body.get("query") or "").strip():
                 raise ValueError("请输入搜索提示词或链接")
-            query = str(body["query"])
-            platforms = body.get("platforms") or None
-            detected = parse_intent(query).identifier_platform
-            # A pasted platform URL is authoritative. This prevents the
-            # default Douyin checkbox from accidentally routing an X/Weibo URL
-            # to the wrong adapter.
-            if detected and platforms and detected not in platforms:
-                platforms = None
-            selected_platform = platforms[0] if platforms and len(platforms) == 1 else None
-            # The checkbox is intentionally gone: short, single-platform
-            # names are first tried as creator names. If no account is found,
-            # the same input is retried as a normal keyword search.
-            auto_creator, auto_creator_id = _creator_hint(query, selected_platform, detected)
-            def optional_int(name):
-                value = body.get(name)
-                return int(value) if value not in (None, "", 0, "0") else None
-            search_kwargs = dict(
-                query=query, platforms=platforms,
-                max_results=int(body.get("max_results", 20)),
-                media_type=str(body.get("media_type", "images")),
-                image_limit=optional_int("image_limit"), video_limit=optional_int("video_limit"),
-                per_post_limit=optional_int("per_post_limit"), max_posts=int(body.get("max_posts", 20)),
-                download=bool(body.get("download", True)), content_query=body.get("content_query") or None,
-                filter_mode=str(body.get("filter_mode", "off")), quality_mode=str(body.get("quality_mode", "fast")),
-                retrieval_mode="sources", use_cache=False,
+            task = self.tasks.create()
+            worker = threading.Thread(
+                target=_run_search_task,
+                args=(task["task_id"], body, self.runner, self.tasks),
+                daemon=True,
             )
-            request_timeout = _request_timeout(body)
-            result = self.runner.call(
-                search_images(**search_kwargs, creator_name=auto_creator, creator_id=auto_creator_id),
-                timeout=request_timeout,
-            )
-            error = result.get("error") if isinstance(result, dict) else None
-            if (auto_creator or auto_creator_id) and isinstance(error, dict):
-                message = str(error.get("message", "")).lower()
-                if any(marker in message for marker in (
-                    "matched 0", "not found", "invalid creator",
-                    "creator_identity_unresolved", "identity_unresolved",
-                )):
-                    result = self.runner.call(
-                        search_images(**search_kwargs, creator_name=None, creator_id=None),
-                        timeout=request_timeout,
-                    )
-            if not isinstance(result, dict):
-                raise ValueError("采集服务返回了无法识别的结果")
-            result["task_report"] = _task_report(body, result, time.monotonic() - started)
-            self._send(200, result)
+            worker.start()
+            self._send(202, task)
         except Exception as exc:
-            error_result = {
-                "items": [],
-                "downloads": [],
-                "error": {"code": "request_error", "message": str(exc)},
-            }
-            error_result["task_report"] = _task_report(body, error_result, time.monotonic() - started)
-            self._send(400, error_result)
+            self._send(400, {"error": {"code": "request_error", "message": str(exc)}})
 
 
 def main() -> None:

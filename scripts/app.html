@@ -20,6 +20,7 @@ input:disabled{background:#f1f5f9;color:#94a3b8;cursor:not-allowed;border-color:
 .search-scope{display:grid;grid-template-columns:minmax(200px,1fr) 2fr;align-items:center;gap:24px;margin-top:16px}
 .settings-summary{background:#eff6ff;color:#1e40af;border-radius:8px;padding:12px 14px;font-size:14px;line-height:1.6}
 .status{white-space:normal;background:#f8fafc;color:#1f2937;border:1px solid #dbe3ee;max-height:420px;padding:4px 14px}
+.status.task-active{border-color:#60a5fa;box-shadow:inset 3px 0 0 #2563eb}
 .log-line{display:grid;grid-template-columns:48px minmax(0,1fr);gap:10px;padding:11px 0;border-bottom:1px solid #e5e7eb;line-height:1.5}
 .log-line:last-child{border-bottom:0}
 .log-level{font-size:12px;font-weight:700;text-align:center;border-radius:4px;padding:2px 4px;height:max-content}
@@ -127,6 +128,7 @@ input:disabled{background:#f1f5f9;color:#94a3b8;cursor:not-allowed;border-color:
 </div>
 <div class="card">
 <h3>运行状态</h3>
+<p class="hint">任务运行时会持续显示自动翻页、作品检查和文件下载进度。</p>
 <div id="status" class="status" role="log" aria-live="polite"><div class="log-line log-info"><span class="log-level">信息</span><div>等待任务。</div></div></div>
 </div>
 <div class="card">

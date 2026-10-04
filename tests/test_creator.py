@@ -9,6 +9,7 @@ from social_image_mcp.creator_protocol import CreatorCollector, creator_target, 
 from social_image_mcp.creator_service import CreatorImageService
 from social_image_mcp.downloader import ImageDownloader
 from social_image_mcp.models import CreatorFetchRequest, CreatorIdentity, DownloadRecord, ImageCandidate, Platform
+from social_image_mcp.progress import progress_context
 from social_image_mcp.sources import CreatorSourceResult
 from social_image_mcp.weibo import WeiboApi, WeiboError
 
@@ -523,6 +524,54 @@ def test_creator_service_continues_source_cursor_until_target_is_filled(tmp_path
     assert sources.calls == [None, pack_cursor(2), pack_cursor(3)]
     assert [item["post_id"] for item in result["items"]] == ["p1", "p2", "p3"]
     assert result["pages_fetched"] == 3
+
+
+def test_creator_service_reports_each_page_and_pagination_stop_reason(tmp_path):
+    class Settings:
+        cache_path = str(tmp_path / "cache.sqlite3")
+        output_dir = str(tmp_path / "out")
+        creator_timeout_seconds = 5
+
+        def ensure_output_dir(self, value=None):
+            from pathlib import Path
+            path = Path(value or self.output_dir)
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+
+    class Sources:
+        calls = 0
+
+        async def fetch_creator(self, request):
+            self.calls += 1
+            page = self.calls
+            item = ImageCandidate(
+                id=f"p{page}:1", platform=Platform.DOUYIN,
+                image_url=f"https://img.test/{page}.jpg", creator_id="sec-1",
+                post_id=f"p{page}", media_index=1,
+            )
+            return CreatorSourceResult(
+                identity=_identity(), items=[item], posts_fetched=1,
+                post_ids=(item.post_id,), pages_fetched=1,
+                next_cursor=pack_cursor(2) if page == 1 else None,
+            )
+
+    events = []
+
+    async def run():
+        service = CreatorImageService(Settings(), Sources(), object())
+        with progress_context(events.append):
+            return await service.fetch(CreatorFetchRequest(
+                platform=Platform.DOUYIN, creator_id="Gracebb0722",
+                max_posts=5, max_images=10, download=False, resume=False,
+            ))
+
+    result = asyncio.run(run())
+    page_events = [event for event in events if event.get("pages_fetched") in {1, 2}]
+    assert {event["pages_fetched"] for event in page_events} == {1, 2}
+    assert any(event.get("stop_reason") == "source_exhausted" for event in events)
+    assert result["current_pages_fetched"] == 2
+    assert result["current_posts_fetched"] == 2
+    assert result["current_pagination_stop_reason"] == "source_exhausted"
 
 
 def test_creator_download_replaces_duplicate_candidates_from_the_same_job(tmp_path):
