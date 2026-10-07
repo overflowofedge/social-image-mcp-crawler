@@ -30,6 +30,32 @@ def test_gallery_dl_video_record_keeps_video_media_type():
     assert items[0].image_url.startswith("https://video.twimg.com/")
 
 
+def test_gallery_dl_ytdl_video_record_uses_metadata_video_url():
+    output = json.dumps([
+        [
+            3,
+            "ytdl:https://www.instagram.com/p/abc/1.mp4",
+            {
+                "post_id": "abc",
+                "post_url": "https://www.instagram.com/p/abc/",
+                "video_url": "https://cdn.test/instagram-video.mp4",
+                "display_url": "https://cdn.test/instagram-cover.jpg",
+            },
+        ]
+    ])
+    items = normalize_source_output(Platform.INSTAGRAM, output, "instagram-cli", 1, "videos")
+    assert len(items) == 1
+    assert items[0].media_type == "video"
+    assert items[0].image_url == "https://cdn.test/instagram-video.mp4"
+
+
+def test_gallery_dl_gallery_num_becomes_media_index():
+    output = '[3, "https://cdn.test/photo-2.jpg", {"post_id":"42", "num":2}]\n'
+    items = normalize_source_output(Platform.INSTAGRAM, output, "instagram-cli", 1, "images")
+    assert len(items) == 1
+    assert items[0].media_index == 2
+
+
 def test_normalized_video_keeps_its_type_without_a_file_extension():
     output = json.dumps({"id": "clip", "media_type": "video", "image_url": "https://cdn.test/play?id=1",
                          "thumbnail_url": "https://cdn.test/cover.jpg", "url": "https://site.test/post/1"})
@@ -114,7 +140,7 @@ def test_gallery_dl_directory_and_queue_messages_are_not_images():
 def test_source_hub_reports_recommended_projects_without_platform_credentials():
     statuses = SourceHub(None, None, "definitely-not-installed-gallery-dl", None).statuses()
     names = {status["name"] for status in statuses}
-    assert names == {"dy-cli", "bilibili-cli", "media-crawler", "xhs-downloader", "gallery-dl"}
+    assert names == {"dy-cli", "bilibili-cli", "weibo-cli", "xhs-cli", "x-cli", "instagram-cli"}
     assert all(status["configured"] is False for status in statuses)
     assert all(status["verified"] is False for status in statuses)
 
@@ -162,6 +188,26 @@ def test_external_source_empty_json_is_not_marked_verified(tmp_path):
     asyncio.run(run())
 
 
+def test_external_source_structured_empty_does_not_start_platform_cooldown(tmp_path):
+    script = tmp_path / "empty_source.py"
+    script.write_text(
+        "import json; print(json.dumps({'source_status': 'empty', 'media_type': 'videos'}))",
+        encoding="utf-8",
+    )
+
+    async def run():
+        source = ExternalJsonSource(
+            "dy-cli", f'"{sys.executable}" "{script}"',
+            (Platform.DOUYIN,), failure_cooldown_seconds=120,
+        )
+        request = SearchRequest(query="空结果", media_type="videos", video_limit=3)
+        assert await source.search(Platform.DOUYIN, parse_intent(request.query), 3, request=request) == []
+        assert source._cooldown_until == {}
+        assert source.status.ready_platforms == ()
+
+    asyncio.run(run())
+
+
 def test_gallery_cli_structured_auth_error_is_not_silently_empty():
     assert _embedded_error([[ -1, {"error": "AuthRequired", "message": "cookies needed"} ]]) == "AuthRequired: cookies needed"
 
@@ -190,13 +236,64 @@ def test_gallery_source_uses_bounded_native_search_targets():
     assert "--cookies-from-browser" not in file_command
 
 
+def test_gallery_source_keeps_x_and_instagram_sessions_independent():
+    source = GalleryDlSource(
+        "gallery-dl",
+        cookies_from_browser="legacy-browser",
+        cookies_file="legacy.txt",
+        platform_cookies_from_browser={Platform.X: "edge/x.com:C:/profiles/x"},
+        platform_cookie_files={Platform.INSTAGRAM: "instagram.txt"},
+    )
+
+    x_command = source._command(Platform.X, parse_intent("x:123456789"), 1)
+    instagram_command = source._command(Platform.INSTAGRAM, parse_intent("instagram:ABC123"), 1)
+    weibo_command = source._command(Platform.WEIBO, parse_intent("weibo:Mx123"), 1)
+
+    assert x_command[x_command.index("--cookies-from-browser") + 1] == "edge/x.com:C:/profiles/x"
+    assert "--cookies" not in x_command
+    assert instagram_command[instagram_command.index("--cookies") + 1] == "instagram.txt"
+    assert "--cookies-from-browser" not in instagram_command
+    assert weibo_command[weibo_command.index("--cookies") + 1] == "legacy.txt"
+
+
+def test_gallery_source_keeps_platform_failure_cooldowns_independent():
+    source = GalleryDlSource("gallery-dl", failure_cooldown_seconds=120)
+
+    source._failed(Platform.X, "X session expired")
+
+    with pytest.raises(SourceError, match="temporarily skipped for x"):
+        source._check_cooldown(Platform.X)
+    source._check_cooldown(Platform.INSTAGRAM)
+    assert Platform.INSTAGRAM.value not in source._cooldown_until
+
+
+def test_gallery_source_empty_video_result_names_requested_media(monkeypatch):
+    class EmptyProcess:
+        returncode = 0
+
+        async def communicate(self):
+            return b"", b""
+
+    async def create_process(*args, **kwargs):
+        return EmptyProcess()
+
+    async def run():
+        source = GalleryDlSource(sys.executable, failure_cooldown_seconds=0)
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+        request = SearchRequest(query="x:123456789", media_type="videos")
+        with pytest.raises(SourceError, match="returned no videos for x"):
+            await source.search(Platform.X, parse_intent(request.query), 1, request=request)
+
+    asyncio.run(run())
+
+
 def test_source_hub_skips_gallery_dl_for_weibo_keyword_search():
     async def run():
         hub = SourceHub(None, None, "gallery-dl", None)
         try:
             await hub.search(Platform.WEIBO, parse_intent("咖啡"), 1)
         except Exception as exc:
-            assert "No recommended source configured" in str(exc)
+            assert "No dedicated CLI configured" in str(exc)
         else:
             raise AssertionError("gallery-dl must not be used for Weibo keyword search")
 
@@ -211,13 +308,29 @@ def test_source_hub_does_not_chain_douyin_fallback_by_default():
         async def dy_fetch(request):
             return expected
 
-        async def media_fetch(request):
-            raise AssertionError("MediaCrawler fallback must be opt-in when dy-cli is configured")
-
         hub.douyin_source.fetch_creator = dy_fetch
-        hub.media_crawler.fetch_creator = media_fetch
         result = await hub.fetch_creator(CreatorFetchRequest(platform=Platform.DOUYIN, creator_id="Gracebb0722"))
         assert result is expected
+
+    asyncio.run(run())
+
+
+def test_source_hub_routes_every_platform_to_exactly_one_cli():
+    async def run():
+        hub = SourceHub("weibo", "xhs", sys.executable, None,
+                        douyin_source_command="douyin", bilibili_source_command="bilibili")
+        calls = []
+
+        for platform, source in hub._platform_sources.items():
+            async def fetch(intent_platform, intent, limit, *, request=None, expected=platform):
+                calls.append(expected)
+                return []
+            source.search = fetch
+
+        for platform in (Platform.DOUYIN, Platform.WEIBO, Platform.X, Platform.INSTAGRAM, Platform.XHS, Platform.BILIBILI):
+            calls.clear()
+            await hub.search(platform, parse_intent("测试"), 1)
+            assert calls == [platform]
 
     asyncio.run(run())
 

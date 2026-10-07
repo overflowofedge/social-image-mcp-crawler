@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import time
@@ -21,6 +22,7 @@ from .object_detector import ObjectDetector
 from .progress import report_progress
 from .bilibili import BilibiliError
 from .weibo import WeiboError
+from .storage import StorageAgent
 
 
 class CreatorStore:
@@ -51,6 +53,7 @@ class CreatorImageService:
         self.settings, self.sources, self.downloader, self.bilibili, self.weibo = settings, sources, downloader, bilibili, weibo
         self.semantic, self.vision, self.object_detector = semantic, vision, object_detector
         self.store = CreatorStore(settings.cache_path)
+        self.storage = StorageAgent(getattr(settings, "output_dir", "downloads"))
         # Serialize retries for the same creator checkpoint while allowing
         # unrelated creator IDs to run concurrently.
         self._locks: dict[str, asyncio.Lock] = {}
@@ -60,37 +63,92 @@ class CreatorImageService:
         target = request.profile_url or request.creator_id or request.creator_name or "creator"
         return f"{request.platform.value}:{target}"
 
+    @staticmethod
+    def _media_key(item: ImageCandidate | dict) -> str:
+        """Identify one asset without conflating a cover and its video."""
+        if isinstance(item, ImageCandidate):
+            post_id = item.post_id or item.id
+            media_type = item.media_type
+            index = item.media_index or 1
+        else:
+            post_id = item.get("post_id") or item.get("id")
+            media_type = item.get("media_type") or "image"
+            index = item.get("media_index") or 1
+        return f"{post_id}:{media_type}:{index}"
+
+    @staticmethod
+    def _legacy_media_key(item: ImageCandidate | dict) -> str:
+        if isinstance(item, ImageCandidate):
+            return f"{item.post_id or item.id}:{item.media_index or 1}"
+        return f"{item.get('post_id') or item.get('id')}:{item.get('media_index') or 1}"
+
+    @classmethod
+    def _valid_manifest_keys(cls, output: Path) -> set[str]:
+        """Trust only completed files that still exist in this job directory."""
+        manifest = output / "manifest.jsonl"
+        valid: set[str] = set()
+        try:
+            output_root = output.resolve()
+            for line in manifest.read_text(encoding="utf-8").splitlines():
+                try:
+                    record = json.loads(line)
+                    path = Path(str(record.get("path") or "")).resolve()
+                    if not path.is_relative_to(output_root) or not path.is_file():
+                        continue
+                    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                    if record.get("sha256") and digest != record["sha256"]:
+                        continue
+                    valid.add(f"{record.get('post_id') or record.get('candidate_id')}:{record.get('media_type') or 'image'}:{record.get('media_index') or 1}")
+                except (OSError, TypeError, ValueError):
+                    continue
+        except (OSError, UnicodeDecodeError):
+            pass
+        return valid
+
+    @classmethod
+    def _completed_media_is_valid(
+        cls,
+        key: str,
+        item: dict,
+        manifest_valid: set[str],
+        manifest_exists: bool,
+        completed_records: dict,
+        output: Path,
+    ) -> bool:
+        """Validate a checkpoint entry while keeping legacy states resumable."""
+        if key in manifest_valid:
+            return True
+        record = completed_records.get(key)
+        if not isinstance(record, dict):
+            legacy_key = cls._legacy_media_key(item)
+            record = completed_records.get(legacy_key)
+        if isinstance(record, dict) and record.get("path"):
+            try:
+                path = Path(str(record["path"])).resolve()
+                root = output.resolve()
+                if not path.is_relative_to(root) or not path.is_file():
+                    return False
+                expected = str(record.get("sha256") or "")
+                return not expected or hashlib.sha256(path.read_bytes()).hexdigest() == expected
+            except (OSError, TypeError, ValueError):
+                return False
+        # Checkpoints from versions before completed_records/manifest support
+        # contain no file evidence. Preserve those keys so a normal resume can
+        # refresh the source instead of creating a phantom retry queue.
+        return not manifest_exists
+
     async def _fetch_source_page(self, request: CreatorFetchRequest):
-        """Read one logical source batch while preserving platform fallbacks."""
-        cli_source = getattr(self.sources, "bilibili_source", None) if request.platform.value == "bilibili" else None
-        if request.platform.value == "bilibili" and cli_source is not None and cli_source.command_template:
-            return await self.sources.fetch_creator(request)
-        if request.platform.value == "weibo" and getattr(getattr(self.sources, "media_crawler", None), "command_template", None):
-            try:
-                return await self.sources.fetch_creator(request)
-            except SourceError as exc:
-                if self.weibo is None:
-                    raise
-                try:
-                    return await self.weibo.fetch_creator(request)
-                except WeiboError as fallback_exc:
-                    raise SourceError(f"weibo CLI: {exc}; public API fallback: {fallback_exc}") from fallback_exc
-        if request.platform.value in {"bilibili", "weibo"} and getattr(self, request.platform.value, None) is not None:
-            native_api = getattr(self, request.platform.value)
-            try:
-                return await native_api.fetch_creator(request)
-            except (BilibiliError, WeiboError) as exc:
-                if request.platform.value == "bilibili":
-                    raise SourceError(str(exc)) from exc
-                try:
-                    return await self.sources.fetch_creator(request)
-                except SourceError as fallback_exc:
-                    raise SourceError(f"weibo public API: {exc}; media-crawler fallback: {fallback_exc}") from fallback_exc
+        """Read one logical batch from the platform's dedicated CLI only."""
         return await self.sources.fetch_creator(request)
 
     @staticmethod
     def _candidate_targets_met(items: list[ImageCandidate], request: CreatorFetchRequest) -> bool:
         """Stop paging after filling the requested quota plus a small replacement reserve."""
+        # A candidate is not a successful file. For download jobs, duplicates,
+        # expired URLs, size rejection and transient failures must be replaced
+        # from later works, so traverse until max_posts or source exhaustion.
+        if request.download:
+            return False
         image_target = request.max_images if request.media_type != "videos" else 0
         video_target = (request.max_videos if request.max_videos is not None else request.max_images) if request.media_type != "images" else 0
         reserve = min(20, max(2, (image_target + video_target + 9) // 10)) if request.download else 0
@@ -244,7 +302,7 @@ class CreatorImageService:
 
     async def _fetch(self, request: CreatorFetchRequest) -> dict:
         target = creator_target(request.platform.value, request.profile_url or request.creator_id) if not request.creator_name else request.creator_name.strip()
-        safe_target = re.sub(r"[^A-Za-z0-9_.\-\u4e00-\u9fff]+", "_", target).strip("._")[:120] or "creator"
+        safe_target = self.storage.account_name(request.platform, query=target)
         scope = request.model_dump(mode="json", exclude={"max_posts", "max_images", "creator_id", "profile_url", "output_dir", "download", "resume", "max_concurrency"})
         # Keep creator downloads in a short, account-specific layout:
         # downloads/<platform>/<account>/<images|videos>.
@@ -259,6 +317,7 @@ class CreatorImageService:
                 "seen": [],
                 "catalog": {},
                 "completed": [],
+                "completed_records": {},
                 "exhausted": False,
                 "last_refresh_at": None,
                 "refresh_count": 0,
@@ -304,6 +363,39 @@ class CreatorImageService:
             state.setdefault("refresh_count", 0)
             state.setdefault("catalog", {})
             state.setdefault("completed", [])
+            state.setdefault("completed_records", {})
+        previous_completed = set(str(value) for value in state.get("completed") or [])
+        # Migrate old checkpoints and invalidate entries whose file disappeared
+        # from this desktop output directory. Missing files are requeued from
+        # the durable catalog instead of being reported as successful.
+        catalog_state = state.get("catalog") if isinstance(state.get("catalog"), dict) else {}
+        normalized_catalog: dict[str, dict] = {}
+        for value in catalog_state.values():
+            if isinstance(value, dict) and value.get("id"):
+                normalized_catalog[self._media_key(value)] = value
+        manifest_valid = self._valid_manifest_keys(output)
+        manifest_exists = (output / "manifest.jsonl").is_file()
+        completed_records = state.get("completed_records") if isinstance(state.get("completed_records"), dict) else {}
+        valid_completed: set[str] = set()
+        stale_completed = {
+            key for key, value in normalized_catalog.items()
+            if (key in previous_completed or self._legacy_media_key(value) in previous_completed)
+            and not self._completed_media_is_valid(
+                key, value, manifest_valid, manifest_exists, completed_records, output,
+            )
+        }
+        for key, value in normalized_catalog.items():
+            if (key in previous_completed or self._legacy_media_key(value) in previous_completed) and key not in stale_completed:
+                valid_completed.add(key)
+        state["completed"] = sorted(valid_completed)
+        if stale_completed:
+            pending_state = {self._media_key(value): value for value in state.get("pending") or [] if isinstance(value, dict)}
+            for key in stale_completed:
+                if key in normalized_catalog and key not in pending_state:
+                    pending_state[key] = normalized_catalog[key]
+            state["pending"] = list(pending_state.values())
+        if normalized_catalog:
+            state["catalog"] = normalized_catalog
         warnings = []
         source_result = None
         # Once the previous batch is drained, probe the source again even if
@@ -348,7 +440,7 @@ class CreatorImageService:
                 if item.platform != request.platform or item.creator_id != identity.canonical_id or not item.post_id or not item.media_index:
                     rejected += 1
                     continue
-                media_key = f"{item.post_id}:{item.media_index}"
+                media_key = self._media_key(item)
                 catalog[media_key] = item.model_dump(mode="json")
                 if media_key in seen:
                     continue
@@ -397,7 +489,11 @@ class CreatorImageService:
                 (request.max_videos if request.max_videos is not None else request.max_images)
                 if request.media_type != "images" else 0
             )
-            attempt_budget = min(len(pending), max(target_total * 3, target_total + 50))
+            # The post traversal is already bounded by max_posts. Every
+            # candidate inside that explicit boundary is eligible as a
+            # replacement; arbitrary 3x/+50 caps caused avoidable shortfalls.
+            attempt_budget = len(pending)
+            batch_number = 0
             while len(attempted) < attempt_budget and not self._download_targets_met(successful, request):
                 batch = self._select_download_batch(
                     pending, request, attempted, successful, successful_per_post,
@@ -405,16 +501,24 @@ class CreatorImageService:
                 )
                 if not batch:
                     break
+                batch_number += 1
                 report_progress(
-                    "downloading", f"正在下载第 {len(attempted) + 1}-{len(attempted) + len(batch)} 个候选文件。",
+                    "downloading",
+                    f"正在下载第 {batch_number} 批（第 {len(attempted) + 1}-{len(attempted) + len(batch)} 个候选文件）。",
                     download_completed=len(records), download_total=attempt_budget,
                     images_found=sum(item.media_type == "image" for item in pending),
                     videos_found=sum(item.media_type == "video" for item in pending),
                 )
                 selected.extend(batch)
                 attempted.update(item.id for item in batch)
+                concurrency = request.max_concurrency
+                if all(item.media_type == "video" for item in batch):
+                    concurrency = min(
+                        concurrency,
+                        max(1, int(os.getenv("VIDEO_DOWNLOAD_CONCURRENCY", "1"))),
+                    )
                 batch_records = await self.downloader.download_many(
-                    batch, output, request.max_concurrency, request.min_width,
+                    batch, output, concurrency, request.min_width,
                     request.min_height, resume=request.resume or bool(records),
                 )
                 records.extend(batch_records)
@@ -423,17 +527,17 @@ class CreatorImageService:
                     record.candidate_id for record in batch_records
                     if record.status in {"downloaded", "existing", "duplicate", "rejected"}
                 }
-                batch_successes = 0
                 for record in batch_records:
                     item = by_id.get(record.candidate_id)
                     if item is None or record.status not in {"downloaded", "existing"}:
                         continue
-                    batch_successes += 1
                     successful[item.media_type] += 1
                     if item.media_type == "image":
                         post = item.post_id or item.id
                         successful_per_post[post] = successful_per_post.get(post, 0) + 1
-                    completed.add(f"{item.post_id}:{item.media_index}")
+                    media_key = self._media_key(item)
+                    completed.add(media_key)
+                    state.setdefault("completed_records", {})[media_key] = record.model_dump(mode="json")
                 state["completed"] = sorted(completed)
                 state["pending"] = [item for item in state["pending"] if item["id"] not in terminal]
                 self.store.save(key, state)
@@ -441,24 +545,26 @@ class CreatorImageService:
                 for record in records:
                     status_counts[record.status if record.status in status_counts else "failed"] += 1
                 report_progress(
-                    "downloading", f"已处理 {len(records)} 个下载候选。",
+                    "downloading", f"第 {batch_number} 批下载已完成，已处理 {len(records)} 个下载候选。",
                     download_completed=len(records), download_total=attempt_budget,
                     **status_counts,
                 )
-                # A whole batch of transport failures usually means the
-                # platform/CDN is unavailable; avoid multiplying the failure.
-                if not batch_successes and all(record.status == "failed" for record in batch_records):
-                    break
         elif warnings:
             state["warnings"].extend(warnings)
             self.store.save(key, state)
+        info_path = self.storage.write_index(
+            output,
+            request.platform,
+            identity=state.get("identity") or {},
+            records=[record.model_dump(mode="json") for record in records],
+        )
         partial = any(record.status == "failed" for record in records) or bool(state["warnings"]) or bool(state.get("filter_warning")) or bool(state.get("filter_error"))
         error = None
         if state.get("filter_error"):
             error = {"code": "content_filter_required", "message": str(state["filter_error"])}
         selected_payload = [item.model_dump(mode="json") for item in selected]
         pending_keys = {
-            f"{item.get('post_id') or item.get('id')}:{item.get('media_index')}"
+            self._media_key(item)
             for item in state.get("pending", [])
             if isinstance(item, dict)
         }
@@ -494,6 +600,7 @@ class CreatorImageService:
                 "work_types": self._work_type_counts(works),
                 "new_work_ids": new_work_ids,
                 "downloads": [record.model_dump(mode="json") for record in records], "output_dir": str(output),
+                "info_path": str(info_path),
                 "next_cursor": state["cursor"], "pending_images": len(state["pending"]),
                 "has_more": bool(state["pending"]) or not state["exhausted"],
                 "last_refresh_at": state.get("last_refresh_at"),
@@ -565,7 +672,7 @@ class CreatorImageService:
             }
             for item in media:
                 item_payload = item.model_dump(mode="json")
-                media_key = f"{item.post_id}:{item.media_index}"
+                media_key = CreatorImageService._media_key(item)
                 item_payload["download_status"] = "downloaded" if media_key in completed else ("pending" if media_key in pending else "known")
                 work_payload["items"].append(item_payload)
             work_payload["download_status"] = "downloaded" if all(item.get("download_status") == "downloaded" for item in work_payload["items"]) else ("pending" if any(item.get("download_status") == "pending" for item in work_payload["items"]) else "known")
@@ -634,12 +741,30 @@ class CreatorImageService:
         batch: list[ImageCandidate] = []
         batch_counts = {"image": 0, "video": 0}
         batch_per_post: dict[str, int] = {}
+        available_types = {
+            item.media_type for item in items
+            if item.id not in attempted
+            and not (request.media_type == "images" and item.media_type != "image")
+            and not (request.media_type == "videos" and item.media_type != "video")
+        }
+        if successful["image"] < image_target and "image" in available_types:
+            needed_type = "image"
+        elif successful["video"] < video_target and "video" in available_types:
+            needed_type = "video"
+        else:
+            return []
+        batch_limit = max(1, int(os.getenv(
+            "IMAGE_DOWNLOAD_BATCH_SIZE" if needed_type == "image" else "VIDEO_DOWNLOAD_BATCH_SIZE",
+            "10" if needed_type == "image" else "3",
+        )))
         for item in items:
             if item.id in attempted:
                 continue
             if request.media_type == "images" and item.media_type != "image":
                 continue
             if request.media_type == "videos" and item.media_type != "video":
+                continue
+            if item.media_type != needed_type:
                 continue
             target = image_target if item.media_type == "image" else video_target
             if successful[item.media_type] + batch_counts[item.media_type] >= target:
@@ -652,6 +777,8 @@ class CreatorImageService:
                 batch_per_post[post] = batch_per_post.get(post, 0) + 1
             batch.append(item)
             batch_counts[item.media_type] += 1
+            if len(batch) >= batch_limit:
+                break
             if len(batch) >= budget:
                 break
             if (

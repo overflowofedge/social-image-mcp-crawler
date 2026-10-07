@@ -140,7 +140,12 @@ def extract_media_urls(platform: str, record: Any, include_video_covers: bool = 
         if not urls and include_video_covers:
             video = record.get("video") or {}
             for key in ("raw_cover", "origin_cover", "dynamic_cover"):
-                urls.extend(_urls_from_mapping(video.get(key) or {}))
+                if cover_urls := _urls_from_mapping(video.get(key) or {}):
+                    # These fields are alternate encodings of the same cover.
+                    # Prefer the first high-quality raw/original URL instead of
+                    # downloading three visually identical files per video.
+                    urls.append(cover_urls[0])
+                    break
         return _dedupe(urls)
 
     if platform == "weibo":
@@ -160,6 +165,38 @@ def extract_video_urls(platform: str, record: Any) -> list[str]:
     """Extract original video URLs without treating covers as videos."""
     if not isinstance(record, dict):
         return []
+    if platform == "xhs":
+        direct = record.get("video_url") or record.get("videoUrl")
+        if isinstance(direct, str):
+            values = [value.strip() for value in direct.split(",")]
+            if urls := _dedupe(value for value in values if _video_url(value)):
+                return urls
+
+        video = record.get("video") or {}
+        if not isinstance(video, dict):
+            return []
+        consumer = video.get("consumer") or {}
+        if isinstance(consumer, dict):
+            origin_key = _as_text(_first(consumer, "origin_video_key", "originVideoKey"))
+            if origin_key:
+                if _video_url(origin_key):
+                    return [origin_key]
+                return [f"https://sns-video-bd.xhscdn.com/{origin_key.lstrip('/')}"]
+
+        stream = ((video.get("media") or {}).get("stream") or {}) if isinstance(video.get("media"), dict) else {}
+        variants: list[tuple[tuple[int, int, int, float, float], str]] = []
+        if isinstance(stream, dict):
+            for codec, rows in stream.items():
+                if not isinstance(rows, list):
+                    continue
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    url = _first(row, "master_url", "masterUrl", "url")
+                    url = _video_url(url)
+                    if url and not is_hdr_video(row, url, str(codec)):
+                        variants.append((video_stream_score(row, url, str(codec)), url))
+        return [max(variants, key=lambda item: item[0])[1]] if variants else []
     if platform == "douyin":
         video = record.get("video") or {}
 

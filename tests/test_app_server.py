@@ -1,4 +1,5 @@
 import importlib.util
+import asyncio
 import json
 from contextlib import contextmanager
 from http.server import ThreadingHTTPServer
@@ -96,6 +97,33 @@ def test_desktop_form_treats_bilibili_nickname_as_creator_name():
     assert _creator_hint("288159073", "bilibili", None) == (None, "288159073")
 
 
+def test_implicit_creator_failure_always_retries_as_keyword(monkeypatch):
+    calls = []
+
+    async def fake_search(query, **kwargs):
+        calls.append((kwargs.get("creator_name"), kwargs.get("creator_id")))
+        if kwargs.get("creator_name") or kwargs.get("creator_id"):
+            return {"items": [], "error": {"code": "adapter_error", "message": "verify_check"}}
+        return {"items": [{"id": "keyword-result", "media_type": "image"}]}
+
+    class Runner:
+        @staticmethod
+        def call(awaitable, timeout=None):
+            return asyncio.run(awaitable)
+
+    activity = []
+    monkeypatch.setattr(_MODULE, "search_images", fake_search)
+    result = _MODULE._execute_search({
+        "query": "Vinan", "platforms": ["douyin"], "max_results": 1,
+        "media_type": "images", "image_limit": 1, "max_posts": 1,
+        "download": False,
+    }, Runner(), activity.append)
+
+    assert calls == [(None, "Vinan"), (None, None)]
+    assert result["items"][0]["id"] == "keyword-result"
+    assert any("关键词检索" in event["message"] for event in activity)
+
+
 def test_task_report_explains_when_image_settings_cannot_reach_target():
     report = _task_report(
         {
@@ -126,6 +154,17 @@ def test_missing_query_guidance_tells_user_what_to_enter():
     assert reason == "没有填写要采集的账号或网址。"
     assert "账号昵称" in action
     assert "主页链接" in action
+
+
+def test_douyin_short_link_parse_failure_is_not_reported_as_expired_login():
+    reason, action = _error_guidance(
+        "dy-cli 抖音请求失败: 无法从链接提取视频 ID: https://v.douyin.com/-cHq0KkO5uE/",
+        "douyin",
+    )
+
+    assert "短链接" in reason
+    assert "登录状态" not in reason
+    assert "douyin.com/user" in action
 
 
 def test_task_report_separates_each_download_outcome():

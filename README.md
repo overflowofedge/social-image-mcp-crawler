@@ -43,11 +43,22 @@ git clone https://github.com/Youhai020616/douyin.git third_party\dy-cli
 powershell -ExecutionPolicy Bypass -File .\scripts\install_desktop.ps1 -InstallSources
 ```
 
-安装脚本会同时安装 MediaCrawler 的桌面桥接依赖。抖音、小红书、微博和 B 站的检索、账号采集都通过独立 CLI 子进程运行；MediaCrawler 桥接按 `--platform` 隔离小红书/微博，抖音使用独立 dy-cli，B 站使用 `bilibili_cli_bridge.py`。首次采集时，程序会打开来源项目的浏览器窗口，请按提示完成官方登录。登录信息只保存在本机 `.cache`，不会提交到 Git。若微博昵称查询遇到 HTTP 432，可以输入完整主页链接重试；账号会由备用浏览器来源核验。配置 `BILIBILI_COOKIE` 可提高 B 站访问稳定性；X 和 Instagram 继续使用独立的 gallery-dl CLI 会话。
+安装脚本会同时安装 MediaCrawler 的桌面桥接依赖。抖音、小红书、微博和 B 站的检索、账号采集都通过独立 CLI 子进程运行；MediaCrawler 桥接按 `--platform` 隔离小红书/微博，抖音使用独立 dy-cli，B 站使用 `bilibili_cli_bridge.py`。首次采集时，程序会打开来源项目的浏览器窗口，请按提示完成官方登录。登录信息只保存在本机 `.cache`，不会提交到 Git。若微博昵称查询遇到 HTTP 432，可以输入完整主页链接重试；账号会由备用浏览器来源核验。配置 `BILIBILI_COOKIE` 可提高 B 站访问稳定性。
+
+### X 和 Instagram
+
+X 与 Instagram 必须分别建立 gallery-dl 会话，不共用 Cookie、浏览器配置或失败冷却。在项目目录依次运行需要的平台命令，并在各自打开的独立浏览器窗口完成官方登录：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\setup_account.ps1 -Platform x
+powershell -ExecutionPolicy Bypass -File .\scripts\setup_account.ps1 -Platform instagram
+```
+
+脚本会把 X 与 Instagram 的会话分别保存到 `.cache`，并写入各自的 `X_GALLERY_DL_*` / `INSTAGRAM_GALLERY_DL_*` 配置。一个平台登录过期、限流或采集失败时，不会改写或冷却另一个平台。
 
 ## 启动
 
-双击 **启动应用.bat**。启动时会先检查 Python 依赖、Playwright 浏览器、来源桥接、抖音 Cookie，以及抖音和微博接口状态；缺少 MediaCrawler 桥接依赖会尝试修复。检查结果保存在 `.cache\preflight-latest.json`，微博浏览器登录状态需在首次采集时核验。通过后浏览器打开 `http://127.0.0.1:8765/`。关闭启动窗口即可停止应用。
+双击 **启动应用.bat**。启动时会先检查 Python 依赖、Playwright 浏览器、来源桥接和本机持久 Cookie；默认不额外请求抖音接口，避免每次启动增加风控频率。即使手动启用动态检查且平台临时返回验证，也只影响抖音，不会阻止桌面版和其它平台启动。缺少 MediaCrawler 桥接依赖会尝试修复，检查结果保存在 `.cache\preflight-latest.json`。通过后浏览器打开 `http://127.0.0.1:8765/`。
 
 ## 使用
 
@@ -56,7 +67,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install_desktop.ps1 -InstallS
 - 网页图片会过滤导航、Logo、头像、图标和统计像素；同一图片优先选择原图或最大的响应式版本，并校验真实尺寸（宽高至少 160 像素）。图片、视频分别按设置数量下载，每篇图片上限不会挤掉同篇视频。
 - 网页视频支持 `<video>`、`<source>`、直接视频链接和结构化数据中的 MP4/WebM 等文件。动态页面会尝试浏览器加载；HLS/DASH 分段流、嵌入式播放器或无法访问的媒体会显示限制或错误，不会把封面作为视频下载。动态读取需要 Playwright 的 Chromium，或设置 `WEBPAGE_BROWSER_PATH` 为已安装浏览器的路径。
 - 图片模式不需要填写视频数量；只有视频或全部模式才填写视频数量。
-- 点击开始采集后，页面按图片作品、视频作品和混合作品列出清单；账号媒体文件保存到 `downloads/<platform>/<account>/<images|videos>`，普通搜索保存到 `downloads/<platform>/<images|videos>`。文件名使用 `时间戳_作品号_作品名`，同一账号再次采集时只会加入新的作品，已存在且校验通过的文件会标记为 `existing`。
+- 点击开始采集后，页面按图片作品、视频作品和混合作品列出清单；所有下载统一保存到 `downloads/<platform>/<account-or-nickname>/<images|videos>`。每个账号目录同时生成 `<account-or-nickname>.md` 清单，采用“日期 + 作品标题 + 文件名”的一行一文件格式，打开即可阅读和核对；视频清单会提示按文件名中的 BV 号或作品 ID 核验。下载校验和断点续传使用同目录的 `manifest.jsonl`，同一账号再次采集时只会加入新的作品，已存在且校验通过的文件会标记为 `existing`。
+- 登录成功后会复用本机持久 Cookie；只有 Cookie 文件缺失、损坏、缺少认证字段或确已过期时才要求重新登录。关键词没有结果、接口暂时失败或触发平台验证不会自动清除登录态。
+- 视频默认每批下载 3 个、并发 1 个；上一批完全结束后才开始下一批。下载失败、重复或被拒绝的候选不占成功数量，程序会继续从后续作品补足，直到达到视频上限或“最多检索作品数”已遍历完。可通过 `.env` 中的 `VIDEO_DOWNLOAD_BATCH_SIZE` 和 `VIDEO_DOWNLOAD_CONCURRENCY` 调整。
 - 数量输入是目标上限，不是平台保证值。页面会提前提示“作品数 × 每作品图片数”的理论容量，任务结束后再说明平台实际返回、重复跳过、规则拒绝和下载失败造成的差额。
 
 ## 常见问题

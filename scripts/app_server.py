@@ -234,6 +234,13 @@ def _error_guidance(message: str, platform: str) -> tuple[str, str]:
     if "请输入搜索提示词或链接" in raw:
         return "没有填写要采集的账号或网址。", "输入账号昵称、完整主页链接或作品链接后再试。"
     if any(marker in lowered for marker in (
+        "无法从链接提取视频 id", "不是抖音主页链接", "无法从短链接解析抖音主页",
+    )):
+        return (
+            "抖音短链接没有被正确识别为主页或作品链接。",
+            "请重试该链接；若平台已更新短链格式，可粘贴完整的 https://www.douyin.com/user/... 主页链接。",
+        )
+    if any(marker in lowered for marker in (
         "verify_check", "wbi", "rate limit", "risk control", "验证码",
         "api error -352", "api error -412", "http 412", "http 403", "http 429",
         "temporarily rejected",
@@ -448,6 +455,11 @@ def _task_report(body: dict, result: dict, elapsed_seconds: float) -> dict:
         logs.append({"level": level, "message": issue["reason"], "action": issue["action"]})
     if result.get("output_dir"):
         logs.append({"level": "info", "message": f"保存目录：{result['output_dir']}"})
+    output_dirs = result.get("output_dirs")
+    if isinstance(output_dirs, dict):
+        for path in dict.fromkeys(str(value) for value in output_dirs.values() if value):
+            if path and path != result.get("output_dir"):
+                logs.append({"level": "info", "message": f"保存目录：{path}"})
     logs.append({"level": "info", "message": f"任务耗时：{elapsed_seconds:.1f} 秒。"})
 
     requested_total = requested["images"] + requested["videos"]
@@ -553,19 +565,18 @@ def _execute_search(body: dict, runner: _Loop, callback) -> dict:
     )
     error = result.get("error") if isinstance(result, dict) else None
     if (auto_creator or auto_creator_id) and isinstance(error, dict):
-        message = str(error.get("message", "")).lower()
-        if any(marker in message for marker in (
-            "matched 0", "not found", "invalid creator",
-            "creator_identity_unresolved", "identity_unresolved",
-        )):
-            callback({
-                "stage": "retrieving", "level": "warning",
-                "message": "未确认到唯一账号，正在改用关键词检索。",
-            })
-            result = runner.call(
-                _search_with_progress(search_kwargs, None, None, callback),
-                timeout=request_timeout,
-            )
+        # A plain short form value is only an account hint; it may be a real
+        # keyword. Any account-mode failure must therefore get one keyword
+        # attempt. Explicit profile/post URLs are handled by parse_intent and
+        # never reach this heuristic branch.
+        callback({
+            "stage": "retrieving", "level": "warning",
+            "message": "账号方式未取得内容，正在改用关键词检索。",
+        })
+        result = runner.call(
+            _search_with_progress(search_kwargs, None, None, callback),
+            timeout=request_timeout,
+        )
     if not isinstance(result, dict):
         raise ValueError("采集服务返回了无法识别的结果")
     return result

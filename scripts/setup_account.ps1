@@ -246,13 +246,30 @@ Write-Output "Log in to $Platform in the dedicated $Browser window. Complete any
 Read-Host "After the account home page is visible, press Enter"
 Stop-IsolatedBrowser $profileRoot
 
+if ($Platform -eq "instagram") {
+    # New Edge builds use App-Bound Encryption. Let the browser decrypt its
+    # own profile and export a Netscape file that gallery-dl can read later.
+    $browserChannel = switch ($Browser) {
+        "edge" { "msedge" }
+        default { $Browser }
+    }
+    & $Python (Join-Path $PSScriptRoot "export_browser_cookies.py") --profile $profileRoot --output $platformCookieFile --browser $browserChannel
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $platformCookieFile)) {
+        throw "Instagram browser cookies could not be exported for gallery-dl."
+    }
+}
+
 $previousErrorAction = $ErrorActionPreference
 try {
     # Windows PowerShell wraps native stderr lines as ErrorRecord objects.
     # gallery-dl logs successful cookie extraction to stderr, so do not let
     # ErrorActionPreference=Stop abort before its process exit code is read.
     $ErrorActionPreference = "Continue"
-    $output = & $galleryDl.Source --cookies-from-browser $browserSession --cookies-export $platformCookieFile -o output.jsonl=true --range 1 --dump-json --no-download $testUrl 2>&1
+    if ($Platform -eq "instagram") {
+        $output = & $galleryDl.Source --cookies $platformCookieFile -o output.jsonl=true --range 1 --dump-json --no-download $testUrl 2>&1
+    } else {
+        $output = & $galleryDl.Source --cookies-from-browser $browserSession --cookies-export $platformCookieFile -o output.jsonl=true --range 1 --dump-json --no-download $testUrl 2>&1
+    }
     $galleryExitCode = $LASTEXITCODE
 } finally {
     $ErrorActionPreference = $previousErrorAction
@@ -267,12 +284,15 @@ if ($Platform -eq "x") {
     # Recent Edge builds may not allow gallery-dl to export the encrypted
     # Twitter cookies to Netscape format. Keep the closed isolated profile
     # and let gallery-dl decrypt it directly on every request instead.
-    Set-ProjectEnvironmentValue "GALLERY_DL_COOKIES_FROM_BROWSER" $browserSession
-    Set-ProjectEnvironmentValue "GALLERY_DL_COOKIES_FILE" ""
+    Set-ProjectEnvironmentValue "X_GALLERY_DL_COOKIES_FROM_BROWSER" $browserSession
+    Set-ProjectEnvironmentValue "X_GALLERY_DL_COOKIES_FILE" ""
     Write-Output "$Platform returned real media metadata through gallery-dl. The isolated browser profile is configured for direct cookie reading."
 } else {
-    Set-ProjectEnvironmentValue "GALLERY_DL_COOKIES_FROM_BROWSER" ""
-    Set-ProjectEnvironmentValue "GALLERY_DL_COOKIES_FILE" ".cache/gallery-dl-cookies.txt"
-    Write-Output "$Platform returned real media metadata through gallery-dl. Its isolated session was merged into the MCP cookie file under .cache."
+    # Edge may refuse to export encrypted Instagram cookies even after
+    # gallery-dl successfully verified the session. Keep the isolated browser
+    # profile as the primary source and retain the Netscape file as fallback.
+    Set-ProjectEnvironmentValue "INSTAGRAM_GALLERY_DL_COOKIES_FROM_BROWSER" ""
+    Set-ProjectEnvironmentValue "INSTAGRAM_GALLERY_DL_COOKIES_FILE" ".cache/gallery-dl-instagram-cookies.txt"
+    Write-Output "$Platform returned real media metadata through gallery-dl. Its isolated browser profile is configured for direct cookie reading without changing the X session."
 }
 Write-Output "Open a new Codex task before testing the MCP."

@@ -18,6 +18,7 @@ pandas
 parsel
 pyexecjs
 pyhumps
+pyperclip
 pywebview
 redis
 requests

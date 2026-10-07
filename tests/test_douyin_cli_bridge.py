@@ -12,6 +12,7 @@ _SPEC.loader.exec_module(_MODULE)
 _records = _MODULE._records
 _configure_stdio = _MODULE._configure_stdio
 _raise_for_empty_search = _MODULE._raise_for_empty_search
+_search_galleries = _MODULE._search_galleries
 _exact_record = _MODULE._exact_record
 _load_cached_items = _MODULE._load_cached_items
 _save_cached_items = _MODULE._save_cached_items
@@ -40,6 +41,72 @@ def test_dy_cli_verify_check_is_reported_as_an_error():
 
     with pytest.raises(RuntimeError, match="verify_check"):
         _raise_for_empty_search({"search_nil_info": {"search_nil_type": "verify_check"}})
+
+
+def test_video_search_uses_dedicated_channel_after_empty_general_results():
+    calls = []
+
+    class Client:
+        def search(self, query, *, search_type, count, offset=0):
+            calls.append((query, search_type, count, offset))
+            if search_type == "general":
+                return {"data": []}
+            return {"data": [{"aweme_info": {
+                "aweme_id": "clip-1",
+                "video": {"play_addr": {"url_list": ["https://video.test/clip.mp4"]}},
+            }}]}
+
+    _, galleries = _search_galleries(Client(), "Vinan", "videos", 8)
+
+    assert [call[1] for call in calls] == ["general", "video"]
+    assert galleries[0][0]["media_type"] == "video"
+
+
+def test_search_fallback_preserves_verify_check_diagnostic():
+    class Client:
+        def search(self, query, *, search_type, count, offset=0):
+            if search_type == "atlas":
+                return {"data": [], "search_nil_info": {"search_nil_type": "verify_check"}}
+            return {"data": []}
+
+    import pytest
+
+    with pytest.raises(RuntimeError, match="verify_check"):
+        _search_galleries(Client(), "受限关键词", "images", 5)
+
+
+def test_empty_video_search_is_a_normal_exhausted_result():
+    calls = []
+
+    class Client:
+        def search(self, query, *, search_type, count, offset=0):
+            calls.append((search_type, offset, count))
+            return {"data": []}
+
+    _, galleries = _search_galleries(Client(), "没有视频的关键词", "videos", 6, max_posts=30)
+
+    assert galleries == []
+    assert calls == [("general", 0, 10), ("video", 0, 10)]
+
+
+def test_video_search_pages_one_session_until_target_or_post_budget(monkeypatch):
+    calls = []
+    monkeypatch.setenv("DOUYIN_SEARCH_SLEEP_SECONDS", "0.001")
+
+    class Client:
+        def search(self, query, *, search_type, count, offset=0):
+            calls.append((search_type, offset, count))
+            if search_type != "general":
+                return {"data": []}
+            return {"data": [{"aweme_info": {
+                "aweme_id": f"clip-{offset}",
+                "video": {"play_addr": {"url_list": [f"https://video.test/{offset}.mp4"]}},
+            }}]}
+
+    _, galleries = _search_galleries(Client(), "咖啡", "videos", 3, max_posts=25)
+
+    assert [gallery[0]["post_id"] for gallery in galleries] == ["clip-0", "clip-10", "clip-20"]
+    assert [call[1] for call in calls] == [0, 10, 20]
 
 
 def test_missing_browser_dependency_explains_how_to_repair(monkeypatch):
@@ -107,6 +174,26 @@ def test_profile_share_preserves_requested_media_and_later_videos(monkeypatch):
     assert _creator_items_from_profile_share(Client(), request.query, 3, search_request=request) == items
 
 
+def test_profile_share_image_mode_requests_video_covers(monkeypatch):
+    from social_image_mcp.models import SearchRequest
+
+    class Client:
+        def resolve_creator_share_url(self, url):
+            return "https://www.douyin.com/user/sec-1"
+
+    def fetch(client, request, account=None):
+        assert request.media_type == "images"
+        assert request.include_video_covers is True
+        return {"items": []}
+
+    monkeypatch.setattr(_MODULE, "_fetch_creator_with_fallback", fetch)
+    request = SearchRequest(
+        query="https://v.douyin.com/-profile/", media_type="images",
+        image_limit=3, max_posts=10,
+    )
+    assert _creator_items_from_profile_share(Client(), request.query, 3, search_request=request) == []
+
+
 def test_dy_cli_relative_cache_is_anchored_to_project(monkeypatch):
     monkeypatch.setenv("DY_CLI_RESULT_CACHE", ".cache/custom-results.json")
     assert _cache_path() == Path(__file__).resolve().parents[1] / ".cache" / "custom-results.json"
@@ -116,6 +203,24 @@ def test_douyin_creator_url_detection_distinguishes_profile_paths():
     assert _looks_like_douyin_creator_url("https://www.douyin.com/user/sec-1")
     assert _looks_like_douyin_creator_url("https://v.douyin.com/abc/") is False
     assert _looks_like_douyin_creator_url("https://www.douyin.com/video/123") is False
+
+
+def test_hyphenated_douyin_short_link_resolves_as_creator_profile(monkeypatch):
+    import sys
+
+    vendor = Path(__file__).resolve().parents[1] / "third_party" / "dy-cli" / "src"
+    monkeypatch.syspath_prepend(str(vendor))
+    from dy_cli.engines.api_client import DouyinAPIClient, SHORT_URL_PATTERN
+
+    url = "https://v.douyin.com/-cHq0KkO5uE/"
+    assert SHORT_URL_PATTERN.fullmatch(url)
+    client = object.__new__(DouyinAPIClient)
+    monkeypatch.setattr(
+        client,
+        "_short_url_redirects",
+        lambda value: (["https://www.iesdouyin.com/share/user/MS4w-test"], "", ""),
+    )
+    assert client.resolve_creator_share_url(url) == "https://www.douyin.com/user/MS4w-test"
 
 
 def test_douyin_profile_share_is_resolved_before_creator_collection(monkeypatch):
