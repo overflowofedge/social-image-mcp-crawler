@@ -4,7 +4,7 @@ import importlib.util
 import subprocess
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 from social_image_mcp.bridge_utils import extract_media_urls, extract_video_urls, normalize_native_record
 from social_image_mcp.models import CreatorFetchRequest, Platform
@@ -17,6 +17,14 @@ _MEDIA_SPEC = importlib.util.spec_from_file_location(
 assert _MEDIA_SPEC and _MEDIA_SPEC.loader
 _MEDIA_MODULE = importlib.util.module_from_spec(_MEDIA_SPEC)
 _MEDIA_SPEC.loader.exec_module(_MEDIA_MODULE)
+
+_XHS_SPEC = importlib.util.spec_from_file_location(
+    "xhs_downloader_bridge",
+    Path(__file__).resolve().parents[1] / "scripts" / "xhs_downloader_bridge.py",
+)
+assert _XHS_SPEC and _XHS_SPEC.loader
+_XHS_MODULE = importlib.util.module_from_spec(_XHS_SPEC)
+_XHS_SPEC.loader.exec_module(_XHS_MODULE)
 
 
 def test_xhs_native_record_prefers_original_image_urls():
@@ -35,6 +43,34 @@ def test_xhs_native_record_prefers_original_image_urls():
     assert items[0]["author"] == "作者"
 
 
+def test_xhs_native_record_extracts_original_video_key():
+    record = {
+        "note_id": "video-1",
+        "type": "video",
+        "video": {"consumer": {"origin_video_key": "path/original.mp4"}},
+        "image_list": [{"url_default": "https://img.test/cover.jpg"}],
+    }
+
+    items = normalize_native_record("xhs", record, "media-crawler", media_type="videos")
+
+    assert len(items) == 1
+    assert items[0]["media_type"] == "video"
+    assert items[0]["image_url"] == "https://sns-video-bd.xhscdn.com/path/original.mp4"
+    assert items[0]["thumbnail_url"] == "https://img.test/cover.jpg"
+
+
+def test_xhs_video_fallback_selects_best_non_hdr_stream():
+    record = {
+        "type": "video",
+        "video": {"media": {"stream": {"h264": [
+            {"master_url": "https://video.test/720.mp4", "width": 1280, "height": 720, "video_bitrate": 800},
+            {"master_url": "https://video.test/1080.mp4", "width": 1920, "height": 1080, "video_bitrate": 1800},
+        ]}}},
+    }
+
+    assert extract_video_urls("xhs", record) == ["https://video.test/1080.mp4"]
+
+
 def test_douyin_native_record_extracts_gallery_and_cover():
     record = {
         "aweme_id": "42",
@@ -46,6 +82,18 @@ def test_douyin_native_record_extracts_gallery_and_cover():
 
     cover = {"aweme_id": "43", "video": {"raw_cover": {"url_list": ["https://img.test/cover.jpg"]}}}
     assert extract_media_urls("douyin", cover) == ["https://img.test/cover.jpg"]
+
+
+def test_douyin_video_uses_one_best_cover_instead_of_duplicate_variants():
+    record = {
+        "video": {
+            "raw_cover": {"url_list": ["https://img.test/raw.jpg"]},
+            "origin_cover": {"url_list": ["https://img.test/low.jpg"]},
+            "dynamic_cover": {"url_list": ["https://img.test/dynamic.jpg"]},
+        }
+    }
+
+    assert extract_media_urls("douyin", record) == ["https://img.test/raw.jpg"]
 
 
 def test_douyin_native_record_accepts_image_list_alias():
@@ -192,6 +240,20 @@ def test_media_bridge_missing_vendor_is_a_clear_error(tmp_path: Path):
     assert result.stdout == ""
 
 
+def test_media_bridge_douyin_capture_accepts_named_aweme_item(monkeypatch):
+    store = ModuleType("store")
+    douyin = ModuleType("store.douyin")
+    store.douyin = douyin
+    monkeypatch.setitem(sys.modules, "store", store)
+    monkeypatch.setitem(sys.modules, "store.douyin", douyin)
+    records = []
+
+    _MEDIA_MODULE._install_capture("douyin", records)
+    asyncio.run(douyin.update_douyin_aweme(aweme_item={"aweme_id": "42"}))
+
+    assert records == [{"aweme_id": "42"}]
+
+
 def test_media_bridge_uses_explicit_browser_in_native_cdp_mode(tmp_path: Path):
     browser = tmp_path / "msedge.exe"
     browser.write_bytes(b"")
@@ -219,3 +281,23 @@ def test_xhs_bridge_keyword_mode_is_empty_without_importing_vendor():
     assert result.returncode == 0
     assert result.stdout == ""
     assert result.stderr == ""
+
+
+def test_xhs_downloader_bridge_labels_video_download_urls():
+    items = _XHS_MODULE._normalize_results([{
+        "作品ID": "video-note",
+        "作品类型": "视频",
+        "作品标题": "测试视频",
+        "下载地址": ["https://sns-video-bd.xhscdn.com/test-video"],
+    }], "", "https://www.xiaohongshu.com/explore/video-note", 1)
+
+    assert items == [{
+        "id": "video-note",
+        "image_url": "https://sns-video-bd.xhscdn.com/test-video",
+        "media_type": "video",
+        "title": "测试视频",
+        "description": "",
+        "author": "",
+        "permalink": "https://www.xiaohongshu.com/explore/video-note",
+        "source": "xhs-downloader",
+    }]

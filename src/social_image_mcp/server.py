@@ -4,14 +4,16 @@ import argparse
 import json
 import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from .models import CreatorFetchRequest, DownloadRequest, Platform, SearchRequest
+from .models import CreatorFetchRequest, DownloadRequest, ImageCandidate, Platform, SearchRequest
 from .intent import parse_intent, requested_media_limit
 from .progress import report_progress
 from .service import SocialImageService
+from .storage import StorageAgent
 
 service = SocialImageService()
 
@@ -55,6 +57,7 @@ async def search_images(query: str, platforms: list[str] | None = None, max_resu
             max_images=image_limit or max_results, max_videos=video_limit,
             max_posts=max_posts,
             per_post_limit=per_post_limit, media_type=media_type,
+            include_video_covers=media_type == "images",
             content_query=content_query, filter_mode=filter_mode,
             quality_mode=quality_mode, download=download, output_dir=output_dir,
         ))
@@ -70,10 +73,32 @@ async def search_images(query: str, platforms: list[str] | None = None, max_resu
             max_images=image_limit or max_results, max_videos=video_limit,
             per_post_limit=per_post_limit, min_width=min_width, min_height=min_height,
             safe_mode=safe_mode, content_query=content_query, filter_mode=filter_mode,
-            quality_mode=quality_mode, media_type=media_type, download=download, output_dir=output_dir,
+            quality_mode=quality_mode, media_type=media_type,
+            include_video_covers=media_type == "images",
+            download=download, output_dir=output_dir,
         ))
     selected = [Platform(value) for value in platforms] if platforms else None
-    request = SearchRequest(query=query, platforms=selected, max_results=max_results, min_width=min_width, min_height=min_height, safe_mode=safe_mode, use_cache=use_cache, retrieval_mode=retrieval_mode, media_type=media_type, image_limit=image_limit, video_limit=video_limit, per_post_limit=per_post_limit, max_posts=max_posts)
+    image_target = (image_limit or max_results) if media_type != "videos" else 0
+    video_target = (video_limit or max_results) if media_type != "images" else 0
+    # Download completion is measured by successfully saved files, not by the
+    # number of URLs returned by a platform. Within max_posts, retain every
+    # candidate that can replace an expired, duplicate or rejected URL. Exact
+    # post URLs remain bounded to their fixed media set.
+    if download and intent.identifier_scope != "post":
+        images_per_post = per_post_limit or 10
+        candidate_image_limit = min(1000, max(image_target, max_posts * images_per_post)) if image_target else None
+        candidate_video_limit = min(1000, max(video_target, max_posts)) if video_target else None
+    else:
+        candidate_image_limit = image_target or None
+        candidate_video_limit = video_target or None
+    candidate_total = (candidate_image_limit or 0) + (candidate_video_limit or 0)
+    request = SearchRequest(
+        query=query, platforms=selected, max_results=max(1, candidate_total),
+        min_width=min_width, min_height=min_height, safe_mode=safe_mode,
+        use_cache=use_cache, retrieval_mode=retrieval_mode, media_type=media_type,
+        image_limit=candidate_image_limit, video_limit=candidate_video_limit,
+        per_post_limit=per_post_limit, max_posts=max_posts,
+    )
     report_progress("retrieving", "正在检索平台内容；若来源支持分页，程序会自动继续读取后续页面。")
     result = await service.search(request)
     items = result.get("items") or []
@@ -86,17 +111,89 @@ async def search_images(query: str, platforms: list[str] | None = None, max_resu
         posts_fetched=int(result.get("posts_fetched") or 0),
     )
     if download and result["items"]:
-        download_request = DownloadRequest(items=result["items"], output_dir=output_dir, min_width=min_width, min_height=min_height)
-        report_progress("downloading", f"正在下载 {len(download_request.items)} 个媒体文件。", download_total=len(download_request.items))
-        records = await service.download(download_request.items, download_request.output_dir, download_request.max_concurrency, download_request.min_width, download_request.min_height)
+        candidates = [ImageCandidate.model_validate(item) for item in result["items"]]
+        records = []
+        attempted: list[ImageCandidate] = []
+        targets = {"image": image_target, "video": video_target}
+        batch_sizes = {
+            "image": max(1, int(getattr(service.settings, "image_download_batch_size", 10))),
+            "video": max(1, int(service.settings.video_download_batch_size)),
+        }
+        storage_root = output_dir or getattr(service.settings, "output_dir", "downloads")
+        storage = StorageAgent(storage_root)
+        grouped: dict[tuple[str, str], list[ImageCandidate]] = {}
+        for item in candidates:
+            account_dir = storage.account_dir(
+                item.platform,
+                candidate=item,
+                query=query,
+                override=storage_root,
+            )
+            grouped.setdefault((item.platform.value, str(account_dir)), []).append(item)
+        records_by_group: dict[tuple[str, str], list[dict]] = {}
+        info_paths: list[str] = []
+        for (platform_name, account_dir_text), group in grouped.items():
+            successful = {"image": 0, "video": 0}
+            account_dir = Path(account_dir_text)
+            total_target = image_target + video_target
+            for kind in ("image", "video"):
+                pool = [item for item in group if item.media_type == kind]
+                cursor = 0
+                batch_number = 0
+                while successful[kind] < targets[kind] and cursor < len(pool):
+                    remaining = targets[kind] - successful[kind]
+                    batch_size = min(batch_sizes[kind], remaining)
+                    batch = pool[cursor:cursor + batch_size]
+                    cursor += len(batch)
+                    if not batch:
+                        break
+                    batch_number += 1
+                    attempted.extend(batch)
+                    media_name = "视频" if kind == "video" else "图片"
+                    report_progress(
+                        "downloading",
+                        f"{platform_name}/{account_dir.name}：正在下载第 {batch_number} 批{media_name}（本批 {len(batch)} 个）；完成后再处理下一批。",
+                        download_completed=len(records), download_total=total_target,
+                    )
+                    concurrency = (
+                        min(len(batch), max(1, int(service.settings.video_download_concurrency)))
+                        if kind == "video" else min(len(batch), max(1, int(getattr(service.settings, "image_download_concurrency", 3))))
+                    )
+                    batch_records = await service.download(
+                        batch, account_dir, concurrency, min_width, min_height,
+                        resume=True,
+                    )
+                    records.extend(batch_records)
+                    records_by_group.setdefault((platform_name, account_dir_text), []).extend(
+                        record.model_dump(mode="json") for record in batch_records
+                    )
+                    successful[kind] += sum(
+                        record.status in {"downloaded", "existing"}
+                        for record in batch_records
+                    )
+                    report_progress(
+                        "downloading",
+                        f"{platform_name}/{account_dir.name}：第 {batch_number} 批{media_name}已完成，当前有效 {successful[kind]}/{targets[kind]} 个。",
+                        download_completed=len(records), download_total=total_target,
+                    )
+            info_paths.append(str(storage.write_index(
+                account_dir, platform_name,
+                records=records_by_group.get((platform_name, account_dir_text), []),
+            )))
+        result["items"] = [item.model_dump(mode="json") for item in attempted]
         result["downloads"] = [record.model_dump(mode="json") for record in records]
-        result["output_dir"] = str(service.settings.ensure_output_dir(output_dir).resolve())
+        result["output_dirs"] = {
+            f"{platform}/{Path(path).name}": path
+            for platform, path in ((key[0], key[1]) for key in grouped)
+        }
+        result["info_paths"] = info_paths
+        result["output_dir"] = next(iter(result["output_dirs"].values()), str(Path(storage_root).resolve()))
         counts = {name: 0 for name in ("downloaded", "existing", "duplicate", "rejected", "failed")}
         for record in records:
             counts[record.status if record.status in counts else "failed"] += 1
         report_progress(
             "finalizing", "下载已完成，正在整理结果。",
-            download_completed=len(records), download_total=len(download_request.items), **counts,
+            download_completed=len(records), download_total=total_target, **counts,
         )
     else:
         report_progress("finalizing", "检索已完成，正在整理结果。")
@@ -126,8 +223,56 @@ async def fetch_creator_images(platform: str, creator_id: str | None = None, cre
 @mcp.tool(description="Download ranked image candidates returned by search_images. Performs retries, image validation, minimum-size filtering and content-hash deduplication.")
 async def download_images(items: list[dict[str, Any]], output_dir: str | None = None, max_concurrency: int = 5, min_width: int = 0, min_height: int = 0) -> dict[str, Any]:
     request = DownloadRequest(items=items, output_dir=output_dir, max_concurrency=max_concurrency, min_width=min_width, min_height=min_height)
-    records = await service.download(request.items, request.output_dir, request.max_concurrency, request.min_width, request.min_height)
-    return {"output_dir": str(service.settings.ensure_output_dir(request.output_dir).resolve()), "records": [record.model_dump(mode="json") for record in records]}
+    storage_root = request.output_dir or getattr(service.settings, "output_dir", "downloads")
+    storage = StorageAgent(storage_root)
+    batch_sizes = {
+        "image": max(1, int(getattr(service.settings, "image_download_batch_size", 10))),
+        "video": max(1, int(getattr(service.settings, "video_download_batch_size", 3))),
+    }
+    groups: dict[tuple[str, str], list[ImageCandidate]] = {}
+    for item in request.items:
+        account_dir = storage.account_dir(item.platform, candidate=item, override=storage_root)
+        groups.setdefault((item.platform.value, str(account_dir)), []).append(item)
+    records = []
+    info_paths = []
+    output_dirs = {}
+    for (platform_name, account_dir_text), group in groups.items():
+        account_dir = Path(account_dir_text)
+        group_records = []
+        for kind in ("image", "video"):
+            pool = [item for item in group if item.media_type == kind]
+            for offset in range(0, len(pool), batch_sizes[kind]):
+                batch = pool[offset:offset + batch_sizes[kind]]
+                concurrency = min(
+                    len(batch),
+                    max(1, int(getattr(service.settings, "video_download_concurrency", 1)))
+                    if kind == "video" else max(1, int(request.max_concurrency)),
+                )
+                report_progress(
+                    "downloading",
+                    f"{platform_name}/{account_dir.name}：正在下载第 {offset // batch_sizes[kind] + 1} 批{'视频' if kind == 'video' else '图片'}（本批 {len(batch)} 个）。",
+                )
+                batch_records = await service.download(
+                    batch, account_dir, concurrency, request.min_width, request.min_height,
+                    resume=True,
+                )
+                group_records.extend(batch_records)
+                records.extend(batch_records)
+        report_progress(
+            "downloading",
+            f"{platform_name}/{account_dir.name}：下载完成，共处理 {len(group_records)} 个文件。",
+        )
+        info_paths.append(str(storage.write_index(
+            account_dir, platform_name,
+            records=[record.model_dump(mode="json") for record in group_records],
+        )))
+        output_dirs[f"{platform_name}/{account_dir.name}"] = str(account_dir)
+    return {
+        "output_dir": next(iter(output_dirs.values()), str(Path(storage_root).resolve())),
+        "output_dirs": output_dirs,
+        "info_paths": info_paths,
+        "records": [record.model_dump(mode="json") for record in records],
+    }
 
 
 @mcp.tool(description="Inspect a single platform item by ID and return its image candidates.")

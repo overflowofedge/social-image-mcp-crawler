@@ -150,7 +150,10 @@ class ImageDownloader:
         output_dir.mkdir(parents=True, exist_ok=True)
         semaphore = asyncio.Semaphore(max_concurrency)
         seen_hashes: dict[tuple[str, str], set[str]] = {}
-        seen_perceptual: dict[tuple[str, str], list[int]] = {}
+        # Keep the work id beside each perceptual hash.  A carousel/gallery
+        # is allowed to contain visually similar frames; perceptual
+        # de-duplication is only meaningful across different works.
+        seen_perceptual: dict[tuple[str, str], list[tuple[int, str]]] = {}
         lock = asyncio.Lock()
         manifest = output_dir / "manifest.jsonl"
         existing: dict[tuple[str, str, str, int, str], DownloadRecord] = {}
@@ -170,7 +173,9 @@ class ImageDownloader:
                     scope = _record_scope(record)
                     seen_hashes.setdefault(scope, set()).add(record.sha256)
                     if record.perceptual_hash:
-                        seen_perceptual.setdefault(scope, []).append(int(record.perceptual_hash, 16))
+                        seen_perceptual.setdefault(scope, []).append(
+                            (int(record.perceptual_hash, 16), record.post_id or record.candidate_id)
+                        )
                 except (ValueError, OSError):
                     continue
 
@@ -198,7 +203,7 @@ class ImageDownloader:
         records = await asyncio.gather(*(one(item) for item in items))
         return records
 
-    async def _download_one(self, item: ImageCandidate, output_dir: Path, seen_hashes: dict[tuple[str, str], set[str]], seen_perceptual: dict[tuple[str, str], list[int]], lock: asyncio.Lock, min_width: int, min_height: int) -> DownloadRecord:
+    async def _download_one(self, item: ImageCandidate, output_dir: Path, seen_hashes: dict[tuple[str, str], set[str]], seen_perceptual: dict[tuple[str, str], list[tuple[int, str]]], lock: asyncio.Lock, min_width: int, min_height: int) -> DownloadRecord:
         try:
             headers = {"User-Agent": "Mozilla/5.0 (social-image-mcp)"}
             if item.platform.value == "x":
@@ -250,7 +255,17 @@ class ImageDownloader:
             async with lock:
                 hashes = seen_hashes.setdefault(scope, set())
                 perceptuals = seen_perceptual.setdefault(scope, [])
-                if digest in hashes or any(_hash_distance(perceptual, previous) <= 5 for previous in perceptuals):
+                work_id = item.post_id or item.id
+                # Exact bytes are duplicates regardless of origin.  Similar
+                # pixels, however, must not collapse separate media in the
+                # same post (Instagram carousels commonly reuse a layout or
+                # background across slides).
+                near_duplicate = any(
+                    _hash_distance(perceptual, previous_hash) <= 5
+                    and previous_work != work_id
+                    for previous_hash, previous_work in perceptuals
+                )
+                if digest in hashes or near_duplicate:
                     return DownloadRecord(candidate_id=item.id, platform=item.platform, image_url=item.image_url, sha256=digest, width=width, height=height, status="duplicate")
                 filename = _filename(item, extension)
                 path = _unique_path(_media_dir(output_dir, item) / filename)
@@ -258,7 +273,7 @@ class ImageDownloader:
                 temporary.write_bytes(content)
                 temporary.replace(path)
                 hashes.add(digest)
-                perceptuals.append(perceptual)
+                perceptuals.append((perceptual, work_id))
             return DownloadRecord(candidate_id=item.id, platform=item.platform, image_url=item.image_url, path=str(path.resolve()), sha256=digest, perceptual_hash=format(perceptual, "x"), width=width, height=height, content_type=response.headers.get("content-type"), status="downloaded")
         except Exception as exc:  # Keep one bad platform item from cancelling the batch.
             return DownloadRecord(candidate_id=item.id, platform=item.platform, image_url=item.image_url, media_type=item.media_type, status="failed", error=str(exc))
@@ -327,38 +342,58 @@ class ImageDownloader:
     ) -> DownloadRecord:
         """Stream a self-contained video file without loading it into memory."""
         last_error = ""
+        temporary: Path | None = None
+        path: Path | None = None
+        content_type = ""
         for attempt in range(3):
-            temporary: Path | None = None
             try:
+                offset = temporary.stat().st_size if temporary and temporary.exists() else 0
+                request_headers = {**headers, "Accept-Encoding": "identity"}
+                if offset:
+                    request_headers["Range"] = f"bytes={offset}-"
                 async with self.client.stream(
-                    "GET", item.image_url, headers=headers, follow_redirects=True,
+                    "GET", item.image_url, headers=request_headers, follow_redirects=True,
                     timeout=httpx.Timeout(120.0, connect=10.0),
                 ) as response:
                     response.raise_for_status()
                     content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
-                    if content_type and not (content_type.startswith("video/") or content_type == "application/octet-stream"):
+                    accepted_video_type = (
+                        content_type.startswith("video/")
+                        or content_type in {"application/octet-stream", "application/mp4"}
+                        # Douyin play URLs are video candidates but some CDN
+                        # edges label the complete MP4 container as audio/mp4.
+                        or (item.platform.value == "douyin" and content_type == "audio/mp4")
+                    )
+                    if content_type and not accepted_video_type:
                         raise ValueError(f"not a video response: {content_type}")
-                    suffix = Path(urlparse(item.image_url).path).suffix.lower().lstrip(".")
-                    extension = {
-                        "video/mp4": "mp4", "video/webm": "webm", "video/x-matroska": "mkv",
-                        "video/quicktime": "mov", "video/ogg": "ogv", "video/x-m4v": "m4v",
-                    }.get(content_type, suffix if suffix in {"mp4", "webm", "mkv", "mov", "ogv", "ogg", "m4v"} else "mp4")
-                    async with lock:
-                        filename = _filename(item, extension)
-                        path = _unique_path(_media_dir(output_dir, item) / filename)
-                        temporary = path.with_suffix(path.suffix + ".part")
-                        temporary.touch(exist_ok=False)
-                    digest_builder = hashlib.sha256()
-                    size = 0
-                    with temporary.open("wb") as handle:
-                        async for chunk in response.aiter_bytes(1024 * 1024):
+                    if temporary is None:
+                        suffix = Path(urlparse(item.image_url).path).suffix.lower().lstrip(".")
+                        extension = {
+                            "video/mp4": "mp4", "video/webm": "webm", "video/x-matroska": "mkv",
+                            "video/quicktime": "mov", "video/ogg": "ogv", "video/x-m4v": "m4v",
+                        }.get(content_type, suffix if suffix in {"mp4", "webm", "mkv", "mov", "ogv", "ogg", "m4v"} else "mp4")
+                        async with lock:
+                            filename = _filename(item, extension)
+                            path = _unique_path(_media_dir(output_dir, item) / filename)
+                            temporary = path.with_suffix(path.suffix + ".part")
+                            temporary.touch(exist_ok=False)
+                    resumed = offset > 0 and response.status_code == 206
+                    if offset > 0 and not resumed:
+                        offset = 0
+                    mode = "ab" if resumed else "wb"
+                    size = offset
+                    with temporary.open(mode) as handle:
+                        async for chunk in response.aiter_bytes():
                             if not chunk:
                                 continue
                             handle.write(chunk)
-                            digest_builder.update(chunk)
                             size += len(chunk)
                     if size <= 0:
                         raise ValueError("empty video response")
+                    digest_builder = hashlib.sha256()
+                    with temporary.open("rb") as handle:
+                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                            digest_builder.update(chunk)
                     digest = digest_builder.hexdigest()
                     scope = _scope(item)
                     async with lock:
@@ -384,8 +419,6 @@ class ImageDownloader:
                     temporary.unlink(missing_ok=True)
                 raise
             except httpx.HTTPError as exc:
-                if temporary is not None:
-                    temporary.unlink(missing_ok=True)
                 last_error = str(exc)
                 if attempt < 2:
                     await asyncio.sleep(0.4 * (attempt + 1))
@@ -393,6 +426,8 @@ class ImageDownloader:
                 if temporary is not None:
                     temporary.unlink(missing_ok=True)
                 raise
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
         raise RuntimeError(last_error or "video request failed")
 
     async def _stream_track(

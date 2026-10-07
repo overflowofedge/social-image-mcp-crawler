@@ -21,6 +21,7 @@ from .models import ImageCandidate, Platform, SearchRequest
 _IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".bmp")
 _VIDEO_EXTENSIONS = (".mp4", ".webm", ".mov", ".m4v", ".ogv", ".ogg")
 _STREAM_EXTENSIONS = (".m3u8", ".mpd")
+_RESIZED_IMAGE = re.compile(r"-\d{2,5}x\d{2,5}(?=\.[^.]+$)", re.I)
 _UI = re.compile(
     r"(?:^|[\W_])(?:logo|icons?|favicon|avatar|sprite|emoji|placeholder|loading|loader|"
     r"spacer|pixel|tracking|qrcode|qr-code|telegram|wechat|close|lock|coin|share|"
@@ -45,6 +46,15 @@ def _url(base: str, value) -> str | None:
 
 def _path(url: str) -> str:
     return unquote(urlparse(url).path).lower()
+
+
+def _image_variant_key(url: str) -> str:
+    """Collapse common CMS thumbnail suffixes onto their original image."""
+    return _RESIZED_IMAGE.sub("", _path(url))
+
+
+def _is_resized_image(url: str) -> bool:
+    return bool(_RESIZED_IMAGE.search(_path(url)))
 
 
 def _srcset_urls(value: str) -> list[str]:
@@ -369,8 +379,18 @@ class WebPageAdapter(PlatformAdapter):
                 warnings.extend(rendered.warnings)
             except Exception:
                 warnings.append("动态页面读取未完成；请确认浏览器组件已安装，且页面可公开访问。")
-        # One level of content cards only; never recursively crawl navigation.
-        links = root.links[:request.max_posts]
+        # A concrete detail page can contain navigation cards (often with
+        # many unrelated thumbnails).  ``content_page`` identifies whether a
+        # media item belongs to the page itself or to one of those cards.  If
+        # the requested URL has its own content, keep the page scoped and do
+        # not let category/detail links replace it.  A homepage generally has
+        # only card items, so it still follows one bounded detail level.
+        page_items = [
+            item for item in root.items
+            if (item.source_payload.get("content_page") or page_url) == page_url
+        ]
+        direct_page = bool(page_items) and _path(page_url).strip("/") != ""
+        links = [] if direct_page else root.links[:request.max_posts]
         pages: dict[str, PageMedia] = {}
         semaphore = asyncio.Semaphore(4)
 
@@ -406,10 +426,28 @@ class WebPageAdapter(PlatformAdapter):
             if link in pages:
                 pool.extend(pages[link].items)
                 warnings.extend(pages[link].warnings)
-        pool.extend(root.items)
+        pool.extend(page_items if direct_page else root.items)
         image_limit = request.image_limit or request.max_results
         video_limit = request.video_limit or request.max_results
-        unique = list({item.image_url: item for item in reversed(pool)}.values())[::-1]
+        unique_by_url = {item.image_url: item for item in reversed(pool)}
+        unique = list(unique_by_url.values())[::-1]
+        # WordPress and similar CMSs expose the same asset as both an
+        # original and a ``-480x640`` card thumbnail. Prefer the original so
+        # a page's own gallery does not contain a second low-resolution copy.
+        variants: dict[tuple[str, str], ImageCandidate] = {}
+        for item in unique:
+            key = (
+                item.media_type,
+                _image_variant_key(item.image_url) if item.media_type == "image" else item.image_url,
+            )
+            previous = variants.get(key)
+            if previous is None or (
+                item.media_type == "image"
+                and _is_resized_image(previous.image_url)
+                and not _is_resized_image(item.image_url)
+            ):
+                variants[key] = item
+        unique = list(variants.values())
         images = [item for item in unique if item.media_type == "image"] if request.media_type != "videos" else []
         # Explicit links to originals must be considered before gallery
         # thumbnails, otherwise a short quota can omit every full-size image.

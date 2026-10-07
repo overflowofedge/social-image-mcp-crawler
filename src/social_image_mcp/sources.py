@@ -269,7 +269,7 @@ def _media_type(metadata: dict[str, Any], image_url: str) -> str:
     values = [
         metadata.get("media_type"), metadata.get("mimetype"), metadata.get("mime_type"),
         metadata.get("content_type"), metadata.get("extension"), metadata.get("ext"),
-        metadata.get("filename"), image_url,
+        metadata.get("filename"), metadata.get("video_url"), metadata.get("videoUrl"), image_url,
     ]
     text = " ".join(str(value or "").lower() for value in values)
     return "video" if any(marker in text for marker in ("video/", ".mp4", ".webm", ".mkv", " mp4", " webm")) else "image"
@@ -304,7 +304,7 @@ def _candidate(platform: Platform, record: Any, image_url: str, index: int, sour
         creator_id=str(_first(metadata, "creator_id", "creatorId", "author_id", "user_id") or "") or None,
         creator_name=str(_first(metadata, "creator_name", "creatorName", "author", "username") or author),
         post_id=post_id,
-        media_index=max(1, int(_number(_first(metadata, "media_index", "image_index", "imageIndex"), 1))),
+        media_index=max(1, int(_number(_first(metadata, "media_index", "image_index", "imageIndex", "num"), 1))),
         engagement_score=max(0.0, _number(_first(metadata, "engagement_score", "engagementScore"), 0)),
         source_payload={"source": source_name, "record": metadata},
     )
@@ -322,6 +322,10 @@ def normalize_source_output(platform: Platform, output: str, source_name: str, l
                 if record[0] != 3 or len(record) <= 1:
                     continue
                 image_urls = _urls(record[1])
+                if not image_urls and len(record) > 2 and isinstance(record[2], dict):
+                    # Instagram emits a ``ytdl:`` pseudo URL for videos and
+                    # keeps the signed CDN URL in metadata.video_url.
+                    image_urls = _urls(record[2].get("video_url") or record[2].get("videoUrl"))
             elif isinstance(record, dict) and record.get("image_url"):
                 # Normalized records carry a single media URL. The permalink
                 # and video thumbnail are metadata, not additional downloads.
@@ -557,9 +561,15 @@ class ExternalJsonSource:
             raise SourceError(f"{self.name} exited with code {process.returncode}: {detail}")
         candidates = normalize_source_output(platform, _decode_process_output(stdout), self.name, limit, request.media_type if request else None)
         if not candidates:
-            self._failed(platform, f"no image candidates returned for {platform.value}")
+            values = _json_values(_decode_process_output(stdout))
+            if any(isinstance(value, dict) and value.get("source_status") == "empty" for value in values):
+                # A valid empty page is content state, not source failure. It
+                # must not put the whole platform into a cooldown.
+                return []
+            media_label = {"images": "image", "videos": "video"}.get(request.media_type if request else "images", "media")
+            self._failed(platform, f"no {media_label} candidates returned for {platform.value}")
             raise SourceError(
-                f"{self.name} returned no image candidates for {platform.value}; "
+                f"{self.name} returned no {media_label} candidates for {platform.value}; "
                 "check login state, query, and source-project output"
             )
         self._succeeded(platform)
@@ -569,14 +579,22 @@ class ExternalJsonSource:
 class GalleryDlSource:
     """gallery-dl bridge for X/Instagram/Weibo URLs and search pages."""
 
-    def __init__(self, binary: str = "gallery-dl", config_path: str | None = None, timeout_seconds: int = 120, cookies_from_browser: str | None = None, failure_cooldown_seconds: int = 120, verification_store: SourceVerificationStore | None = None, cookies_file: str | None = None) -> None:
+    def __init__(self, binary: str = "gallery-dl", config_path: str | None = None, timeout_seconds: int = 120, cookies_from_browser: str | None = None, failure_cooldown_seconds: int = 120, verification_store: SourceVerificationStore | None = None, cookies_file: str | None = None, *, platform_cookies_from_browser: dict[Platform, str | None] | None = None, platform_cookie_files: dict[Platform, str | None] | None = None, name: str = "gallery-dl", platforms: tuple[Platform, ...] | None = None) -> None:
+        self.name = name
         self.binary = binary
         self.config_path = config_path
         self.timeout_seconds = timeout_seconds
         self.cookies_from_browser = cookies_from_browser
         self.cookies_file = str(Path(cookies_file).expanduser()) if cookies_file else None
+        self.platform_cookies_from_browser = {
+            platform: value for platform, value in (platform_cookies_from_browser or {}).items() if value
+        }
+        self.platform_cookie_files = {
+            platform: str(Path(value).expanduser())
+            for platform, value in (platform_cookie_files or {}).items() if value
+        }
         self.failure_cooldown_seconds = max(0, failure_cooldown_seconds)
-        self.platforms = (Platform.X, Platform.INSTAGRAM, Platform.WEIBO, Platform.XHS)
+        self.platforms = platforms or (Platform.X, Platform.INSTAGRAM, Platform.WEIBO, Platform.XHS)
         self._verified = False
         self._last_error: str | None = None
         self._verified_platforms: set[str] = set()
@@ -587,7 +605,7 @@ class GalleryDlSource:
     @property
     def status(self) -> SourceStatus:
         found = Path(self.binary).exists() or shutil.which(self.binary) is not None
-        platform_status = {platform.value: self._verification.status("gallery-dl", platform.value) for platform in self.platforms}
+        platform_status = {platform.value: self._verification.status(self.name, platform.value) for platform in self.platforms}
         verified_platforms = tuple(sorted(platform for platform, status in platform_status.items() if status["verified"]))
         ready_platforms = tuple(sorted(platform for platform, status in platform_status.items() if status["ready"]))
         latest_event = _latest_verification_event(platform_status)
@@ -598,11 +616,11 @@ class GalleryDlSource:
         elif latest_event and latest_event["result"] == "failure":
             detail = f"Last request failed: {latest_event['error']}"
         elif verified_platforms:
-            detail = "Last request completed successfully and returned images"
+            detail = "Last request completed successfully and returned media"
         else:
             detail = "gallery-dl is installed; account access is not verified until a real request"
         return SourceStatus(
-            "gallery-dl",
+            self.name,
             found,
             "native-cli" if found else "not-installed",
             detail,
@@ -620,7 +638,7 @@ class GalleryDlSource:
         self._last_error = detail
         if self.failure_cooldown_seconds:
             self._cooldown_until[platform.value] = time.monotonic() + self.failure_cooldown_seconds
-        self._verification.record_failure("gallery-dl", platform.value, detail)
+        self._verification.record_failure(self.name, platform.value, detail)
 
     def _succeeded(self, platform: Platform) -> None:
         self._verified_platforms.add(platform.value)
@@ -628,7 +646,7 @@ class GalleryDlSource:
         self._verified = True
         self._last_error = None
         self._cooldown_until.pop(platform.value, None)
-        self._verification.record_success("gallery-dl", platform.value)
+        self._verification.record_success(self.name, platform.value)
 
     def _check_cooldown(self, platform: Platform) -> None:
         until = self._cooldown_until.get(platform.value, 0.0)
@@ -638,7 +656,7 @@ class GalleryDlSource:
         remaining = max(1, int(until - time.monotonic()))
         detail = self._last_errors.get(platform.value, "previous request failed")
         raise SourceError(
-            f"gallery-dl temporarily skipped for {platform.value} for {remaining}s "
+            f"{self.name} temporarily skipped for {platform.value} for {remaining}s "
             f"after a previous failure: {detail}"
         )
 
@@ -705,7 +723,13 @@ class GalleryDlSource:
     def _command(self, platform: Platform, intent: Intent, limit: int) -> list[str]:
         binary = self.binary if Path(self.binary).exists() else shutil.which(self.binary) or self.binary
         command = [binary, "--dump-json", "--no-download", "-o", "output.jsonl=true", "--range", f"1-{max(1, limit)}"]
-        if self.cookies_file:
+        platform_file = self.platform_cookie_files.get(platform)
+        platform_browser = self.platform_cookies_from_browser.get(platform)
+        if platform_file:
+            command.extend(["--cookies", platform_file])
+        elif platform_browser:
+            command.extend(["--cookies-from-browser", platform_browser])
+        elif self.cookies_file:
             command.extend(["--cookies", self.cookies_file])
         elif self.cookies_from_browser:
             command.extend(["--cookies-from-browser", self.cookies_from_browser])
@@ -752,11 +776,13 @@ class GalleryDlSource:
         if error := _embedded_error(values):
             self._failed(platform, error)
             raise SourceError(f"gallery-dl {platform.value} request failed: {error}")
-        candidates = normalize_source_output(platform, output, "gallery-dl", limit, request.media_type if request else None)
+        requested_media_type = request.media_type if request else None
+        candidates = normalize_source_output(platform, output, self.name, limit, requested_media_type)
         if not candidates:
-            self._failed(platform, f"no images returned for {platform.value}")
+            media_label = {"images": "images", "videos": "videos"}.get(requested_media_type, "media")
+            self._failed(platform, f"no {media_label} returned for {platform.value}")
             raise SourceError(
-                f"gallery-dl returned no images for {platform.value}; "
+                f"gallery-dl returned no {media_label} for {platform.value}; "
                 "the URL may require an authenticated account or may not support search"
             )
         self._succeeded(platform)
@@ -836,83 +862,62 @@ class GalleryDlSource:
                 break
             if request.media_type == "all" and media_counts["image"] >= image_limit and media_counts["video"] >= video_limit:
                 break
-        identity = CreatorIdentity(platform=request.platform, requested_id=target, canonical_id=target, name=target, profile_url=profile_url, source="gallery-dl", matched_by="profile_url")
+        identity = CreatorIdentity(platform=request.platform, requested_id=target, canonical_id=target, name=target, profile_url=profile_url, source=self.name, matched_by="profile_url")
         return CreatorSourceResult(identity=identity, items=items, posts_fetched=len(post_ids), post_ids=tuple(post_ids), pages_fetched=1, next_cursor=None)
 
 
 class SourceHub:
-    def __init__(self, media_crawler_command: str | None, xhs_downloader_command: str | None, gallery_dl_binary: str, gallery_dl_config: str | None = None, timeout_seconds: int = 120, douyin_source_command: str | None = None, douyin_timeout_seconds: int = 45, gallery_dl_cookies_from_browser: str | None = None, failure_cooldown_seconds: int = 120, verification_path: str | None = None, verification_ttl_seconds: int = 86400, gallery_dl_cookies_file: str | None = None, douyin_media_crawler_fallback: bool = False, bilibili_source_command: str | None = None) -> None:
-        # Douyin is intentionally handled by dy-cli. MediaCrawler's Douyin
-        # browser-login path is not used when embedded in an MCP stdio server.
-        # MediaCrawler remains available as an opt-in Douyin creator fallback.
-        # The dy-cli bridge already has its own browser fallback, so invoking
-        # another browser stack by default only duplicates latency after a 403.
-        domestic = (Platform.XHS, Platform.WEIBO, Platform.DOUYIN)
+    def __init__(self, media_crawler_command: str | None, xhs_downloader_command: str | None, gallery_dl_binary: str, gallery_dl_config: str | None = None, timeout_seconds: int = 120, douyin_source_command: str | None = None, douyin_timeout_seconds: int = 45, gallery_dl_cookies_from_browser: str | None = None, failure_cooldown_seconds: int = 120, verification_path: str | None = None, verification_ttl_seconds: int = 86400, gallery_dl_cookies_file: str | None = None, bilibili_source_command: str | None = None, x_gallery_dl_cookies_from_browser: str | None = None, x_gallery_dl_cookies_file: str | None = None, instagram_gallery_dl_cookies_from_browser: str | None = None, instagram_gallery_dl_cookies_file: str | None = None) -> None:
         verification = SourceVerificationStore(verification_path, verification_ttl_seconds)
-        self.media_crawler = ExternalJsonSource("media-crawler", media_crawler_command, domestic, timeout_seconds, failure_cooldown_seconds, verification)
-        self.xhs_downloader = ExternalJsonSource("xhs-downloader", xhs_downloader_command, (Platform.XHS,), timeout_seconds, failure_cooldown_seconds, verification)
+        # Each platform owns exactly one source object. This isolates process
+        # failures, cookies, cooldowns and verification state, even where two
+        # platforms happen to use the same underlying CLI executable.
+        self.weibo_source = ExternalJsonSource("weibo-cli", media_crawler_command, (Platform.WEIBO,), timeout_seconds, failure_cooldown_seconds, verification)
+        self.xhs_source = ExternalJsonSource("xhs-cli", xhs_downloader_command, (Platform.XHS,), timeout_seconds, failure_cooldown_seconds, verification)
         self.douyin_source = ExternalJsonSource("dy-cli", douyin_source_command, (Platform.DOUYIN,), douyin_timeout_seconds, failure_cooldown_seconds, verification)
         self.bilibili_source = ExternalJsonSource("bilibili-cli", bilibili_source_command, (Platform.BILIBILI,), timeout_seconds, failure_cooldown_seconds, verification)
-        self.douyin_media_crawler_fallback = douyin_media_crawler_fallback
-        self.gallery_dl = GalleryDlSource(gallery_dl_binary, gallery_dl_config, timeout_seconds, gallery_dl_cookies_from_browser, failure_cooldown_seconds, verification, gallery_dl_cookies_file)
+        self.x_source = GalleryDlSource(
+            gallery_dl_binary,
+            gallery_dl_config,
+            timeout_seconds,
+            x_gallery_dl_cookies_from_browser or gallery_dl_cookies_from_browser,
+            failure_cooldown_seconds,
+            verification,
+            x_gallery_dl_cookies_file or gallery_dl_cookies_file,
+            name="x-cli",
+            platforms=(Platform.X,),
+        )
+        self.instagram_source = GalleryDlSource(
+            gallery_dl_binary,
+            gallery_dl_config,
+            timeout_seconds,
+            instagram_gallery_dl_cookies_from_browser or gallery_dl_cookies_from_browser,
+            failure_cooldown_seconds,
+            verification,
+            instagram_gallery_dl_cookies_file or gallery_dl_cookies_file,
+            name="instagram-cli",
+            platforms=(Platform.INSTAGRAM,),
+        )
+        self._platform_sources = {
+            Platform.DOUYIN: self.douyin_source,
+            Platform.WEIBO: self.weibo_source,
+            Platform.X: self.x_source,
+            Platform.INSTAGRAM: self.instagram_source,
+            Platform.XHS: self.xhs_source,
+            Platform.BILIBILI: self.bilibili_source,
+        }
 
     def statuses(self) -> list[dict[str, Any]]:
-        return [{"name": status.name, "configured": status.configured, "verified": status.verified, "verified_platforms": list(status.verified_platforms), "ready_platforms": list(status.ready_platforms), "mode": status.mode, "detail": status.detail, "platforms": list(status.platforms), "platform_status": status.platform_status or {}} for status in (self.douyin_source.status, self.bilibili_source.status, self.media_crawler.status, self.xhs_downloader.status, self.gallery_dl.status)]
+        return [{"name": status.name, "configured": status.configured, "verified": status.verified, "verified_platforms": list(status.verified_platforms), "ready_platforms": list(status.ready_platforms), "mode": status.mode, "detail": status.detail, "platforms": list(status.platforms), "platform_status": status.platform_status or {}} for status in (self.douyin_source.status, self.weibo_source.status, self.x_source.status, self.instagram_source.status, self.xhs_source.status, self.bilibili_source.status)]
 
     async def fetch_creator(self, request: CreatorFetchRequest) -> CreatorSourceResult:
-        if request.platform == Platform.DOUYIN:
-            errors: list[str] = []
-            if self.douyin_source.command_template:
-                try:
-                    return await self.douyin_source.fetch_creator(request)
-                except (SourceError, SourceUnavailable) as exc:
-                    errors.append(f"dy-cli: {exc}")
-            if self.media_crawler.command_template and (self.douyin_media_crawler_fallback or not self.douyin_source.command_template):
-                try:
-                    return await self.media_crawler.fetch_creator(request)
-                except (SourceError, SourceUnavailable) as exc:
-                    errors.append(f"media-crawler: {exc}")
-            raise SourceError("; ".join(errors) or "No creator source configured for douyin")
-        if request.platform == Platform.BILIBILI and self.bilibili_source.command_template:
-            return await self.bilibili_source.fetch_creator(request)
-        if request.platform == Platform.WEIBO:
-            return await self.media_crawler.fetch_creator(request)
-        if request.platform == Platform.BILIBILI:
-            raise SourceUnavailable("Bilibili creator retrieval uses the native public API")
-        if request.platform in (Platform.X, Platform.INSTAGRAM, Platform.XHS):
-            return await self.gallery_dl.fetch_creator(request)
-        raise SourceUnavailable("creator retrieval currently supports only douyin and weibo")
+        source = self._platform_sources.get(request.platform)
+        if source is None or not source.status.configured:
+            raise SourceUnavailable(f"No dedicated CLI configured for {request.platform.value}")
+        return await source.fetch_creator(request)
 
     async def search(self, platform: Platform, intent: Intent, limit: int, *, request: SearchRequest | None = None) -> list[ImageCandidate]:
-        sources: list[Any] = []
-        if platform == Platform.DOUYIN and self.douyin_source.command_template:
-            sources.append(self.douyin_source)
-        if (
-            platform in self.media_crawler.platforms
-            and self.media_crawler.command_template
-            and not (
-                platform == Platform.DOUYIN
-                and self.douyin_source.command_template
-                and limit <= 50
-            )
-        ):
-            sources.append(self.media_crawler)
-        if platform == Platform.XHS and self.xhs_downloader.command_template and (intent.url or intent.identifier):
-            sources.append(self.xhs_downloader)
-        if platform == Platform.BILIBILI and self.bilibili_source.command_template:
-            sources.append(self.bilibili_source)
-        if platform in self.gallery_dl.platforms and self.gallery_dl.status.configured and (platform != Platform.WEIBO or intent.url or intent.identifier):
-            sources.append(self.gallery_dl)
-        if not sources:
-            raise SourceUnavailable(f"No recommended source configured for {platform.value}; configure MediaCrawler/XHS-Downloader/gallery-dl")
-        results = await asyncio.gather(*(source.search(platform, intent, limit, request=request) for source in sources), return_exceptions=True)
-        candidates: list[ImageCandidate] = []
-        errors: list[str] = []
-        for result in results:
-            if isinstance(result, Exception):
-                errors.append(str(result))
-            else:
-                candidates.extend(result)
-        if not candidates and errors:
-            raise SourceError("; ".join(errors))
-        return candidates
+        source = self._platform_sources.get(platform)
+        if source is None or not source.status.configured:
+            raise SourceUnavailable(f"No dedicated CLI configured for {platform.value}")
+        return await source.search(platform, intent, limit, request=request)

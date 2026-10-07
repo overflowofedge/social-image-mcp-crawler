@@ -159,12 +159,66 @@ def _exact_record(records: list[dict[str, Any]], item_id: str) -> dict[str, Any]
     return None
 
 
-def _raise_for_empty_search(payload: dict[str, Any]) -> None:
+def _raise_for_empty_search(payload: dict[str, Any], media_type: str = "images") -> None:
     nil_info = payload.get("search_nil_info") or {}
     nil_type = nil_info.get("search_nil_type") if isinstance(nil_info, dict) else None
     if nil_type == "verify_check":
         raise RuntimeError("抖音触发 verify_check，本次请求未获得候选；请稍后重试或先使用作品 URL/ID")
-    raise RuntimeError("抖音搜索成功但没有返回图文候选；请更换关键词或稍后重试")
+
+
+def _search_galleries(client: Any, query: str, media_type: str, limit: int, max_posts: int | None = None) -> tuple[dict[str, Any], list[list[dict[str, Any]]]]:
+    """Page one authenticated session until quota or the post budget is exhausted."""
+    search_types = {
+        "images": ("atlas", "general"),
+        "videos": ("general", "video"),
+        "all": ("general", "atlas", "video"),
+    }.get(media_type, ("general",))
+    attempts: list[dict[str, Any]] = []
+    galleries: list[list[dict[str, Any]]] = []
+    seen_posts: set[str] = set()
+    post_budget = max(1, min(max_posts or limit, 500))
+    page_size = min(10, post_budget)
+    last_payload: dict[str, Any] = {}
+    for offset in range(0, post_budget, page_size):
+        page_had_records = False
+        for search_type in search_types:
+            count = min(page_size, post_budget - offset)
+            payload = client.search(query, search_type=search_type, count=count, offset=offset)
+            last_payload = payload
+            attempts.append(payload)
+            records = _records(payload)
+            page_had_records = page_had_records or bool(records)
+            page_galleries: list[list[dict[str, Any]]] = []
+            for record in records:
+                post_id = str(record.get("aweme_id") or record.get("awemeId") or record.get("id") or "")
+                if post_id and post_id in seen_posts:
+                    continue
+                normalized = normalize_native_record(
+                    "douyin", record, "dy-cli", media_type=media_type,
+                    include_video_covers=media_type == "images",
+                )
+                if normalized:
+                    page_galleries.append(normalized)
+                    if post_id:
+                        seen_posts.add(post_id)
+            if page_galleries:
+                galleries.extend(page_galleries)
+                break
+        if sum(len(gallery) for gallery in galleries) >= limit:
+            break
+        if not page_had_records:
+            break
+        if offset + page_size < post_budget:
+            time.sleep(max(0.1, float(os.getenv("DOUYIN_SEARCH_SLEEP_SECONDS", "0.5"))))
+
+    verification = next((
+        value for value in attempts
+        if isinstance(value.get("search_nil_info"), dict)
+        and value["search_nil_info"].get("search_nil_type") == "verify_check"
+    ), None)
+    if verification and not galleries:
+        _raise_for_empty_search(verification, media_type)
+    return last_payload, galleries
 
 
 def _fetch_creator(client: Any, request: CreatorFetchRequest) -> dict[str, Any]:
@@ -215,6 +269,7 @@ def _creator_items_from_profile_share(client: Any, url: str, limit: int, account
         max_videos=search_request.video_limit if search_request else None,
         per_post_limit=search_request.per_post_limit if search_request else None,
         media_type=search_request.media_type if search_request else "images",
+        include_video_covers=(search_request.media_type == "images") if search_request else True,
         download=False,
     )
     result = _fetch_creator_with_fallback(client, request, account)
@@ -508,16 +563,18 @@ async def _fetch_creator_via_browser(request: CreatorFetchRequest, account: str 
 
 
 def _fetch_creator_with_fallback(client: Any, request: CreatorFetchRequest, account: str | None = None) -> dict[str, Any]:
-    """Use dy-cli first, then let the logged-in web app collect its own API responses."""
+    """Use dy-cli's native API route; optional browser capture is explicit."""
     http_error: Exception | None = None
     try:
         return _fetch_creator(client, request)
     except Exception as exc:
         http_error = exc
 
-    # The browser route is intentionally attempted after the native client. It
-    # is slower, but can still work when the API client's manually signed
-    # request is rejected with 403 or a stale web signature.
+    if os.getenv("DOUYIN_BROWSER_FALLBACK", "false").lower() not in {"1", "true", "yes"}:
+        raise RuntimeError(f"dy-cli native creator route failed: {http_error}") from http_error
+
+    # Browser response capture is slower and starts a second browser. Keep it
+    # available for explicit diagnostics, never as a silent production route.
     try:
         result = asyncio.get_event_loop().run_until_complete(_fetch_creator_via_browser(request, account))
         if http_error and result.get("warnings") is None:
@@ -630,24 +687,13 @@ def _sync_fetch(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, An
 
         if not args.query.strip():
             raise RuntimeError("关键词不能为空；请传入 --query 或 --item-id/--url")
-        # Prefer atlas (image-text) search, but Douyin may return
-        # ``verify_check`` or an empty atlas page while ordinary search still
-        # works.  Falling back to general search lets us return video covers
-        # and any image-text records instead of reporting a misleading zero.
-        payload = client.search(args.query, search_type="atlas" if media_type == "images" else "general", count=max(1, min(args.limit, 50)))
-        galleries = [normalize_native_record("douyin", record, "dy-cli", media_type=media_type, include_video_covers=media_type == "images") for record in _records(payload)]
-        galleries = [gallery for gallery in galleries if gallery]
-        if not galleries:
-            fallback = client.search(args.query, search_type="general", count=max(1, min(args.limit, 50)))
-            fallback_galleries = [normalize_native_record("douyin", record, "dy-cli", media_type=media_type, include_video_covers=media_type == "images") for record in _records(fallback)]
-            fallback_galleries = [gallery for gallery in fallback_galleries if gallery]
-            if fallback_galleries:
-                payload = fallback
-                galleries = fallback_galleries
-            else:
-                # Report the more useful verification error if both routes
-                # failed; otherwise retain the native empty-search message.
-                _raise_for_empty_search(payload if payload.get("search_nil_info") else fallback)
+        # The dedicated atlas/video endpoints can be empty or challenged while
+        # the general endpoint still works (and vice versa). Keep each media
+        # type on its own bounded fallback sequence.
+        payload, galleries = _search_galleries(
+            client, args.query, media_type, args.limit,
+            max_posts=search_request.max_posts if search_request else args.limit,
+        )
 
         # Round-robin preserves post diversity before adding extra frames from
         # large galleries, giving the reranker meaningfully different choices.
@@ -673,26 +719,39 @@ def _sync_fetch(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, An
         client.close()
         try:
             loop.run_until_complete(close_sign_page())
+            # Playwright closes its Windows subprocess transports on the next
+            # event-loop turn. Let that cleanup finish before closing the loop.
+            loop.run_until_complete(asyncio.sleep(0.05))
+            loop.run_until_complete(loop.shutdown_asyncgens())
         except Exception:
             pass
         asyncio.set_event_loop(None)
         loop.close()
 
 
-async def _run(args: argparse.Namespace) -> list[dict[str, Any]]:
-    return await asyncio.to_thread(_sync_fetch, args)
-
-
 def main() -> int:
     _configure_stdio()
     args = _parser().parse_args()
     try:
-        result = asyncio.run(_run(args))
+        # _sync_fetch owns one event loop for dy-cli's signer. Running it in
+        # the process main thread lets Playwright close all Windows transports
+        # before interpreter shutdown.
+        result = _sync_fetch(args)
     except Exception as exc:
         print(f"dy-cli bridge failed: {exc}", file=sys.stderr)
         return 2
     if isinstance(result, dict):
         print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+        return 0
+    if not result:
+        media_type = "images"
+        try:
+            request_payload = json.loads(os.getenv("SOCIAL_IMAGE_SEARCH_REQUEST") or "{}")
+            if request_payload.get("media_type") in {"images", "videos", "all"}:
+                media_type = request_payload["media_type"]
+        except (json.JSONDecodeError, AttributeError):
+            pass
+        print(json.dumps({"source_status": "empty", "media_type": media_type}, ensure_ascii=False, separators=(",", ":")))
         return 0
     for item in result:
         print(json.dumps(item, ensure_ascii=False, separators=(",", ":")))

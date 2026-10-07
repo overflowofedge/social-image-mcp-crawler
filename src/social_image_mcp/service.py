@@ -57,7 +57,19 @@ class SocialImageService:
             label_map=getattr(self.settings, "object_label_map", None),
             vision=self.vision,
         )
-        self.sources = SourceHub(self.settings.media_crawler_command, self.settings.xhs_downloader_command, self.settings.gallery_dl_binary, self.settings.gallery_dl_config, self.settings.source_timeout_seconds, self.settings.douyin_source_command, self.settings.douyin_source_timeout_seconds, self.settings.gallery_dl_cookies_from_browser, self.settings.source_failure_cooldown_seconds, self.settings.source_verification_path, self.settings.source_verification_ttl_seconds, self.settings.gallery_dl_cookies_file, getattr(self.settings, "douyin_media_crawler_fallback", False), getattr(self.settings, "bilibili_source_command", None))
+        self.sources = SourceHub(
+            self.settings.media_crawler_command, self.settings.xhs_downloader_command,
+            self.settings.gallery_dl_binary, self.settings.gallery_dl_config,
+            self.settings.source_timeout_seconds, self.settings.douyin_source_command,
+            self.settings.douyin_source_timeout_seconds, self.settings.gallery_dl_cookies_from_browser,
+            self.settings.source_failure_cooldown_seconds, self.settings.source_verification_path,
+            self.settings.source_verification_ttl_seconds, self.settings.gallery_dl_cookies_file,
+            getattr(self.settings, "bilibili_source_command", None),
+            getattr(self.settings, "x_gallery_dl_cookies_from_browser", None),
+            getattr(self.settings, "x_gallery_dl_cookies_file", None),
+            getattr(self.settings, "instagram_gallery_dl_cookies_from_browser", None),
+            getattr(self.settings, "instagram_gallery_dl_cookies_file", None),
+        )
         self.creators = CreatorImageService(
             self.settings, self.sources, self.downloader, self.reranker, self.vision, self.object_detector,
             bilibili=getattr(self.adapters.get(Platform.BILIBILI), "api", None),
@@ -83,13 +95,17 @@ class SocialImageService:
             return await self.fetch_creator(CreatorFetchRequest(
                 platform=Platform(intent.identifier_platform), creator_id=intent.identifier,
                 max_images=request.max_results, min_width=request.min_width, min_height=request.min_height,
-                safe_mode=request.safe_mode, download=False,
+                safe_mode=request.safe_mode, media_type=request.media_type,
+                max_videos=request.video_limit, max_posts=request.max_posts,
+                include_video_covers=request.media_type == "images", download=False,
             ))
         if intent.identifier_scope == "creator_name" and not webpage:
             return await self.fetch_creator(CreatorFetchRequest(
                 platform=Platform(intent.identifier_platform), creator_name=intent.identifier,
                 max_images=request.max_results, min_width=request.min_width, min_height=request.min_height,
-                safe_mode=request.safe_mode, download=False,
+                safe_mode=request.safe_mode, media_type=request.media_type,
+                max_videos=request.video_limit, max_posts=request.max_posts,
+                include_video_covers=request.media_type == "images", download=False,
             ))
         if intent.is_keyword:
             self.vision.start_loading()
@@ -142,7 +158,10 @@ class SocialImageService:
         platforms = self._target_platforms(request, intent.identifier_platform)
         # Bump the namespace when relevance rules change so old low-quality
         # keyword results are never served from the persistent cache.
-        namespace = "search-v5-web-originals" if platforms == [Platform.OTHER] else "search-v5-source-media"
+        # Webpage extraction now scopes direct URLs to their own content and
+        # removes CMS thumbnail variants.  Bump only the web namespace so a
+        # previously cached cross-page result cannot be served after upgrade.
+        namespace = "search-v6-web-page-scope" if platforms == [Platform.OTHER] else "search-v5-source-media"
         key = self.cache.key(namespace, request.model_dump(mode="json"), intent.normalized) if request.use_cache else None
         if key and (cached := self.cache.get(key)) is not None:
             return await self._refresh_cached_status(cached, platforms, request, key)
@@ -184,43 +203,8 @@ class SocialImageService:
             if request.retrieval_mode in ("discovery", "hybrid"):
                 await collect("discovery", self.discovery.search(platform, intent, requested_total * 2))
             if request.retrieval_mode in ("sources", "hybrid"):
-                if platform == Platform.BILIBILI:
-                    # Bilibili uses the same isolated JSON CLI contract as
-                    # the other domestic platforms. The native API remains a
-                    # bounded fallback when no CLI has been installed.
-                    await collect("sources", self.sources.search(platform, intent, source_limit, request=request))
-                    if not candidates:
-                        await collect(
-                            "platform",
-                            adapter.search(
-                                intent,
-                                requested_total * 2,
-                                request.safe_mode,
-                                request.media_type,
-                                image_limit=request.image_limit,
-                                video_limit=request.video_limit,
-                            ),
-                        )
-                elif platform == Platform.WEIBO:
-                    media_crawler = getattr(self.sources, "media_crawler", None)
-                    if platform == Platform.WEIBO and getattr(media_crawler, "command_template", None):
-                        # Prefer an already configured authenticated source;
-                        # the public mobile endpoint is frequently rate limited.
-                        await collect("sources", self.sources.search(platform, intent, source_limit, request=request))
-                        if not candidates:
-                            await collect("platform", adapter.search(intent, requested_total * 2, request.safe_mode))
-                    else:
-                        # Bilibili's bounded public API is the recommended source.
-                        await collect("platform", adapter.search(intent, requested_total * 2, request.safe_mode))
-                else:
-                    await collect("sources", self.sources.search(platform, intent, source_limit, request=request))
-                if platform not in (Platform.BILIBILI, Platform.WEIBO) and request.retrieval_mode == "sources" and getattr(adapter.status, "mode", "") == "browser-fallback":
-                    await collect("browser", adapter.search(intent, requested_total, request.safe_mode))
+                await collect("sources", self.sources.search(platform, intent, source_limit, request=request))
             if request.retrieval_mode == "platform" or (request.retrieval_mode == "hybrid" and platform not in (Platform.BILIBILI, Platform.WEIBO)):
-                await collect("platform", adapter.search(intent, requested_total, request.safe_mode))
-            elif request.retrieval_mode == "sources" and platform in (Platform.X, Platform.INSTAGRAM) and adapter.status.configured and not candidates:
-                # Official X/Instagram APIs are a usable download source when
-                # the user supplied a token, even if gallery-dl is not set up.
                 await collect("platform", adapter.search(intent, requested_total, request.safe_mode))
 
             # In hybrid mode, preserve useful candidates and expose partial
@@ -499,9 +483,12 @@ class SocialImageService:
             self.cache.clear()
         return {"recorded": True, "query": query, "platform": platform.value, "candidate_id": candidate_id, "accepted": accepted}
 
-    async def download(self, items: list[ImageCandidate], output_dir: str | None, max_concurrency: int, min_width: int, min_height: int) -> list[DownloadRecord]:
+    async def download(self, items: list[ImageCandidate], output_dir: str | None, max_concurrency: int, min_width: int, min_height: int, *, resume: bool = False) -> list[DownloadRecord]:
         await self.start()
-        return await self.downloader.download_many(items, self.settings.ensure_output_dir(output_dir), max_concurrency, min_width, min_height)
+        return await self.downloader.download_many(
+            items, self.settings.ensure_output_dir(output_dir), max_concurrency,
+            min_width, min_height, resume=resume,
+        )
 
     def statuses(self) -> list[dict]:
         """Return the effective availability of every platform.
@@ -580,7 +567,19 @@ class SocialImageService:
 
     def source_statuses(self) -> list[dict]:
         if self.sources is None:
-            self.sources = SourceHub(self.settings.media_crawler_command, self.settings.xhs_downloader_command, self.settings.gallery_dl_binary, self.settings.gallery_dl_config, self.settings.source_timeout_seconds, self.settings.douyin_source_command, self.settings.douyin_source_timeout_seconds, self.settings.gallery_dl_cookies_from_browser, self.settings.source_failure_cooldown_seconds, self.settings.source_verification_path, self.settings.source_verification_ttl_seconds, self.settings.gallery_dl_cookies_file, getattr(self.settings, "douyin_media_crawler_fallback", False), getattr(self.settings, "bilibili_source_command", None))
+            self.sources = SourceHub(
+                self.settings.media_crawler_command, self.settings.xhs_downloader_command,
+                self.settings.gallery_dl_binary, self.settings.gallery_dl_config,
+                self.settings.source_timeout_seconds, self.settings.douyin_source_command,
+                self.settings.douyin_source_timeout_seconds, self.settings.gallery_dl_cookies_from_browser,
+                self.settings.source_failure_cooldown_seconds, self.settings.source_verification_path,
+                self.settings.source_verification_ttl_seconds, self.settings.gallery_dl_cookies_file,
+                getattr(self.settings, "bilibili_source_command", None),
+                getattr(self.settings, "x_gallery_dl_cookies_from_browser", None),
+                getattr(self.settings, "x_gallery_dl_cookies_file", None),
+                getattr(self.settings, "instagram_gallery_dl_cookies_from_browser", None),
+                getattr(self.settings, "instagram_gallery_dl_cookies_file", None),
+            )
         return self.sources.statuses()
 
 

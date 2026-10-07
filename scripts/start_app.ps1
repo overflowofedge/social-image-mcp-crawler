@@ -20,6 +20,7 @@ $env:DOUYIN_SOURCE_COMMAND = ('"{0}" "{1}" --query "{{query}}" --item-id "{{item
 $env:XHS_DOWNLOADER_COMMAND = ('"{0}" "{1}" --query "{{query}}" --item-id "{{item_id}}" --url "{{url}}" --limit {{limit}}' -f $python, (Join-Path $ProjectRoot "scripts\xhs_downloader_bridge.py"))
 $env:BILIBILI_SOURCE_COMMAND = ('"{0}" "{1}" --query "{{query}}" --item-id "{{item_id}}" --url "{{url}}" --limit {{limit}}' -f $python, (Join-Path $ProjectRoot "scripts\bilibili_cli_bridge.py"))
 $env:MEDIA_CRAWLER_ROOT = Join-Path $ProjectRoot "third_party\MediaCrawler"
+$env:XHS_DOWNLOADER_ROOT = Join-Path $ProjectRoot "third_party\XHS-Downloader"
 # Prefer an installed Microsoft Edge when Playwright's bundled Chromium has
 # not been downloaded yet. The bridge and webpage crawler both honor this
 # channel, so a missing cache does not break the whole startup chain.

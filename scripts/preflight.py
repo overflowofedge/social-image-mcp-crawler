@@ -218,6 +218,36 @@ def _looks_like_auth_failure(check: dict[str, Any]) -> bool:
     return any(marker in detail for marker in ("登录", "未检测到抖音登录态", "authrequired", "unauthorized", "401", "expired"))
 
 
+def _persistent_login_needed(cookie_state: str | None) -> bool:
+    """Only local session state can trigger an automatic QR login."""
+    return cookie_state in {"missing", "invalid", "missing_auth", "expired"}
+
+
+def _douyin_health_check_enabled() -> bool:
+    """Live platform traffic is opt-in; startup should normally stay local."""
+    return os.getenv("PREFLIGHT_DOUYIN_HEALTH_CHECK", "false").lower() in {"1", "true", "yes"}
+
+
+def _douyin_startup_ready(bridge: dict[str, Any], cookie: dict[str, Any]) -> bool:
+    if not bridge.get("configured"):
+        return True
+    return bool(bridge.get("ok") and cookie.get("state") == "valid")
+
+
+def _check_or_defer_douyin(project_root: Path, python: Path, checks: dict[str, Any]) -> dict[str, Any]:
+    prerequisites = all(checks[name].get("ok") for name in ("python", "imports", "browser", "bridge"))
+    if not prerequisites or checks["cookie"].get("state") != "valid":
+        return {"ok": False, "skipped": True, "detail": "local prerequisites or persistent login state are incomplete"}
+    if _douyin_health_check_enabled():
+        return _check_douyin_health(project_root, python)
+    return {
+        "ok": True,
+        "skipped": True,
+        "deferred": True,
+        "detail": "persistent login state is valid; live platform check deferred until the first crawl",
+    }
+
+
 def run_preflight(project_root: Path, python: Path, *, auto_repair: bool = True) -> dict[str, Any]:
     project_root, python = project_root.resolve(), python.resolve()
     try:
@@ -238,10 +268,7 @@ def run_preflight(project_root: Path, python: Path, *, auto_repair: bool = True)
     checks["weibo_bridge"] = _check_weibo_bridge(project_root, python) if checks["python"]["ok"] else {"ok": False, "detail": "Python executable is missing"}
     checks["bilibili_bridge"] = _check_bilibili_bridge(project_root, python) if checks["python"]["ok"] else {"ok": False, "detail": "Python executable is missing"}
     checks["weibo_api"] = _check_weibo_api() if checks["imports"].get("ok") else {"ok": False, "detail": "httpx is unavailable"}
-    if all(checks[name].get("ok") for name in ("python", "imports", "browser", "bridge")):
-        checks["douyin"] = _check_douyin_health(project_root, python)
-    else:
-        checks["douyin"] = {"ok": False, "skipped": True, "detail": "local prerequisites are incomplete"}
+    checks["douyin"] = _check_or_defer_douyin(project_root, python, checks)
 
     if auto_repair and not checks["imports"].get("ok") and checks["python"].get("ok"):
         rc, out, err = _run([str(python), "-m", "pip", "install", "-e", f"{project_root}[browser]"], 180)
@@ -264,7 +291,7 @@ def run_preflight(project_root: Path, python: Path, *, auto_repair: bool = True)
             checks["weibo_bridge"] = _check_weibo_bridge(project_root, python)
 
     if checks["bridge"].get("configured") and checks["bridge"].get("ok") and checks["douyin"].get("skipped") and all(checks[name].get("ok") for name in ("python", "imports", "browser")):
-        checks["douyin"] = _check_douyin_health(project_root, python)
+        checks["douyin"] = _check_or_defer_douyin(project_root, python, checks)
 
     if auto_repair and checks["bridge"].get("configured") and not checks["douyin"].get("ok"):
         detail = str(checks["douyin"].get("detail") or "").lower()
@@ -276,17 +303,25 @@ def run_preflight(project_root: Path, python: Path, *, auto_repair: bool = True)
                 checks["douyin"] = _check_douyin_health(project_root, python)
 
     cookie_state = checks["cookie"].get("state")
-    login_needed = cookie_state in {"missing", "invalid", "missing_auth", "expired"} or _looks_like_auth_failure(checks["douyin"])
+    # A transient API/verify failure must not force a new QR login when the
+    # persisted auth cookies are still structurally valid. Re-login only when
+    # the local session file is actually missing, invalid or expired.
+    login_needed = _persistent_login_needed(cookie_state)
     if auto_repair and login_needed and checks["bridge"].get("ok") and os.getenv("PREFLIGHT_AUTO_LOGIN", "true").lower() in {"1", "true", "yes"}:
         login = _run_login(project_root, python)
         report["repairs"].append({"action": "refresh Douyin login", **login})
         checks["cookie"] = inspect_cookie_file(cookie_file_path())
         if checks["cookie"].get("state") == "valid" and checks["browser"].get("ok"):
-            checks["douyin"] = _check_douyin_health(project_root, python)
+            checks["douyin"] = _check_or_defer_douyin(project_root, python, checks)
 
     local_ok = all(checks[name].get("ok", False) for name in ("python", "imports", "browser"))
     douyin_configured = bool(checks["bridge"].get("configured"))
-    report["ok"] = local_ok and (not douyin_configured or (checks["bridge"].get("ok") and checks["cookie"].get("state") == "valid" and checks["douyin"].get("ok")))
+    douyin_session_available = _douyin_startup_ready(checks["bridge"], checks["cookie"])
+    # A live API challenge is platform state, not a desktop startup failure.
+    # Keep other platforms and the local UI usable whenever the persisted
+    # session and local bridge are structurally ready.
+    report["ok"] = local_ok and douyin_session_available
+    report["douyin_session_available"] = douyin_session_available
     report["douyin_ready"] = bool(checks["douyin"].get("ok"))
     report["weibo_bridge_available"] = bool(checks["weibo_bridge"].get("ok"))
     report["weibo_ready"] = bool(checks["weibo_api"].get("creator_lookup_ok"))
@@ -314,7 +349,7 @@ def main() -> int:
         print("启动前自检未通过：请按上面的检查结果修复后重试。", file=sys.stderr)
         return 1
     if not report["douyin_ready"]:
-        print("提示：抖音链路动态检查未通过，请查看 preflight-latest.json。", file=sys.stderr)
+        print("提示：抖音动态检查未通过，但桌面版仍会启动；其它平台不受影响。", file=sys.stderr)
     if not report["weibo_ready"]:
         print("提示：微博登录链路尚未验证，请查看 preflight-latest.json 中的 weibo_api 和 weibo_bridge。", file=sys.stderr)
     return 0

@@ -188,6 +188,53 @@ def test_homepage_follows_only_bounded_content_links_and_keeps_both_media_types(
     asyncio.run(run())
 
 
+def test_detail_page_does_not_replace_own_media_with_navigation_cards():
+    calls = []
+    page = '''<main>
+    <img src="/own-one.jpg" alt="own one"><img src="/own-two.jpg" alt="own two">
+    <a href="/category"><img src="/unrelated-card.jpg" alt="category"></a>
+    </main>'''
+    unrelated = '<main><img src="/wrong-page.jpg"><img src="/another-wrong-page.jpg"></main>'
+
+    def handler(request):
+        calls.append(request.url.path)
+        if request.url.path == "/post/one":
+            return html_response(page)
+        if request.url.path == "/category":
+            return html_response(unrelated)
+        return media_response(request)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            result = await WebPageAdapter(client).search_media(SearchRequest(
+                query="https://example.org/post/one", media_type="images", image_limit=2,
+            ))
+        assert [item.image_url for item in result.items] == [
+            "https://example.org/own-one.jpg", "https://example.org/own-two.jpg",
+        ]
+        assert "/category" not in calls
+
+    asyncio.run(run())
+
+
+def test_webpage_prefers_original_over_cms_resized_thumbnail():
+    html = '''<main>
+    <img src="/photo.jpg" alt="original"><img src="/photo-480x640.jpg" alt="thumbnail">
+    </main>'''
+
+    def handler(request):
+        return html_response(html) if request.url.path == "/post/one" else media_response(request)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            result = await WebPageAdapter(client).search_media(SearchRequest(
+                query="https://example.org/post/one", media_type="images", image_limit=5,
+            ))
+        assert [item.image_url for item in result.items] == ["https://example.org/photo.jpg"]
+
+    asyncio.run(run())
+
+
 def test_real_dimensions_reject_hashed_icons_and_tracking_pixels():
     def handler(request):
         if request.url.path == "/":

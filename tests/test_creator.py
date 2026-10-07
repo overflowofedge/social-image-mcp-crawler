@@ -1,6 +1,7 @@
 import asyncio
 import io
 import time
+from pathlib import Path
 import httpx
 import pytest
 from PIL import Image
@@ -116,7 +117,11 @@ def test_weibo_profile_to_image_and_video_files(tmp_path):
             return path
     async def run():
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            service = CreatorImageService(Settings(), object(), ImageDownloader(client), weibo=WeiboApi(client))
+            api = WeiboApi(client)
+            class Sources:
+                async def fetch_creator(self, request):
+                    return await api.fetch_creator(request)
+            service = CreatorImageService(Settings(), Sources(), ImageDownloader(client))
             request = CreatorFetchRequest(platform=Platform.WEIBO, profile_url="https://weibo.com/u/5984743446",
                                           media_type="all", max_images=2, max_videos=2, output_dir=str(tmp_path / "out"), resume=False)
             return await service.fetch(request)
@@ -629,3 +634,104 @@ def test_creator_download_replaces_duplicate_candidates_from_the_same_job(tmp_pa
     assert downloader.calls == [["p1:1", "p2:1"], ["p3:1"]]
     assert [record["status"] for record in result["downloads"]] == ["duplicate", "downloaded", "downloaded"]
     assert len(result["items"]) == 3
+
+
+def test_creator_videos_download_in_sequential_replacement_batches(monkeypatch, tmp_path):
+    monkeypatch.setenv("VIDEO_DOWNLOAD_BATCH_SIZE", "3")
+    monkeypatch.setenv("VIDEO_DOWNLOAD_CONCURRENCY", "1")
+
+    class Settings:
+        cache_path = str(tmp_path / "cache.sqlite3")
+        output_dir = str(tmp_path / "out")
+        creator_timeout_seconds = 5
+
+        def ensure_output_dir(self, value=None):
+            from pathlib import Path
+            path = Path(value or self.output_dir)
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+
+    items = [
+        ImageCandidate(
+            id=f"v{index}", platform=Platform.DOUYIN,
+            image_url=f"https://video.test/{index}.mp4", media_type="video",
+            creator_id="sec-1", post_id=f"p{index}", media_index=1,
+        )
+        for index in range(1, 7)
+    ]
+
+    class Sources:
+        async def fetch_creator(self, request):
+            return CreatorSourceResult(
+                identity=_identity(), items=items, posts_fetched=6,
+                post_ids=tuple(item.post_id for item in items), pages_fetched=1,
+            )
+
+    class Downloader:
+        def __init__(self):
+            self.calls = []
+
+        async def download_many(self, batch, output, concurrency, *args, **kwargs):
+            self.calls.append(([item.id for item in batch], concurrency, kwargs.get("resume")))
+            return [
+                DownloadRecord(
+                    candidate_id=item.id, platform=item.platform,
+                    image_url=item.image_url, media_type="video",
+                    status="duplicate" if item.id == "v1" else "downloaded",
+                )
+                for item in batch
+            ]
+
+    async def run():
+        downloader = Downloader()
+        service = CreatorImageService(Settings(), Sources(), downloader)
+        result = await service.fetch(CreatorFetchRequest(
+            platform=Platform.DOUYIN, creator_id="Gracebb0722",
+            max_posts=6, max_images=5, max_videos=5,
+            media_type="videos", download=True, resume=False,
+            max_concurrency=5,
+        ))
+        return downloader, result
+
+    downloader, result = asyncio.run(run())
+    assert downloader.calls == [
+        (["v1", "v2", "v3"], 1, False),
+        (["v4", "v5", "v6"], 1, True),
+    ]
+    assert sum(record["status"] == "downloaded" for record in result["downloads"]) == 5
+
+
+def test_creator_requeues_completed_media_when_output_file_is_missing(tmp_path):
+    class Settings:
+        cache_path = str(tmp_path / "cache.sqlite3")
+        output_dir = str(tmp_path / "out")
+        creator_timeout_seconds = 5
+        def ensure_output_dir(self, value=None):
+            path = Path(value or self.output_dir); path.mkdir(parents=True, exist_ok=True); return path
+
+    item = ImageCandidate(id="p1:1", platform=Platform.DOUYIN, image_url="https://img.test/1.jpg", creator_id="sec-1", post_id="p1", media_index=1)
+
+    class Sources:
+        async def fetch_creator(self, request):
+            return CreatorSourceResult(identity=_identity(), items=[item], posts_fetched=1, post_ids=("p1",), pages_fetched=1)
+
+    class Downloader:
+        calls = 0
+        async def download_many(self, batch, *args, **kwargs):
+            self.calls += 1
+            path = Path(args[0]) / "images" / "p1.jpg"
+            path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(b"ok")
+            return [DownloadRecord(candidate_id=batch[0].id, platform=Platform.DOUYIN, image_url=batch[0].image_url, path=str(path), sha256=__import__("hashlib").sha256(b"ok").hexdigest(), status="downloaded")]
+
+    async def run():
+        downloader = Downloader(); service = CreatorImageService(Settings(), Sources(), downloader)
+        request = CreatorFetchRequest(platform=Platform.DOUYIN, creator_id="Gracebb0722", max_posts=1, max_images=1, download=True, resume=False)
+        first = await service.fetch(request.model_copy(update={"resume": True}))
+        Path(first["downloads"][0]["path"]).unlink()
+        second = await service.fetch(request.model_copy(update={"resume": True}))
+        return downloader, first, second
+
+    downloader, first, second = asyncio.run(run())
+    assert first["downloads"][0]["status"] == "downloaded"
+    assert second["downloads"][0]["status"] == "downloaded"
+    assert downloader.calls == 2

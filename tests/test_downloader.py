@@ -203,6 +203,38 @@ def test_downloader_deduplicates_near_identical_images(tmp_path):
     asyncio.run(run())
 
 
+def test_downloader_keeps_near_identical_images_from_one_gallery(tmp_path):
+    first = io.BytesIO()
+    second = io.BytesIO()
+    Image.new("RGB", (64, 64), "red").save(first, format="PNG")
+    Image.new("RGB", (64, 64), "#ff0001").save(second, format="PNG")
+    payloads = [first.getvalue(), second.getvalue()]
+
+    def handler(request):
+        index = 0 if request.url.path.endswith("1.png") else 1
+        return httpx.Response(200, content=payloads[index], request=request)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            downloader = ImageDownloader(client)
+            items = [
+                ImageCandidate(
+                    id="gallery:1", platform=Platform.INSTAGRAM,
+                    image_url="https://cdn.test/1.png", post_id="gallery", media_index=1,
+                ),
+                ImageCandidate(
+                    id="gallery:2", platform=Platform.INSTAGRAM,
+                    image_url="https://cdn.test/2.png", post_id="gallery", media_index=2,
+                ),
+            ]
+            records = await downloader.download_many(items, tmp_path)
+            assert [record.status for record in records] == ["downloaded", "downloaded"]
+            assert len({record.sha256 for record in records}) == 2
+            assert len(list((tmp_path / "images").glob("*"))) == 2
+
+    asyncio.run(run())
+
+
 def test_downloader_resume_reuses_verified_existing_file(tmp_path):
     buffer = io.BytesIO()
     Image.new("RGB", (40, 30), "blue").save(buffer, format="JPEG")
@@ -260,6 +292,60 @@ def test_downloader_accepts_video_media_and_keeps_media_type(tmp_path):
             assert record.path and record.path.endswith(".mp4")
 
     asyncio.run(run())
+
+
+def test_douyin_video_accepts_mislabeled_complete_mp4(tmp_path):
+    def handler(request):
+        return httpx.Response(200, headers={"content-type": "audio/mp4"}, content=b"complete-mp4", request=request)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            item = ImageCandidate(
+                id="douyin-mp4", platform=Platform.DOUYIN,
+                image_url="https://douyin.test/play", media_type="video",
+            )
+            return (await ImageDownloader(client).download_many([item], tmp_path))[0]
+
+    record = asyncio.run(run())
+
+    assert record.status == "downloaded"
+    assert record.content_type == "audio/mp4"
+    assert record.path.endswith(".mp4")
+
+
+def test_video_download_resumes_after_an_incomplete_response(tmp_path):
+    payload = b"first-part-second-part"
+    calls = []
+
+    class BrokenStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield payload[:10]
+            raise httpx.RemoteProtocolError("peer closed early")
+
+    def handler(request):
+        calls.append(request.headers.get("range"))
+        if len(calls) == 1:
+            return httpx.Response(200, headers={"content-type": "video/mp4"}, stream=BrokenStream())
+        assert request.headers["range"] == "bytes=10-"
+        return httpx.Response(
+            206,
+            headers={"content-type": "video/mp4", "content-range": f"bytes 10-{len(payload) - 1}/{len(payload)}"},
+            content=payload[10:],
+        )
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            item = ImageCandidate(
+                id="resumed", platform=Platform.DOUYIN,
+                image_url="https://video.test/resume.mp4", media_type="video",
+            )
+            return (await ImageDownloader(client).download_many([item], tmp_path))[0]
+
+    record = asyncio.run(run())
+
+    assert record.status == "downloaded", record.error
+    assert Path(record.path).read_bytes() == payload
+    assert calls == [None, "bytes=10-"]
 
 
 def test_webpage_download_rejects_tiny_images_even_without_user_size_filter(tmp_path):

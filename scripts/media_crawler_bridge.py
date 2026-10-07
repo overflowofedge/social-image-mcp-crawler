@@ -26,7 +26,7 @@ if str(SRC) not in sys.path:
 
 from social_image_mcp.bridge_utils import normalize_native_record
 from social_image_mcp.creator_protocol import CreatorCollector, creator_target
-from social_image_mcp.models import CreatorFetchRequest, CreatorIdentity, Platform
+from social_image_mcp.models import CreatorFetchRequest, CreatorIdentity, Platform, SearchRequest
 
 DY_ROOT = Path(os.getenv("DY_CLI_ROOT") or ROOT / "third_party" / "dy-cli").expanduser().resolve()
 DY_SRC = DY_ROOT / "src"
@@ -92,25 +92,33 @@ def _configure_vendor_browser(config: ModuleType, args: argparse.Namespace) -> N
 
 def _install_capture(platform: str, records: list[Any]) -> None:
     """Patch only the content callback; comments/media storage stay disabled."""
+    def append_record(args: tuple[Any, ...], kwargs: dict[str, Any], *names: str) -> None:
+        record = args[0] if args else next((kwargs[name] for name in names if kwargs.get(name) is not None), None)
+        if not isinstance(record, dict):
+            raise TypeError(f"MediaCrawler capture callback did not receive a record: {sorted(kwargs)}")
+        records.append(record)
+
     if platform == "xhs":
         from store import xhs as module
 
-        async def capture(note: dict[str, Any]) -> None:
-            records.append(note)
+        async def capture(*args: Any, **kwargs: Any) -> None:
+            append_record(args, kwargs, "note_item", "note_detail")
 
         module.update_xhs_note = capture
     elif platform == "douyin":
         from store import douyin as module
 
-        async def capture(note: dict[str, Any]) -> None:
-            records.append(note)
+        async def capture(*args: Any, **kwargs: Any) -> None:
+            # Recent MediaCrawler releases call this callback with the named
+            # ``aweme_item`` argument instead of a positional record.
+            append_record(args, kwargs, "aweme_item", "note_item")
 
         module.update_douyin_aweme = capture
     elif platform == "weibo":
         from store import weibo as module
 
-        async def capture(note: dict[str, Any]) -> None:
-            records.append(note)
+        async def capture(*args: Any, **kwargs: Any) -> None:
+            append_record(args, kwargs, "note_item")
 
         module.update_weibo_note = capture
 
@@ -278,6 +286,7 @@ async def _run(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, Any
     original_creator_method = None
     original_weibo_pong = None
     creator_request = None
+    search_request = None
     WeiboCrawler = None
     WeiboClient = None
     DouYinCrawler = None
@@ -291,6 +300,7 @@ async def _run(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, Any
 
         platform = {"dy": "douyin", "xhs": "xhs", "wb": "weibo"}[PLATFORM_MAP[args.platform.lower()]]
         creator_request = CreatorFetchRequest.model_validate_json(os.environ["SOCIAL_IMAGE_CREATOR_REQUEST"]) if os.getenv("SOCIAL_IMAGE_CREATOR_REQUEST") else None
+        search_request = SearchRequest.model_validate_json(os.environ["SOCIAL_IMAGE_SEARCH_REQUEST"]) if os.getenv("SOCIAL_IMAGE_SEARCH_REQUEST") else None
         if platform == "weibo":
             from media_platform.weibo.client import WeiboClient
 
@@ -386,8 +396,15 @@ async def _run(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, Any
         return creator_result
 
     normalized: list[dict[str, Any]] = []
+    media_type = search_request.media_type if search_request else "images"
     for record in records:
-        normalized.extend(normalize_native_record(platform, record, "media-crawler"))
+        normalized.extend(normalize_native_record(
+            platform,
+            record,
+            "media-crawler",
+            media_type=media_type,
+            include_video_covers=media_type == "images",
+        ))
     return normalized[: max(1, args.limit)]
 
 

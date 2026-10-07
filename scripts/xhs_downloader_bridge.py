@@ -10,6 +10,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 
@@ -47,6 +48,44 @@ def _urls(data: dict[str, Any]) -> list[str]:
     return list(dict.fromkeys(result))
 
 
+def _prepare_vendor_imports() -> None:
+    """Provide only the unused FastMCP symbol required by the vendor import."""
+    try:
+        from fastmcp import FastMCP  # noqa: F401
+    except (ImportError, RuntimeError):
+        module = ModuleType("fastmcp")
+
+        class UnavailableFastMCP:
+            def __init__(self, *args, **kwargs):
+                raise RuntimeError("XHS-Downloader MCP server support is unavailable in bridge mode")
+
+        module.FastMCP = UnavailableFastMCP
+        sys.modules["fastmcp"] = module
+
+
+def _normalize_results(results: list[dict[str, Any]], item_id: str, url: str, limit: int) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for data in results:
+        note_id = _as_text(data.get("作品ID") or item_id)
+        title = _as_text(data.get("作品标题") or data.get("作品描述"))
+        permalink = _as_text(data.get("作品链接") or url)
+        author = _as_text(data.get("作者昵称"))
+        work_type = _as_text(data.get("作品类型") or data.get("type")).casefold()
+        media_type = "video" if work_type in {"视频", "video"} else "image"
+        for media_url in _urls(data):
+            normalized.append({
+                "id": note_id or "unknown",
+                "image_url": media_url,
+                "media_type": media_type,
+                "title": title,
+                "description": _as_text(data.get("作品描述")),
+                "author": author,
+                "permalink": permalink,
+                "source": "xhs-downloader",
+            })
+    return normalized[: max(1, limit)]
+
+
 async def _run(args: argparse.Namespace) -> list[dict[str, Any]]:
     if not args.url and not args.item_id:
         # Keyword recall belongs to MediaCrawler; this source is intentionally a
@@ -57,6 +96,7 @@ async def _run(args: argparse.Namespace) -> list[dict[str, Any]]:
         raise RuntimeError(f"XHS-Downloader source package not found: {vendor_root}")
     url = args.url or f"https://www.xiaohongshu.com/explore/{args.item_id}"
     sys.path.insert(0, str(vendor_root))
+    _prepare_vendor_imports()
     from source import XHS, Settings
 
     settings = Settings(root=vendor_root / "Volume")
@@ -73,23 +113,7 @@ async def _run(args: argparse.Namespace) -> list[dict[str, Any]]:
             elif isinstance(extracted, dict):
                 results.append(extracted)
 
-    normalized: list[dict[str, Any]] = []
-    for data in results:
-        note_id = _as_text(data.get("作品ID") or args.item_id)
-        title = _as_text(data.get("作品标题") or data.get("作品描述"))
-        permalink = _as_text(data.get("作品链接") or url)
-        author = _as_text(data.get("作者昵称"))
-        for image_url in _urls(data):
-            normalized.append({
-                "id": note_id or "unknown",
-                "image_url": image_url,
-                "title": title,
-                "description": _as_text(data.get("作品描述")),
-                "author": author,
-                "permalink": permalink,
-                "source": "xhs-downloader",
-            })
-    return normalized[: max(1, args.limit)]
+    return _normalize_results(results, args.item_id, url, args.limit)
 
 
 def main() -> int:
