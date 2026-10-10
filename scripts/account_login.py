@@ -144,6 +144,10 @@ async def _login_browser_session(platform: str, root: Path, cancel: threading.Ev
                 for text in ("登录", "扫码登录"):
                     try:
                         await page.get_by_text(text, exact=True).first.click(timeout=2500)
+                        # The first click opens the platform's login panel. A
+                        # second click immediately switches panels and makes
+                        # the official QR page visibly flash.
+                        break
                     except Exception:
                         pass
             message = (f"请使用{PLATFORMS[platform]} App 扫码，并在手机上确认登录。成功后会自动保存。"
