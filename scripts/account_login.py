@@ -27,7 +27,11 @@ LOGIN_URLS = {
 ACTIVE_STATES = {"opening", "waiting", "verifying", "saving", "cancelling"}
 LOGIN_PAGE_HOSTS = {
     "douyin": {"douyin.com"},
+    "weibo": {"weibo.com", "weibo.cn"},
+    "xhs": {"xiaohongshu.com"},
+    "bilibili": {"bilibili.com"},
     "x": {"x.com", "twitter.com"},
+    "instagram": {"instagram.com"},
 }
 
 
@@ -129,6 +133,7 @@ async def _login_browser_session(platform: str, root: Path, cancel: threading.Ev
         channel = _browser_channel()
         if channel:
             options["channel"] = channel
+        options["args"] = ["--window-size=1100,760", "--disable-popup-blocking"]
         browser = await playwright.chromium.launch(**options)
         context = None
         try:
@@ -150,20 +155,24 @@ async def _login_browser_session(platform: str, root: Path, cancel: threading.Ev
                     except Exception:
                         pass
 
-            if platform == "xhs":
-                context.on("response", observe_xhs)
             pending_pages = []
 
             def observe_login_page(new_page):
                 if new_page not in pending_pages:
                     pending_pages.append(new_page)
 
-            # Some official login flows open a popup instead of navigating the
-            # original tab. Keep the newest platform page and close the old
-            # one so the user sees one stable login window.
-            if platform in LOGIN_PAGE_HOSTS and hasattr(context, "on"):
+            # Official login flows sometimes open a popup instead of navigating
+            # the original tab. Every platform uses the same single-page
+            # controller so a second visible login window cannot accumulate.
+            if hasattr(context, "on"):
                 context.on("page", observe_login_page)
+            if platform == "xhs":
+                context.on("response", observe_xhs)
             page = await context.new_page()
+            try:
+                await page.set_viewport_size({"width": 1080, "height": 720})
+            except Exception:
+                pass
             await page.goto(LOGIN_URLS[platform], wait_until="domcontentloaded", timeout=45000)
             if platform in {"douyin", "xhs"}:
                 for text in ("登录", "扫码登录"):
@@ -180,11 +189,15 @@ async def _login_browser_session(platform: str, root: Path, cancel: threading.Ev
                        f"请在官方窗口完成 {PLATFORMS[platform]} 登录及验证，成功后会自动保存。")
             update("waiting", message)
             deadline = time.monotonic() + timeout
+            no_page_since = None
             while time.monotonic() < deadline:
                 if cancel.is_set():
                     raise asyncio.CancelledError()
-                if not browser.is_connected() or not context.pages:
+                if not browser.is_connected():
                     raise asyncio.CancelledError()
+                for candidate in context.pages:
+                    if candidate is not page and candidate not in pending_pages:
+                        pending_pages.append(candidate)
                 while pending_pages:
                     candidate = pending_pages.pop(0)
                     if candidate is page:
@@ -201,26 +214,34 @@ async def _login_browser_session(platform: str, root: Path, cancel: threading.Ev
                         await previous.close()
                     except Exception:
                         pass
+                if not context.pages:
+                    if no_page_since is None:
+                        no_page_since = time.monotonic()
+                    if time.monotonic() - no_page_since > 5:
+                        raise asyncio.CancelledError()
+                    await asyncio.sleep(0.25)
+                    continue
+                no_page_since = None
                 state = await context.storage_state()
                 if has_auth(platform, state):
                     if platform == "douyin":
-                        web_cookie = cookie_header("douyin", await context.storage_state(), "https://www.douyin.com/")
+                        web_cookie = cookie_header("douyin", state, "https://www.douyin.com/")
                         if not any(part.strip().split("=", 1)[0] in {"sessionid", "sessionid_ss"}
                                    for part in web_cookie.split(";")):
                             update("verifying", "正在同步抖音登录状态，请完成窗口中的平台验证。")
-                            await asyncio.sleep(0.5)
+                            await asyncio.sleep(0.25)
                             continue
                     if platform == "xhs" and not await _xhs_authenticated(context, xhs_confirmed):
                         # Keep the guest session in memory until login is
                         # confirmed. Do not persist it or close the QR window.
-                        await asyncio.sleep(0.5)
+                        await asyncio.sleep(0.25)
                         continue
                     if cancel.is_set():
                         raise asyncio.CancelledError()
                     update("saving", "登录已确认，正在保存到本机…")
                     save_session(platform, await context.storage_state(), root)
                     return
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.25)
             raise TimeoutError("登录超时，请点击登录重试；已有登录信息会保留。")
         finally:
             try:
