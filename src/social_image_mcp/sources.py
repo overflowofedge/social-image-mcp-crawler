@@ -910,6 +910,16 @@ class SourceHub:
     def statuses(self) -> list[dict[str, Any]]:
         return [{"name": status.name, "configured": status.configured, "verified": status.verified, "verified_platforms": list(status.verified_platforms), "ready_platforms": list(status.ready_platforms), "mode": status.mode, "detail": status.detail, "platforms": list(status.platforms), "platform_status": status.platform_status or {}} for status in (self.douyin_source.status, self.weibo_source.status, self.x_source.status, self.instagram_source.status, self.xhs_source.status, self.bilibili_source.status)]
 
+    def session_updated(self, platform: Platform) -> None:
+        """Allow an immediate retry with new credentials without claiming a crawl succeeded."""
+        source = self._platform_sources.get(platform)
+        if isinstance(source, ExternalJsonSource):
+            for key in list(source._cooldown_until):
+                if key == platform.value or key.startswith(platform.value + ":"):
+                    source._cooldown_until.pop(key, None)
+            source._last_errors.pop(platform.value, None)
+            source._last_error = next(iter(source._last_errors.values()), None)
+
     async def fetch_creator(self, request: CreatorFetchRequest) -> CreatorSourceResult:
         source = self._platform_sources.get(request.platform)
         if source is None or not source.status.configured:

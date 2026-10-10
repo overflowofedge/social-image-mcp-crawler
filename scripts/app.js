@@ -15,6 +15,66 @@ const platformLabels = {
   bilibili: "B站", instagram: "Instagram", other: "自定义网页"
 };
 
+const accountCards = [...document.querySelectorAll(".account[data-platform]")];
+const loginStates = new Map();
+
+function renderLogin(data) {
+  const card = accountCards.find(row => row.dataset.platform === data.platform);
+  if (!card) return;
+  loginStates.set(data.platform, data);
+  card.dataset.state = data.state;
+  card.querySelector(".account-status").textContent = data.message || "请点击扫码登录。";
+  const start = card.querySelector(".start-login");
+  start.disabled = Boolean(data.active);
+  start.textContent = data.active ? "等待登录…" : data.session_available ? "重新登录" : "扫码登录";
+  const cancel = card.querySelector(".cancel-login");
+  cancel.hidden = !data.active;
+  cancel.disabled = data.state === "cancelling" || data.state === "saving";
+}
+
+async function refreshLogins() {
+  try {
+    const response = await fetch("/api/login", {cache: "no-store"});
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    data.platforms.forEach(renderLogin);
+  } catch (_) {
+    accountCards.forEach(card => {
+      card.querySelector(".account-status").textContent = "暂时无法读取登录状态，请确认应用正在运行。";
+      card.querySelector(".start-login").disabled = false;
+    });
+  }
+}
+
+async function requestLogin(card, cancel = false) {
+  const platform = card.dataset.platform;
+  card.querySelector(cancel ? ".cancel-login" : ".start-login").disabled = true;
+  try {
+    const response = await fetch(cancel ? "/api/login/cancel" : "/api/login", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({platform, force: Boolean(loginStates.get(platform)?.session_available)})
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error?.message || `HTTP ${response.status}`);
+    renderLogin(data);
+  } catch (error) {
+    card.querySelector(".account-status").textContent = `无法操作登录：${error.message || error}`;
+    card.querySelector(".start-login").disabled = false;
+    card.querySelector(".cancel-login").disabled = false;
+  }
+}
+
+accountCards.forEach(card => {
+  card.querySelector(".start-login").addEventListener("click", () => requestLogin(card));
+  card.querySelector(".cancel-login").addEventListener("click", () => requestLogin(card, true));
+});
+
+async function pollLogins() {
+  await refreshLogins();
+  setTimeout(pollLogins, [...loginStates.values()].some(value => value.active) ? 1000 : 5000);
+}
+pollLogins();
+
 function renderLogEntries(entries) {
   status.innerHTML = "";
   const labels = {info: "信息", success: "成功", warning: "提醒", error: "错误"};

@@ -241,6 +241,30 @@ def test_browser_response_helpers_extract_profile_and_endpoint():
     assert _browser_profile({"data": [{"user_info": profile["user"]}]}) == profile["user"]
 
 
+def test_douyin_cli_uses_new_desktop_cookie_for_api_and_browser(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from dy_cli.engines.api_client import DouyinAPIClient
+    from dy_cli.utils import signature
+    from social_image_mcp.accounts import save_session
+
+    target = tmp_path / "login.json"
+    monkeypatch.setenv("DOUYIN_BROWSER_STORAGE_STATE", str(target))
+    save_session("douyin", {"cookies": [{"name": "sessionid", "value": "new-login", "domain": ".douyin.com", "path": "/", "expires": -1}]}, tmp_path)
+    client = SimpleNamespace(cookie="old-login", close=lambda: None)
+    monkeypatch.setattr(DouyinAPIClient, "from_config", lambda account: client)
+    monkeypatch.setattr(_MODULE, "_configure_browser_runtime", lambda: None)
+
+    async def close_sign_page():
+        pass
+
+    monkeypatch.setattr(signature, "close_sign_page", close_sign_page)
+    monkeypatch.setenv("SOCIAL_IMAGE_CREATOR_REQUEST", '{"platform":"douyin","creator_id":"sec-test","download":false}')
+    monkeypatch.setattr(_MODULE, "_fetch_creator_with_fallback", lambda actual, *_args: {"cookie": actual.cookie})
+    assert _MODULE._browser_storage_state() == target
+    result = _MODULE._sync_fetch(SimpleNamespace(account=None))
+    assert result == {"cookie": "sessionid=new-login"}
+
+
 def test_browser_user_search_requires_exact_account_id_and_dedupes_sec_uid():
     payload = {
         "data": [

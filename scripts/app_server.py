@@ -17,12 +17,16 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import ProxyHandler, build_opener
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
 from social_image_mcp.intent import parse_intent
+from social_image_mcp.models import Platform
 from social_image_mcp.progress import progress_context
 from social_image_mcp.server import search_images, service
+from scripts.account_login import LoginManager
 
 HTML = (ROOT / "scripts" / "app.html").read_text(encoding="utf-8")
 APP_ID = "social-image-mcp-desktop"
@@ -247,12 +251,14 @@ def _error_guidance(message: str, platform: str) -> tuple[str, str]:
     )):
         action = "稍后重试，并确认平台登录状态正常。"
         if platform == "douyin":
-            action = "重新运行抖音扫码登录，完成验证后再试；仍失败时稍后重试或更换网络。"
+            action = "在页面“平台登录”中点击抖音重新登录，完成验证后再试；仍失败时稍后重试或更换网络。"
         elif platform == "bilibili":
             action = "稍后重试；频繁出现时，在 .env 中更新 BILIBILI_COOKIE 后重启桌面版。"
         return f"{label}触发了访问频率限制或安全验证，本次请求被平台拒绝。", action
     if any(marker in lowered for marker in ("cookie", "login", "logged in", "登录", "扫码", "unauthorized", "-101")):
-        return f"{label}登录状态缺失或已经失效。", "重新完成该平台登录或扫码验证，然后重启桌面版再试。"
+        action = ("在页面“平台登录”中点击该平台扫码登录，手机确认成功后直接重试。"
+                  if platform in {"douyin", "weibo"} else "重新完成该平台登录或扫码验证，然后重启桌面版再试。")
+        return f"{label}登录状态缺失或已经失效。", action
     if any(marker in lowered for marker in ("creator_identity_unresolved", "identity_unresolved", "matched 0", "not found", "没有找到")):
         return "没有确认到唯一的账号，昵称可能不准确、存在同名账号，或账号未公开。", "核对完整昵称；仍无法识别时粘贴该账号的完整主页链接。"
     if any(marker in lowered for marker in ("timed out", "timeout", "deadline", "超时")):
@@ -610,9 +616,16 @@ def _run_search_task(task_id: str, body: dict, runner: _Loop, tasks: TaskRegistr
         tasks.finish(task_id, error_result, failed=True)
 
 
+def _login_session_updated(platform: str) -> None:
+    async def refresh():
+        service.sources.session_updated(Platform(platform))
+    Handler.runner.call(refresh(), timeout=10)
+
+
 class Handler(BaseHTTPRequestHandler):
     runner: _Loop
     tasks: TaskRegistry = TASKS
+    logins = LoginManager(ROOT, on_success=_login_session_updated)
 
     def log_message(self, *_args) -> None:
         return
@@ -643,6 +656,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"app": APP_ID, "root": str(ROOT), "preflight": _preflight_report()})
         elif parsed.path == "/api/status":
             self._send(200, {"platforms": service.statuses(), "sources": service.source_statuses(), "preflight": _preflight_report()})
+        elif parsed.path == "/api/login":
+            self._send(200, {"platforms": self.logins.statuses()})
         elif parsed.path.startswith("/api/tasks/"):
             task_id = parsed.path.removeprefix("/api/tasks/").strip("/")
             task = self.tasks.get(task_id)
@@ -660,11 +675,30 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
 
     def do_POST(self) -> None:
-        if urlparse(self.path).path != "/api/search":
+        path = urlparse(self.path).path
+        if path not in {"/api/search", "/api/login", "/api/login/cancel"}:
             self._send(404, {"error": "not found"}); return
         try:
+            if path.startswith("/api/login"):
+                origin = self.headers.get("Origin")
+                if origin and (urlparse(origin).scheme != "http" or
+                               urlparse(origin).netloc != self.headers.get("Host")):
+                    self._send(403, {"error": {"message": "请从本机应用页面操作登录。"}})
+                    return
+                if not self.headers.get("Content-Type", "").lower().startswith("application/json"):
+                    raise ValueError("登录请求必须使用 JSON。")
             length = int(self.headers.get("Content-Length", "0"))
+            if length < 1 or length > 65536:
+                raise ValueError("请求内容长度无效。")
             body = json.loads(self.rfile.read(length).decode("utf-8"))
+            if path.startswith("/api/login"):
+                if not isinstance(body, dict) or not isinstance(body.get("force", False), bool):
+                    raise ValueError("登录请求格式无效。")
+                platform = str(body.get("platform") or "")
+                data = (self.logins.cancel(platform) if path.endswith("/cancel")
+                        else self.logins.start(platform, force=body.get("force", False)))
+                self._send(202 if data["active"] else 200, data)
+                return
             if not isinstance(body, dict) or not str(body.get("query") or "").strip():
                 raise ValueError("请输入搜索提示词或链接")
             task = self.tasks.create()
@@ -700,7 +734,7 @@ def main() -> None:
     if not args.no_browser: threading.Timer(1.0, lambda: webbrowser.open(url)).start()
     try: server.serve_forever()
     except KeyboardInterrupt: pass
-    finally: server.server_close(); runner.close()
+    finally: Handler.logins.close(); server.server_close(); runner.close()
 
 if __name__ == "__main__":
     main()

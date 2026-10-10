@@ -24,23 +24,24 @@
 
 3. 双击项目根目录的 **安装桌面版.bat**。默认会创建 `.venv`，下载锁定版本的 dy-cli、MediaCrawler、XHS-Downloader，安装各平台依赖和 gallery-dl，并验证浏览器与实际导入。ZIP 下载用户不需要安装 Git。只有本地组件验证通过才显示安装完成；已有 `.env`、登录缓存、来源修改和下载文件会保留。仅使用普通网页时可运行 `powershell -ExecutionPolicy Bypass -File .\scripts\install_desktop.ps1 -WebOnly`。
 
-安装完成后即可启动界面。安装检查不要求用户拥有任何平台账号，也不会自动打开抖音登录窗口。需要登录的平台按下面步骤分别配置；某个平台未登录不影响其它平台。登录态有效时会持续复用。
+安装完成后双击 **启动应用.bat**。在页面顶部的“平台登录”中点击抖音或微博的 **扫码登录**，应用会自动打开官方登录窗口；用对应 App 扫码并在手机上确认后，程序自动检测成功、保存 Cookie 并关闭登录窗口，可直接开始采集，无需复制 Cookie、回终端按回车或重启应用。
 
-### 抖音
+页面会显示等待扫码、确认登录、成功、取消或超时状态；可点击“取消登录”关闭此次窗口，或点击“重新登录”更换账号。取消、超时和失败不会覆盖此前保存的会话。安装和启动不要求任何平台账号，某个平台未登录不影响其它平台。验证码或额外确认仍需按官方窗口提示完成。
+
+### 抖音、微博的备用登录入口
+
+日常使用推荐页面内扫码登录。已有的 `登录抖音.bat`、`登录微博.bat` 和下面的命令仍可使用，同样会自动保存登录信息：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\setup_account.ps1 -Platform douyin
 ```
 
-### 微博和小红书
-
-抖音也可以双击 **登录抖音.bat**。微博可以双击 **登录微博.bat**，或在项目目录执行：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\setup_account.ps1 -Platform weibo
 ```
 
-各平台通过自己的 CLI 子进程运行；MediaCrawler 按 `--platform` 隔离微博和小红书，抖音使用 dy-cli，B 站使用 `bilibili_cli_bridge.py`。微博登录脚本会明确打开登录窗口，请完成官方登录。小红书首次使用需要自己的账号与平台登录；没有账号时可以跳过。登录信息保存在本机，不会提交到 Git。配置 `BILIBILI_COOKIE` 可提高 B 站访问稳定性。
+各平台通过自己的 CLI 子进程运行；MediaCrawler 按 `--platform` 隔离微博和小红书，抖音使用 dy-cli，B 站使用 `bilibili_cli_bridge.py`。抖音复用 dy-cli 的账号 Cookie 文件，微博保存到本项目 `.cache/weibo-session.json`，采集时自动读取最新会话；登录信息仅保存在本机，不会提交到 Git。小红书首次使用需要自己的账号与平台登录；没有账号时可以跳过。配置 `BILIBILI_COOKIE` 可提高 B 站访问稳定性。
 
 ### X 和 Instagram
 

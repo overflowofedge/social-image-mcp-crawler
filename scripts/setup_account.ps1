@@ -207,20 +207,13 @@ if ($Platform -eq "douyin") {
     if ($LASTEXITCODE -ne 0) {
         throw "Douyin login did not complete."
     }
-    Write-Output "Douyin login completed. Open a new Codex task before testing the MCP."
+    Write-Output "Douyin login completed. You can now collect directly in the desktop app."
     exit 0
 }
 
 if ($Platform -eq "weibo") {
-    $bridge = Join-Path $PSScriptRoot "media_crawler_bridge.py"
-    Write-Output "A visible Weibo login window will open. Complete the official login or QR confirmation."
-    $weiboOutput = & $Python $bridge --platform weibo --query "coffee shop" --limit 1 --login-type qrcode --headless false
-    if ($LASTEXITCODE -ne 0 -or -not (Test-BridgeMediaOutput $weiboOutput)) {
-        $detail = ($weiboOutput | Select-Object -Last 12) -join [Environment]::NewLine
-        throw "Weibo login or real candidate verification failed. No image candidate was returned.`n$detail"
-    }
-    Write-Output "Weibo returned a real candidate and its saved browser session can now be used by the MCP."
-    Write-Output "Open a new Codex task before testing the MCP."
+    & $Python (Join-Path $PSScriptRoot "account_login.py") --platform weibo
+    if ($LASTEXITCODE -ne 0) { throw "微博登录未完成，请按窗口提示重试。" }
     exit 0
 }
 
