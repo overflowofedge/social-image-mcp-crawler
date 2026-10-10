@@ -24,22 +24,22 @@ MCP 版本位于仓库默认的 `master` 分支；本页对应无需 MCP 客户�
 
 3. 双击项目根目录的 **安装桌面版.bat**。默认会创建 `.venv`，下载锁定版本的 dy-cli、MediaCrawler、XHS-Downloader，安装各平台依赖和 gallery-dl，并验证浏览器与实际导入。ZIP 下载用户不需要安装 Git。只有本地组件验证通过才显示安装完成；已有 `.env`、登录缓存、来源修改和下载文件会保留。仅使用普通网页时可运行 `powershell -ExecutionPolicy Bypass -File .\scripts\install_desktop.ps1 -WebOnly`。
 
-安装完成后双击 **启动应用.bat**。在页面顶部的“平台登录”中点击抖音或微博的 **扫码登录**，应用会自动打开官方登录窗口；用对应 App 扫码并在手机上确认后，程序自动检测成功、保存 Cookie 并关闭登录窗口，可直接开始采集，无需复制 Cookie、回终端按回车或重启应用。
+安装完成后双击 **启动应用.bat**。页面顶部的“平台登录”提供抖音、微博、小红书、B 站、X 和 Instagram 的登录卡片。前四个平台点击 **扫码登录**，用对应 App 扫码并确认；X 和 Instagram 点击 **网页登录**，在官方窗口完成登录。程序自动检测成功、保存 Cookie 并关闭登录窗口，可直接开始采集，无需复制 Cookie、回终端按回车或重启应用。
 
 页面会显示等待扫码、确认登录、成功、取消或超时状态；可点击“取消登录”关闭此次窗口，或点击“重新登录”更换账号。取消、超时和失败不会覆盖此前保存的会话。安装和启动不要求任何平台账号，某个平台未登录不影响其它平台。验证码或额外确认仍需按官方窗口提示完成。
 
-各平台通过自己的 CLI 子进程运行；MediaCrawler 按 `--platform` 隔离微博和小红书，抖音使用 dy-cli，B 站使用 `bilibili_cli_bridge.py`。抖音复用 dy-cli 的账号 Cookie 文件，微博保存到本项目 `.cache/weibo-session.json`，采集时自动读取最新会话；登录信息仅保存在本机，不会提交到 Git。小红书首次使用需要自己的账号与平台登录；没有账号时可以跳过。配置 `BILIBILI_COOKIE` 可提高 B 站访问稳定性。
+各平台通过自己的 CLI 子进程运行：抖音使用 dy-cli，微博使用 MediaCrawler，小红书使用 XHS-Downloader，B 站使用 `bilibili_cli_bridge.py`，X 与 Instagram 各自使用 gallery-dl。抖音复用 dy-cli 的账号 Cookie 文件，其余平台分别保存到本项目 `.cache/<platform>-session.json`，采集时自动读取最新会话；登录信息仅保存在本机，不会提交到 Git。小红书首次使用需要自己的账号与平台登录；没有账号时可以跳过。旧版手动配置的 Cookie 仍作为备用。
 
 ### X 和 Instagram
 
-X 与 Instagram 必须分别建立 gallery-dl 会话，不共用 Cookie、浏览器配置或失败冷却。在项目目录依次运行需要的平台命令，并在各自打开的独立浏览器窗口完成官方登录：
+X 与 Instagram 可直接在页面的登录卡片完成官方登录，程序自动生成各自的 gallery-dl Cookie 文件。两者不共用 Cookie、浏览器配置或失败冷却。如需命令行登录，以下命令使用相同的自动保存流程：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\setup_account.ps1 -Platform x
 powershell -ExecutionPolicy Bypass -File .\scripts\setup_account.ps1 -Platform instagram
 ```
 
-脚本会把 X 与 Instagram 的会话分别保存到 `.cache`，并写入各自的 `X_GALLERY_DL_*` / `INSTAGRAM_GALLERY_DL_*` 配置。一个平台登录过期、限流或采集失败时，不会改写或冷却另一个平台。
+会话分别保存到 `.cache`，下次启动自动复用；无需修改 `.env`。一个平台登录过期、限流或采集失败时，不会改写或冷却另一个平台。
 
 ## 启动
 
@@ -63,7 +63,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\setup_account.ps1 -Platform i
 - **启动提示 `init_import_site` 或 `UnicodeDecodeError`**：旧版在中文目录安装时可能写入了 GBK 路径，导致 UTF-8 启动失败。更新桌面版后双击 `启动应用.bat` 会自动修复，原路径文件会备份；无需删除 `.venv`、登录信息或下载文件。重新运行 `安装桌面版.bat` 也会先修复再安装。
 - **采集提示 `No module named 'playwright'`**：旧版虚拟环境缺少浏览器采集组件。更新后重新运行 `安装桌面版.bat`，再重试采集；仅复制 `third_party` 文件夹不会把依赖安装进 `.venv`。抖音接口返回 403 时也需要这些组件才能尝试已登录浏览器采集。
 - **页面打不开**：确认启动窗口仍在运行，或换一个端口执行 `powershell -ExecutionPolicy Bypass -File .\scripts\start_app.ps1 -Port 8766`。
-- **抖音/微博来源未安装**：重新双击 `安装桌面版.bat`，默认会补齐来源与依赖；网络失败的详细原因见 `.cache/source-install-latest.json`。显示“需要登录”时再运行对应平台的登录脚本。
+- **平台来源未安装**：重新双击 `安装桌面版.bat`，默认会补齐来源与依赖；网络失败的详细原因见 `.cache/source-install-latest.json`。显示“需要登录”时，在页面“平台登录”中点击对应平台的登录按钮。
 - **设置了数量但没有下载满**：查看“运行状态”中的找到数量和保存结果。按提示增加“最多检索作品数”或“每个作品最多张数”；若候选仍不足，说明平台当前可访问内容、筛选结果或去重后的文件少于目标。
 - **使用 CLI 是否不会触发风控**：不会。CLI 用来隔离平台实现并稳定传递结构化结果，平台仍能识别账号、Cookie、IP 和访问频率。大批量任务会分页、限速并支持续传；出现验证码、403、412、429 或 Cookie 失效时，按日志建议重新登录或稍后重试。
 

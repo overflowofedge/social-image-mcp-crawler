@@ -1,4 +1,4 @@
-"""Official QR login with automatic session capture, usable by UI or CLI."""
+"""Official platform login with automatic session capture, usable by UI or CLI."""
 from __future__ import annotations
 
 import argparse
@@ -8,16 +8,21 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
-from social_image_mcp.accounts import PLATFORMS, cookie_header, has_auth, read_session, save_session
+from social_image_mcp.accounts import PLATFORMS, QR_PLATFORMS, cookie_header, has_auth, read_session, save_session
 
 LOGIN_URLS = {
     "douyin": "https://creator.douyin.com/",
     "weibo": "https://passport.weibo.com/sso/signin?entry=miniblog&source=miniblog",
+    "xhs": "https://www.xiaohongshu.com/explore",
+    "bilibili": "https://passport.bilibili.com/login",
+    "x": "https://x.com/i/flow/login",
+    "instagram": "https://www.instagram.com/accounts/login/",
 }
 ACTIVE_STATES = {"opening", "waiting", "verifying", "saving", "cancelling"}
 
@@ -33,6 +38,44 @@ async def _weibo_authenticated(context) -> bool:
             payload = await response.json()
             data = payload.get("data", {})
             if isinstance(data, dict) and data.get("login") in (True, 1, "1"):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _bilibili_authenticated(context) -> bool:
+    try:
+        response = await context.request.get("https://api.bilibili.com/x/web-interface/nav", timeout=5000)
+        if response.status != 200:
+            return False
+        payload = await response.json()
+        return payload.get("code") == 0 and payload.get("data", {}).get("isLogin") is True
+    except Exception:
+        return False
+
+
+def _xhs_account_response(payload: dict) -> bool:
+    if not isinstance(payload, dict) or payload.get("success") is False:
+        return False
+    data = payload.get("data")
+    if not isinstance(data, dict) or data.get("guest") is True:
+        return False
+    result = data.get("result")
+    if isinstance(result, dict) and result.get("success") is True:
+        return True
+    return (data.get("guest") is False and bool(data.get("user_id") or data.get("userid")))
+
+
+async def _xhs_authenticated(context, confirmed: bool) -> bool:
+    if confirmed:
+        return True
+    # A guest may also have web_session. Require official account information
+    # or the signed-in profile link used by the website itself.
+    for page in context.pages:
+        try:
+            selector = 'xpath=//a[contains(@href, "/user/profile/")]//span[text()="我"]'
+            if await page.locator(selector).first.is_visible():
                 return True
         except Exception:
             continue
@@ -77,15 +120,35 @@ async def _login_browser_session(platform: str, root: Path, cancel: threading.Ev
             # A fresh context ensures '重新登录' can select a different account.
             # Do not use or alter the user's regular browser profile.
             context = await browser.new_context()
+            xhs_confirmed = False
+
+            async def observe_xhs(response):
+                nonlocal xhs_confirmed
+                parsed = urlparse(response.url)
+                if (parsed.hostname == "edith.xiaohongshu.com"
+                        and parsed.path in {"/api/sns/web/v1/user/selfinfo", "/api/sns/web/v2/user/me"}
+                        and response.status == 200):
+                    try:
+                        payload = await response.json()
+                        if isinstance(payload, dict) and _xhs_account_response(payload):
+                            xhs_confirmed = True
+                    except Exception:
+                        pass
+
+            if platform == "xhs":
+                context.on("response", observe_xhs)
             page = await context.new_page()
             await page.goto(LOGIN_URLS[platform], wait_until="domcontentloaded", timeout=45000)
-            if platform == "douyin":
+            if platform in {"douyin", "xhs"}:
                 for text in ("登录", "扫码登录"):
                     try:
                         await page.get_by_text(text, exact=True).first.click(timeout=2500)
                     except Exception:
                         pass
-            update("waiting", f"请使用{PLATFORMS[platform]} App 扫码，并在手机上确认登录。成功后会自动保存。")
+            message = (f"请使用{PLATFORMS[platform]} App 扫码，并在手机上确认登录。成功后会自动保存。"
+                       if platform in QR_PLATFORMS else
+                       f"请在官方窗口完成 {PLATFORMS[platform]} 登录及验证，成功后会自动保存。")
+            update("waiting", message)
             deadline = time.monotonic() + timeout
             warmed = False
             last_verification = 0.0
@@ -96,8 +159,8 @@ async def _login_browser_session(platform: str, root: Path, cancel: threading.Ev
                     raise asyncio.CancelledError()
                 state = await context.storage_state()
                 if has_auth(platform, state):
-                    if not warmed:
-                        update("verifying", "已检测到扫码确认，正在同步登录状态…")
+                    if not warmed and platform in {"douyin", "weibo"}:
+                        update("verifying", "已检测到登录确认，正在同步登录状态…")
                         # Weibo's desktop and mobile sites have separate cookies.
                         warm_page = await context.new_page()
                         try:
@@ -129,17 +192,34 @@ async def _login_browser_session(platform: str, root: Path, cancel: threading.Ev
                             update("verifying", "正在确认微博登录；如窗口要求安全验证，请按平台提示完成。")
                             await asyncio.sleep(0.5)
                             continue
+                    if platform == "bilibili":
+                        now = time.monotonic()
+                        if now - last_verification < 3:
+                            await asyncio.sleep(0.5)
+                            continue
+                        last_verification = now
+                        update("verifying", "正在确认 B 站账号登录状态…")
+                        if not await _bilibili_authenticated(context):
+                            await asyncio.sleep(0.5)
+                            continue
+                    if platform == "xhs" and not await _xhs_authenticated(context, xhs_confirmed):
+                        # Keep the guest session in memory until login is
+                        # confirmed. Do not persist it or close the QR window.
+                        await asyncio.sleep(0.5)
+                        continue
                     if cancel.is_set():
                         raise asyncio.CancelledError()
                     update("saving", "登录已确认，正在保存到本机…")
                     save_session(platform, await context.storage_state(), root)
                     return
                 await asyncio.sleep(0.5)
-            raise TimeoutError("扫码登录超时，请点击登录重试；已有登录信息会保留。")
+            raise TimeoutError("登录超时，请点击登录重试；已有登录信息会保留。")
         finally:
-            if context:
-                await context.close()
-            await browser.close()
+            try:
+                if context:
+                    await context.close()
+            finally:
+                await browser.close()
 
 
 class LoginManager:
@@ -156,16 +236,18 @@ class LoginManager:
 
     def status(self, platform: str) -> dict:
         if platform not in PLATFORMS:
-            raise ValueError("目前应用内扫码登录支持抖音和微博。")
+            raise ValueError("请选择支持的平台登录；普通网页无需平台账号。")
         with self._lock:
             saved = has_auth(platform, read_session(platform, self.root))
             job = self._jobs.get(platform)
             data = dict(job) if job else {
                 "platform": platform, "state": "logged_in" if saved else "login_required",
-                "message": "已保存登录状态，可直接采集。" if saved else "首次使用请点击扫码登录。",
+                "message": "已保存登录状态，可直接采集。" if saved else (
+                    "首次使用请点击扫码登录。" if platform in QR_PLATFORMS else "首次使用请点击网页登录。"),
             }
             if not saved and data["state"] == "completed":
-                data.update(state="login_required", message="保存的登录状态缺失或已过期，请重新扫码登录。")
+                data.update(state="login_required", message="保存的登录状态缺失或已过期，请重新登录。")
+            data["login_label"] = "扫码登录" if platform in QR_PLATFORMS else "网页登录"
             data["session_available"] = saved
             data["active"] = data["state"] in ACTIVE_STATES
             return data
@@ -180,7 +262,7 @@ class LoginManager:
                 return current
             task_id = uuid.uuid4().hex
             self._jobs[platform] = {"task_id": task_id, "platform": platform,
-                                    "state": "opening", "message": "正在启动扫码登录…"}
+                                    "state": "opening", "message": "正在启动官方登录…"}
             cancel = threading.Event()
             self._cancel[platform] = cancel
             thread = threading.Thread(target=self._run, args=(platform, task_id, cancel), daemon=True)
@@ -200,7 +282,7 @@ class LoginManager:
         try:
             asyncio.run(self.login(platform, self.root, cancel, update))
             if not has_auth(platform, read_session(platform, self.root)):
-                raise RuntimeError("登录信息未保存，请重试扫码登录。")
+                raise RuntimeError("登录信息未保存，请重试登录。")
             if self.on_success:
                 self.on_success(platform)
             update("completed", "登录成功，已自动保存。现在可以直接采集，无需重启。")

@@ -19,6 +19,7 @@ from typing import Any
 import httpx
 from urllib.parse import urlencode
 
+from .accounts import cookie_header, read_session
 from .creator_protocol import creator_target, pack_cursor, unpack_cursor
 from .media_quality import audio_stream_score, is_hdr_video, video_stream_score
 from .models import CreatorFetchRequest, CreatorIdentity, ImageCandidate, Platform
@@ -120,11 +121,15 @@ class BilibiliApi:
     async def _request_payload(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         if self.client is None:
             raise BilibiliError("Bilibili API client is not initialized")
+        headers = dict(self.headers)
+        saved = cookie_header("bilibili", read_session("bilibili"), self.base_url + path)
+        if saved:
+            headers["Cookie"] = saved
         try:
             response = await self.client.get(
                 self.base_url + path,
                 params=params,
-                headers=self.headers,
+                headers=headers,
                 timeout=httpx.Timeout(self.timeout_seconds, connect=4.0),
                 follow_redirects=True,
             )

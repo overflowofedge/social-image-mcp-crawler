@@ -105,7 +105,8 @@ def _parser() -> argparse.ArgumentParser:
 
 async def _run(args: argparse.Namespace) -> None:
     timeout = float(os.getenv("BILIBILI_SOURCE_TIMEOUT_SECONDS", os.getenv("NATIVE_API_TIMEOUT_SECONDS", "12")))
-    cookie = os.getenv("BILIBILI_COOKIE") or ""
+    from social_image_mcp.accounts import cookie_header, read_session
+    cookie = cookie_header("bilibili", read_session("bilibili", ROOT), "https://api.bilibili.com/") or os.getenv("BILIBILI_COOKIE") or ""
     async with httpx.AsyncClient() as client:
         api = BilibiliApi(client, cookie=cookie, timeout_seconds=timeout)
         if args.health_check:

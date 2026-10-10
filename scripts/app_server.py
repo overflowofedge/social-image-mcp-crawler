@@ -253,11 +253,12 @@ def _error_guidance(message: str, platform: str) -> tuple[str, str]:
         if platform == "douyin":
             action = "在页面“平台登录”中点击抖音重新登录，完成验证后再试；仍失败时稍后重试或更换网络。"
         elif platform == "bilibili":
-            action = "稍后重试；频繁出现时，在 .env 中更新 BILIBILI_COOKIE 后重启桌面版。"
+            action = "稍后重试；频繁出现时，在页面“平台登录”中点击 B 站重新登录，完成验证后直接重试。"
         return f"{label}触发了访问频率限制或安全验证，本次请求被平台拒绝。", action
     if any(marker in lowered for marker in ("cookie", "login", "logged in", "登录", "扫码", "unauthorized", "-101")):
-        action = ("在页面“平台登录”中点击该平台扫码登录，手机确认成功后直接重试。"
-                  if platform in {"douyin", "weibo"} else "重新完成该平台登录或扫码验证，然后重启桌面版再试。")
+        action = ("在页面“平台登录”中点击该平台登录，按官方窗口提示完成登录和验证后直接重试。"
+                  if platform in {"douyin", "weibo", "xhs", "bilibili", "x", "instagram"}
+                  else "检查该网页的访问权限和登录要求后重试。")
         return f"{label}登录状态缺失或已经失效。", action
     if any(marker in lowered for marker in ("creator_identity_unresolved", "identity_unresolved", "matched 0", "not found", "没有找到")):
         return "没有确认到唯一的账号，昵称可能不准确、存在同名账号，或账号未公开。", "核对完整昵称；仍无法识别时粘贴该账号的完整主页链接。"

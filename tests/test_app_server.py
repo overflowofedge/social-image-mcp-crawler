@@ -146,7 +146,7 @@ def test_bilibili_wbi_failure_has_plain_language_guidance():
     reason, action = _error_guidance("WBI API error -352", "bilibili")
 
     assert "安全验证" in reason
-    assert "BILIBILI_COOKIE" in action
+    assert "平台登录" in action and "直接重试" in action
 
 
 def test_missing_query_guidance_tells_user_what_to_enter():
@@ -350,9 +350,11 @@ def test_search_task_failure_is_visible_through_progress_endpoint():
     assert task["activity"][-1]["level"] == "error"
 
 
-def test_login_http_is_async_deduplicated_and_can_be_cancelled(monkeypatch, tmp_path):
+@pytest.mark.parametrize("platform", ["douyin", "weibo", "xhs", "bilibili", "x", "instagram"])
+def test_login_http_is_async_deduplicated_and_can_be_cancelled(monkeypatch, tmp_path, platform):
     from scripts.account_login import LoginManager
-    monkeypatch.setenv("WEIBO_BROWSER_STORAGE_STATE", str(tmp_path / "weibo.json"))
+    monkeypatch.setenv(f"{platform.upper()}_BROWSER_STORAGE_STATE", str(tmp_path / "session.json"))
+    monkeypatch.delenv(f"{platform.upper()}_GALLERY_DL_COOKIES_FILE", raising=False)
     waiting = threading.Event()
 
     async def login(platform, root, cancel, update):
@@ -375,19 +377,20 @@ def test_login_http_is_async_deduplicated_and_can_be_cancelled(monkeypatch, tmp_
             with urlopen(request, timeout=2) as response:
                 return response.status, json.loads(response.read())
 
-        status, first = post("/api/login", {"platform": "weibo"}, base)
+        status, first = post("/api/login", {"platform": platform}, base)
         assert status == 202 and waiting.wait(1)
-        _, repeated = post("/api/login", {"platform": "weibo"})
+        _, repeated = post("/api/login", {"platform": platform})
         assert first["task_id"] == repeated["task_id"]
         with urlopen(base + "/api/login") as response:
             platforms = json.loads(response.read())["platforms"]
-        assert next(row for row in platforms if row["platform"] == "weibo")["state"] == "waiting"
+        assert {row["platform"] for row in platforms} == {"douyin", "weibo", "xhs", "bilibili", "x", "instagram"}
+        assert next(row for row in platforms if row["platform"] == platform)["state"] == "waiting"
         with pytest.raises(HTTPError) as error:
-            post("/api/login", {"platform": "weibo"}, "https://untrusted.test")
+            post("/api/login", {"platform": platform}, "https://untrusted.test")
         assert error.value.code == 403
         with pytest.raises(HTTPError) as error:
-            post("/api/login", {"platform": "xhs"})
+            post("/api/login", {"platform": "unsupported"})
         assert error.value.code == 400
-        post("/api/login/cancel", {"platform": "weibo"})
+        post("/api/login/cancel", {"platform": platform})
     manager.close()
-    assert manager.status("weibo")["state"] == "cancelled"
+    assert manager.status(platform)["state"] == "cancelled"

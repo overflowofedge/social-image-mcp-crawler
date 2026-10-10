@@ -102,6 +102,10 @@ async def _run(args: argparse.Namespace) -> list[dict[str, Any]]:
     settings = Settings(root=vendor_root / "Volume")
     options = settings.run().copy()
     options.update({"image_download": False, "video_download": False, "live_download": False, "download_record": False})
+    from social_image_mcp.accounts import cookie_header, read_session
+    saved = cookie_header("xhs", read_session("xhs", ROOT), "https://www.xiaohongshu.com/")
+    if saved:
+        options["cookie"] = saved
     results: list[dict[str, Any]] = []
     # XHS-Downloader logs through its own console helper. Keep stdout clean for
     # the JSON contract, including constructor/context-manager messages.
