@@ -25,6 +25,20 @@ LOGIN_URLS = {
     "instagram": "https://www.instagram.com/accounts/login/",
 }
 ACTIVE_STATES = {"opening", "waiting", "verifying", "saving", "cancelling"}
+LOGIN_PAGE_HOSTS = {
+    "douyin": {"douyin.com"},
+    "x": {"x.com", "twitter.com"},
+}
+
+
+def _page_belongs_to_login(platform: str, page) -> bool:
+    """Return whether a popup can be part of this platform's login flow."""
+    url = str(getattr(page, "url", "") or "")
+    if not url:
+        return True
+    hostname = (urlparse(url).hostname or "").lower().lstrip(".")
+    return any(hostname == domain or hostname.endswith("." + domain)
+               for domain in LOGIN_PAGE_HOSTS.get(platform, set()))
 
 
 async def _weibo_authenticated(context) -> bool:
@@ -138,6 +152,17 @@ async def _login_browser_session(platform: str, root: Path, cancel: threading.Ev
 
             if platform == "xhs":
                 context.on("response", observe_xhs)
+            pending_pages = []
+
+            def observe_login_page(new_page):
+                if new_page not in pending_pages:
+                    pending_pages.append(new_page)
+
+            # Some official login flows open a popup instead of navigating the
+            # original tab. Keep the newest platform page and close the old
+            # one so the user sees one stable login window.
+            if platform in LOGIN_PAGE_HOSTS and hasattr(context, "on"):
+                context.on("page", observe_login_page)
             page = await context.new_page()
             await page.goto(LOGIN_URLS[platform], wait_until="domcontentloaded", timeout=45000)
             if platform in {"douyin", "xhs"}:
@@ -155,12 +180,27 @@ async def _login_browser_session(platform: str, root: Path, cancel: threading.Ev
                        f"请在官方窗口完成 {PLATFORMS[platform]} 登录及验证，成功后会自动保存。")
             update("waiting", message)
             deadline = time.monotonic() + timeout
-            last_verification = 0.0
             while time.monotonic() < deadline:
                 if cancel.is_set():
                     raise asyncio.CancelledError()
                 if not browser.is_connected() or not context.pages:
                     raise asyncio.CancelledError()
+                while pending_pages:
+                    candidate = pending_pages.pop(0)
+                    if candidate is page:
+                        continue
+                    if not _page_belongs_to_login(platform, candidate):
+                        try:
+                            await candidate.close()
+                        except Exception:
+                            pass
+                        continue
+                    previous = page
+                    page = candidate
+                    try:
+                        await previous.close()
+                    except Exception:
+                        pass
                 state = await context.storage_state()
                 if has_auth(platform, state):
                     if platform == "douyin":
@@ -168,26 +208,6 @@ async def _login_browser_session(platform: str, root: Path, cancel: threading.Ev
                         if not any(part.strip().split("=", 1)[0] in {"sessionid", "sessionid_ss"}
                                    for part in web_cookie.split(";")):
                             update("verifying", "正在同步抖音登录状态，请完成窗口中的平台验证。")
-                            await asyncio.sleep(0.5)
-                            continue
-                    if platform == "weibo":
-                        now = time.monotonic()
-                        if now - last_verification < 3:
-                            await asyncio.sleep(0.5)
-                            continue
-                        last_verification = now
-                        if not await _weibo_authenticated(context):
-                            update("verifying", "正在确认微博登录，请按当前官方窗口提示完成验证。")
-                            await asyncio.sleep(0.5)
-                            continue
-                    if platform == "bilibili":
-                        now = time.monotonic()
-                        if now - last_verification < 3:
-                            await asyncio.sleep(0.5)
-                            continue
-                        last_verification = now
-                        update("verifying", "正在确认 B 站账号登录状态…")
-                        if not await _bilibili_authenticated(context):
                             await asyncio.sleep(0.5)
                             continue
                     if platform == "xhs" and not await _xhs_authenticated(context, xhs_confirmed):
