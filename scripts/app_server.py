@@ -244,17 +244,6 @@ def _error_guidance(message: str, platform: str) -> tuple[str, str]:
             "抖音短链接没有被正确识别为主页或作品链接。",
             "请重试该链接；若平台已更新短链格式，可粘贴完整的 https://www.douyin.com/user/... 主页链接。",
         )
-    if any(marker in lowered for marker in (
-        "verify_check", "wbi", "rate limit", "risk control", "验证码",
-        "api error -352", "api error -412", "http 412", "http 403", "http 429",
-        "temporarily rejected",
-    )):
-        action = "稍后重试，并确认平台登录状态正常。"
-        if platform == "douyin":
-            action = "在页面“平台登录”中点击抖音重新登录，完成验证后再试；仍失败时稍后重试或更换网络。"
-        elif platform == "bilibili":
-            action = "稍后重试；频繁出现时，在页面“平台登录”中点击 B 站重新登录，完成验证后直接重试。"
-        return f"{label}触发了访问频率限制或安全验证，本次请求被平台拒绝。", action
     if platform == "other":
         if any(marker in lowered for marker in (
             "no image candidates", "no candidates", "returned no", "没有找到可下载",
@@ -266,12 +255,24 @@ def _error_guidance(message: str, platform: str) -> tuple[str, str]:
             )
         if any(marker in lowered for marker in (
             "cookie", "login", "logged in", "登录", "扫码", "unauthorized",
-            "http 401", "http 403", "http 407", "forbidden",
+            "http 401", "http 403", "http 407", "forbidden", "rate limit",
+            "verify_check", "验证码", "risk control",
         )):
             return (
                 "自定义网页访问失败，页面可能需要权限或登录。",
                 "检查网页地址、访问权限和页面登录要求后重试；自定义网页不会使用平台登录卡片。",
             )
+    if any(marker in lowered for marker in (
+        "verify_check", "wbi", "rate limit", "risk control", "验证码",
+        "api error -352", "api error -412", "http 412", "http 403", "http 429",
+        "temporarily rejected",
+    )):
+        action = "稍后重试，并确认平台登录状态正常。"
+        if platform == "douyin":
+            action = "在页面“平台登录”中点击抖音重新登录，完成验证后再试；仍失败时稍后重试或更换网络。"
+        elif platform == "bilibili":
+            action = "稍后重试；频繁出现时，在页面“平台登录”中点击 B 站重新登录，完成验证后直接重试。"
+        return f"{label}触发了访问频率限制或安全验证，本次请求被平台拒绝。", action
     if any(marker in lowered for marker in ("cookie", "login", "logged in", "登录", "扫码", "unauthorized", "-101")):
         action = ("在页面“平台登录”中点击该平台登录，按官方窗口提示完成登录和验证后直接重试。"
                   if platform in {"douyin", "weibo", "xhs", "bilibili", "x", "instagram"}
@@ -362,10 +363,13 @@ def _task_report(body: dict, result: dict, elapsed_seconds: float) -> dict:
     scope = f"，最多检查 {requested['max_posts']} 个作品" if requested["max_posts"] else ""
     logs.append({"level": "info", "message": f"目标：{'，'.join(target_parts) or '检索媒体'}{scope}。"})
     if requested["images"] > 200 or requested["videos"] > 200 or requested["max_posts"] > 100:
+        action = ("请保持桌面版运行；网页采集仍受页面访问频率和动态加载限制，遇到验证时按网页提示处理。"
+                  if platform == "other" else
+                  "请保持桌面版运行；CLI 仍受平台访问频率和登录状态限制，遇到验证时请按后续日志处理。")
         logs.append({
             "level": "warning",
             "message": "这是大批量任务，程序会分页采集并继续使用增量去重。",
-            "action": "请保持桌面版运行；CLI 仍受平台访问频率和登录状态限制，遇到验证时请按后续日志处理。",
+            "action": action,
         })
 
     identity = result.get("identity") if isinstance(result.get("identity"), dict) else None
