@@ -255,6 +255,23 @@ def _error_guidance(message: str, platform: str) -> tuple[str, str]:
         elif platform == "bilibili":
             action = "稍后重试；频繁出现时，在页面“平台登录”中点击 B 站重新登录，完成验证后直接重试。"
         return f"{label}触发了访问频率限制或安全验证，本次请求被平台拒绝。", action
+    if platform == "other":
+        if any(marker in lowered for marker in (
+            "no image candidates", "no candidates", "returned no", "没有找到可下载",
+            "页面可能需要登录", "正文图片或直接视频",
+        )):
+            return (
+                "自定义网页没有找到可下载的正文图片或直接视频。",
+                "确认网址指向具体内容页面，并检查页面是否需要登录或依赖浏览器动态加载后重试。",
+            )
+        if any(marker in lowered for marker in (
+            "cookie", "login", "logged in", "登录", "扫码", "unauthorized",
+            "http 401", "http 403", "http 407", "forbidden",
+        )):
+            return (
+                "自定义网页访问失败，页面可能需要权限或登录。",
+                "检查网页地址、访问权限和页面登录要求后重试；自定义网页不会使用平台登录卡片。",
+            )
     if any(marker in lowered for marker in ("cookie", "login", "logged in", "登录", "扫码", "unauthorized", "-101")):
         action = ("在页面“平台登录”中点击该平台登录，按官方窗口提示完成登录和验证后直接重试。"
                   if platform in {"douyin", "weibo", "xhs", "bilibili", "x", "instagram"}
@@ -274,6 +291,8 @@ def _error_guidance(message: str, platform: str) -> tuple[str, str]:
         return "访问平台或媒体服务器时网络连接失败。", "检查网络和代理设置后重试；也可减少单次任务数量。"
     if any(marker in lowered for marker in ("content_filter_required", "required object", "no image matched")):
         return "严格内容筛选没有找到符合条件的内容。", "放宽内容筛选条件，或将筛选模式改为“尽量筛选”。"
+    if platform == "other":
+        return f"自定义网页任务未完成：{raw}", "检查网页地址、访问权限、动态加载和网络连接后重试。"
     return f"{label}任务未完成：{raw}", "检查账号或网址是否公开、登录状态和网络连接，然后重试。"
 
 
@@ -446,6 +465,8 @@ def _task_report(body: dict, result: dict, elapsed_seconds: float) -> dict:
             action = "已检查完本次设置的作品范围；可增加“最多检索作品数”，或更新平台登录状态后重试。"
         else:
             action = "程序已自动读取平台返回的后续页面；若仍不足，请更新平台登录状态后重试。"
+        if platform == "other":
+            action = "确认网址指向具体内容页面；必要时开启浏览器动态加载并检查网页访问权限。"
         if media == "images" and requested["per_post_limit"] and requested["max_posts"]:
             capacity = requested["per_post_limit"] * requested["max_posts"]
             if requested["images"] > capacity:

@@ -391,6 +391,76 @@ def test_weibo_login_verification_requires_official_logged_in_response():
     assert not asyncio.run(_weibo_authenticated(Context()))
 
 
+def test_weibo_login_uses_one_sso_page_and_does_not_open_mobile_login(monkeypatch, tmp_path):
+    from scripts import account_login
+    monkeypatch.setenv("WEIBO_BROWSER_STORAGE_STATE", str(tmp_path / "weibo.json"))
+    opened_urls = []
+    new_pages = []
+
+    class Response:
+        status = 200
+        async def json(self):
+            return {"data": {"login": True}}
+
+    class Request:
+        async def get(self, url, **kwargs):
+            assert url == "https://weibo.com/ajax/config"
+            return Response()
+
+    class Page:
+        async def goto(self, url, **kwargs):
+            opened_urls.append(url)
+
+    page = Page()
+
+    class Context:
+        pages = [page]
+        request = Request()
+        async def new_page(self):
+            new_pages.append(page)
+            self.pages.append(page)
+            return page
+        async def storage_state(self):
+            return {"cookies": [{"name": "SUB", "value": "single-sso", "domain": ".weibo.com",
+                                  "path": "/", "expires": -1}], "origins": []}
+        async def close(self):
+            pass
+
+    context = Context()
+
+    class Browser:
+        def is_connected(self):
+            return True
+        async def new_context(self):
+            return context
+        async def close(self):
+            pass
+
+    browser = Browser()
+
+    class Chromium:
+        async def launch(self, **kwargs):
+            return browser
+
+    class Playwright:
+        chromium = Chromium()
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+
+    monkeypatch.setattr("playwright.async_api.async_playwright", lambda: Playwright())
+    monkeypatch.setattr("scripts.preflight._browser_channel", lambda: None)
+    asyncio.run(account_login._login_browser_session(
+        "weibo", tmp_path, threading.Event(), lambda *_: None, timeout=2,
+    ))
+
+    assert opened_urls == [account_login.LOGIN_URLS["weibo"]]
+    # The single page is the SSO window itself; no second m.weibo login page.
+    assert len(new_pages) == 1
+    assert read_session("weibo", tmp_path)["cookies"][0]["value"] == "single-sso"
+
+
 def test_cancel_interrupts_even_a_stalled_login_navigation(monkeypatch, tmp_path):
     from scripts import account_login
     started, cleaned = threading.Event(), threading.Event()

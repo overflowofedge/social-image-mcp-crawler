@@ -168,6 +168,25 @@ def test_douyin_short_link_parse_failure_is_not_reported_as_expired_login():
     assert "douyin.com/user" in action
 
 
+def test_empty_custom_webpage_is_not_reported_as_expired_login():
+    reason, action = _error_guidance(
+        "没有找到可下载的正文图片或直接视频文件；已过滤图标、Logo 和小图。页面可能需要登录或动态加载。",
+        "other",
+    )
+
+    assert reason == "自定义网页没有找到可下载的正文图片或直接视频。"
+    assert "登录状态" not in reason
+    assert "具体内容页面" in action
+
+
+def test_custom_webpage_login_error_does_not_use_platform_login_logic():
+    reason, action = _error_guidance("网页访问失败：HTTP 401 Unauthorized; login required", "other")
+
+    assert reason == "自定义网页访问失败，页面可能需要权限或登录。"
+    assert "平台登录卡片" in action
+    assert "登录状态缺失" not in reason
+
+
 def test_task_report_separates_each_download_outcome():
     statuses = ["downloaded", "existing", "duplicate", "rejected", "failed"]
     result = {

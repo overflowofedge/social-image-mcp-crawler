@@ -28,9 +28,10 @@ ACTIVE_STATES = {"opening", "waiting", "verifying", "saving", "cancelling"}
 
 
 async def _weibo_authenticated(context) -> bool:
-    # Some networks report mobile /api/config as logged out despite a working
-    # desktop session. Both checks are official account-state endpoints.
-    for url in ("https://m.weibo.cn/api/config", "https://weibo.com/ajax/config"):
+    # Check the desktop account endpoint first. Do not open a second mobile
+    # login page just to obtain a second cookie: the SSO session is shared by
+    # the crawler and the browser context already carries all returned cookies.
+    for url in ("https://weibo.com/ajax/config", "https://m.weibo.cn/api/config"):
         try:
             response = await context.request.get(url, timeout=5000)
             if response.status != 200:
@@ -150,7 +151,6 @@ async def _login_browser_session(platform: str, root: Path, cancel: threading.Ev
                        f"请在官方窗口完成 {PLATFORMS[platform]} 登录及验证，成功后会自动保存。")
             update("waiting", message)
             deadline = time.monotonic() + timeout
-            warmed = False
             last_verification = 0.0
             while time.monotonic() < deadline:
                 if cancel.is_set():
@@ -159,17 +159,6 @@ async def _login_browser_session(platform: str, root: Path, cancel: threading.Ev
                     raise asyncio.CancelledError()
                 state = await context.storage_state()
                 if has_auth(platform, state):
-                    if not warmed and platform in {"douyin", "weibo"}:
-                        update("verifying", "已检测到登录确认，正在同步登录状态…")
-                        # Weibo's desktop and mobile sites have separate cookies.
-                        warm_page = await context.new_page()
-                        try:
-                            await warm_page.goto("https://m.weibo.cn/" if platform == "weibo"
-                                                 else "https://www.douyin.com/",
-                                                 wait_until="domcontentloaded", timeout=15000)
-                        except Exception:
-                            pass
-                        warmed = True
                     if platform == "douyin":
                         web_cookie = cookie_header("douyin", await context.storage_state(), "https://www.douyin.com/")
                         if not any(part.strip().split("=", 1)[0] in {"sessionid", "sessionid_ss"}
@@ -183,13 +172,8 @@ async def _login_browser_session(platform: str, root: Path, cancel: threading.Ev
                             await asyncio.sleep(0.5)
                             continue
                         last_verification = now
-                        mobile_cookie = cookie_header("weibo", await context.storage_state(), "https://m.weibo.cn/")
-                        if not any(part.strip().startswith("SUB=") for part in mobile_cookie.split(";")):
-                            update("verifying", "正在同步微博手机版登录状态，请完成窗口中的平台验证。")
-                            await asyncio.sleep(0.5)
-                            continue
                         if not await _weibo_authenticated(context):
-                            update("verifying", "正在确认微博登录；如窗口要求安全验证，请按平台提示完成。")
+                            update("verifying", "正在确认微博登录，请按当前官方窗口提示完成验证。")
                             await asyncio.sleep(0.5)
                             continue
                     if platform == "bilibili":
