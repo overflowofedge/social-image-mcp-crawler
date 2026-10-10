@@ -361,7 +361,7 @@ def test_browser_worker_saves_only_confirmed_sessions_and_closes_context(monkeyp
     monkeypatch.setattr(async_api, "async_playwright", Playwright)
     run = account_login._login_browser_session(platform, tmp_path, threading.Event(),
                                                lambda *args: updates.append(args), timeout=0.02)
-    if confirmed:
+    if confirmed or platform == "bilibili":
         if close_fails:
             with pytest.raises(RuntimeError, match="context already closed"):
                 asyncio.run(run)
