@@ -36,3 +36,18 @@ def test_fresh_dy_cli_resolves_hyphenated_profile_shares_after_install(tmp_path)
     first = path.read_bytes()
     MODULE.apply_compatibility("dy-cli", tmp_path)
     assert path.read_bytes() == first
+
+
+def test_existing_creator_method_does_not_skip_legacy_short_link_repair(tmp_path):
+    path = tmp_path / "src/dy_cli/engines/api_client.py"
+    path.parent.mkdir(parents=True)
+    path.write_text('import re\nSHORT_URL_PATTERN = re.compile(r"https?://v\\.douyin\\.com/\\w+/?")\n# custom local method\nclass DouyinAPIClient:\n    def resolve_creator_share_url(self, url):\n        return "custom result"\n', encoding="utf-8")
+    MODULE.apply_compatibility("dy-cli", tmp_path)
+    namespace = {}
+    exec(path.read_text(encoding="utf-8"), namespace)
+    assert namespace["SHORT_URL_PATTERN"].fullmatch("https://v.douyin.com/Ab-c_d/?from=share")
+    assert namespace["DouyinAPIClient"]().resolve_creator_share_url("test") == "custom result"
+    assert "# custom local method" in path.read_text(encoding="utf-8")
+    first = path.read_bytes()
+    MODULE.apply_compatibility("dy-cli", tmp_path)
+    assert path.read_bytes() == first

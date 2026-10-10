@@ -66,10 +66,17 @@ def apply_compatibility(name: str, target: Path) -> None:
     elif name == "dy-cli":
         path = target / "src/dy_cli/engines/api_client.py"
         content = path.read_text(encoding="utf-8")
-        if "def resolve_creator_share_url(" in content:
-            return
         old = 'SHORT_URL_PATTERN = re.compile(r"https?://v\\.douyin\\.com/\\w+/?")'
-        new = 'SHORT_URL_PATTERN = re.compile(r"https?://v\\.douyin\\.com/[A-Za-z0-9_-]+/?(?:[?#].*)?$", re.I)\nCREATOR_SHARE_URL_PATTERN = re.compile(r"https?://(?:www\\.)?(?:douyin\\.com|iesdouyin\\.com)/(?:share/user|user)/([^/?#]+)", re.I)'
+        short_pattern = 'SHORT_URL_PATTERN = re.compile(r"https?://v\\.douyin\\.com/[A-Za-z0-9_-]+/?(?:[?#].*)?$", re.I)'
+        if "def resolve_creator_share_url(" in content:
+            # Older local installs may already have the creator method while
+            # retaining the original short-link regex. Repair it independently.
+            if old in content:
+                content = content.replace(old, short_pattern, 1)
+                compile(content, str(path), "exec")
+                path.write_text(content, encoding="utf-8")
+            return
+        new = short_pattern + '\nCREATOR_SHARE_URL_PATTERN = re.compile(r"https?://(?:www\\.)?(?:douyin\\.com|iesdouyin\\.com)/(?:share/user|user)/([^/?#]+)", re.I)'
         anchor = '    def resolve_share_url(self, url: str) -> str:\n'
         if old not in content or anchor not in content:
             raise RuntimeError(f"Profile-share repair does not match {path}; existing file was preserved")
