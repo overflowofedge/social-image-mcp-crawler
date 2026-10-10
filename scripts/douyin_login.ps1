@@ -19,7 +19,7 @@ $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $OutputEncoding = $Utf8NoBom
 
 Write-Output "A browser window will open. Scan the Douyin QR code to log in."
-& $Python (Join-Path $PSScriptRoot "douyin_login.py")
+& $Python (Join-Path $PSScriptRoot "account_login.py") --platform douyin
 if ($LASTEXITCODE -ne 0) {
     throw "dy-cli login failed with exit code $LASTEXITCODE"
 }

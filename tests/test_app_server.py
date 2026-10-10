@@ -7,6 +7,7 @@ from pathlib import Path
 import threading
 import time
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 
 import pytest
 
@@ -347,3 +348,46 @@ def test_search_task_failure_is_visible_through_progress_endpoint():
     assert task["state"] == "failed"
     assert task["result"]["error"]["message"] == "source unavailable"
     assert task["activity"][-1]["level"] == "error"
+
+
+def test_login_http_is_async_deduplicated_and_can_be_cancelled(monkeypatch, tmp_path):
+    from scripts.account_login import LoginManager
+    monkeypatch.setenv("WEIBO_BROWSER_STORAGE_STATE", str(tmp_path / "weibo.json"))
+    waiting = threading.Event()
+
+    async def login(platform, root, cancel, update):
+        update("waiting", "等待手机确认")
+        waiting.set()
+        while not cancel.is_set():
+            await asyncio.sleep(0.01)
+        raise asyncio.CancelledError()
+
+    manager = LoginManager(tmp_path, login)
+    monkeypatch.setattr(_MODULE.Handler, "logins", manager)
+    with running_server(_MODULE.Handler) as server:
+        base = f"http://127.0.0.1:{server.server_port}"
+
+        def post(path, data, origin=None):
+            headers = {"Content-Type": "application/json"}
+            if origin:
+                headers["Origin"] = origin
+            request = Request(base + path, data=json.dumps(data).encode(), headers=headers, method="POST")
+            with urlopen(request, timeout=2) as response:
+                return response.status, json.loads(response.read())
+
+        status, first = post("/api/login", {"platform": "weibo"}, base)
+        assert status == 202 and waiting.wait(1)
+        _, repeated = post("/api/login", {"platform": "weibo"})
+        assert first["task_id"] == repeated["task_id"]
+        with urlopen(base + "/api/login") as response:
+            platforms = json.loads(response.read())["platforms"]
+        assert next(row for row in platforms if row["platform"] == "weibo")["state"] == "waiting"
+        with pytest.raises(HTTPError) as error:
+            post("/api/login", {"platform": "weibo"}, "https://untrusted.test")
+        assert error.value.code == 403
+        with pytest.raises(HTTPError) as error:
+            post("/api/login", {"platform": "xhs"})
+        assert error.value.code == 400
+        post("/api/login/cancel", {"platform": "weibo"})
+    manager.close()
+    assert manager.status("weibo")["state"] == "cancelled"

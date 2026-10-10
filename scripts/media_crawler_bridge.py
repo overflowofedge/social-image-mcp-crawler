@@ -25,6 +25,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from social_image_mcp.bridge_utils import normalize_native_record
+from social_image_mcp.accounts import platform_cookies, read_session
 from social_image_mcp.creator_protocol import CreatorCollector, creator_target
 from social_image_mcp.models import CreatorFetchRequest, CreatorIdentity, Platform, SearchRequest
 
@@ -285,6 +286,7 @@ async def _run(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, Any
     creator_result = None
     original_creator_method = None
     original_weibo_pong = None
+    original_weibo_client = None
     creator_request = None
     search_request = None
     WeiboCrawler = None
@@ -303,6 +305,17 @@ async def _run(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, Any
         search_request = SearchRequest.model_validate_json(os.environ["SOCIAL_IMAGE_SEARCH_REQUEST"]) if os.getenv("SOCIAL_IMAGE_SEARCH_REQUEST") else None
         if platform == "weibo":
             from media_platform.weibo.client import WeiboClient
+            from media_platform.weibo.core import WeiboCrawler
+
+            original_weibo_client = WeiboCrawler.create_weibo_client
+
+            async def desktop_weibo_client(crawler, *client_args, **client_kwargs):
+                cookies = platform_cookies("weibo", read_session("weibo", ROOT))
+                if cookies:
+                    await crawler.browser_context.add_cookies(cookies)
+                return await original_weibo_client(crawler, *client_args, **client_kwargs)
+
+            WeiboCrawler.create_weibo_client = desktop_weibo_client
 
             async def weibo_session_pong(client):
                 if creator_request:
@@ -376,6 +389,8 @@ async def _run(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, Any
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             await media_main.main()
     finally:
+        if original_weibo_client and WeiboCrawler:
+            WeiboCrawler.create_weibo_client = original_weibo_client
         if original_weibo_pong and WeiboClient:
             WeiboClient.pong = original_weibo_pong
         if original_creator_method:

@@ -53,21 +53,11 @@ def inspect_cookie_file(path: Path, now: float | None = None) -> dict[str, Any]:
 
 
 def cookie_file_path() -> Path:
-    configured = os.getenv("DOUYIN_COOKIE_FILE")
-    if configured:
-        return Path(configured).expanduser()
-    config_file = Path.home() / ".dy" / "config.json"
-    account = os.getenv("DY_CLI_ACCOUNT") or "default"
-    try:
-        payload = json.loads(config_file.read_text(encoding="utf-8"))
-        if isinstance(payload, dict):
-            account = str(payload.get("default", {}).get("account") or account)
-            configured = payload.get("api", {}).get("cookie_file")
-            if configured:
-                return Path(str(configured)).expanduser()
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError):
-        pass
-    return Path.home() / ".dy" / "cookies" / f"{account}.json"
+    root = Path(__file__).resolve().parents[1]
+    if str(root / "src") not in sys.path:
+        sys.path.insert(0, str(root / "src"))
+    from social_image_mcp.accounts import session_path
+    return session_path("douyin", root)
 
 
 def _run(command: list[str], timeout: float, env: dict[str, str] | None = None, cwd: Path | None = None) -> tuple[int, str, str]:
@@ -373,7 +363,7 @@ def platform_states(checks: dict[str, Any]) -> dict[str, dict[str, str]]:
         elif platform in {"douyin", "weibo", "xhs"} and not checks["browser"].get("ok"):
             states[platform] = {"state": "browser_unavailable", "detail": "浏览器不可用，请安装 Edge 或重新运行 安装桌面版.bat。"}
         elif platform == "douyin" and checks["cookie"].get("state") != "valid":
-            states[platform] = {"state": "login_required", "detail": "首次使用或登录态失效，请双击 登录抖音.bat；其它平台可以继续使用。"}
+            states[platform] = {"state": "login_required", "detail": "首次使用或登录态失效，请在应用的“平台登录”中点击抖音扫码登录；其它平台可以继续使用。"}
         else:
             states[platform] = {"state": "ready_unverified", "detail": "采集程序就绪；账号及接口可用性将在该平台实际采集时核验。"}
     return states

@@ -10,6 +10,7 @@ from typing import Any
 import httpx
 
 from .bridge_utils import normalize_native_record
+from .accounts import cookie_header, read_session
 from .creator_protocol import creator_target, pack_cursor, unpack_cursor
 from .models import CreatorFetchRequest, CreatorIdentity, ImageCandidate, Platform
 
@@ -67,10 +68,14 @@ class WeiboApi:
         if self.client is None:
             raise WeiboError("Weibo API client is not initialized")
         try:
+            headers = dict(self.headers)
+            saved_cookie = cookie_header("weibo", read_session("weibo"), self.base_url + path)
+            if saved_cookie:
+                headers["Cookie"] = saved_cookie
             response = await self.client.get(
                 self.base_url + path,
                 params=params,
-                headers=self.headers,
+                headers=headers,
                 timeout=httpx.Timeout(self.timeout_seconds, connect=4.0),
                 follow_redirects=True,
             )

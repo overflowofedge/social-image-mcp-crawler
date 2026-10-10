@@ -29,6 +29,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from social_image_mcp.bridge_utils import normalize_native_record
+from social_image_mcp.accounts import cookie_header, read_session, session_path
 from social_image_mcp.creator_protocol import CreatorCollector, douyin_identity
 from social_image_mcp.models import CreatorFetchRequest, SearchRequest
 
@@ -295,16 +296,7 @@ def _creator_items_from_profile_share(client: Any, url: str, limit: int, account
 
 def _browser_storage_state(account: str | None = None) -> Path | None:
     """Locate the Playwright storage state produced by dy-cli login."""
-    configured = os.getenv("DOUYIN_BROWSER_STORAGE_STATE") or os.getenv("DY_CLI_STORAGE_STATE")
-    if configured:
-        path = Path(configured).expanduser()
-    else:
-        try:
-            from dy_cli.utils.config import get_cookie_file
-
-            path = Path(get_cookie_file(account)).expanduser()
-        except Exception:
-            path = Path.home() / ".dy" / "cookies" / "default.json"
+    path = session_path("douyin", ROOT, account)
     return path if path.is_file() else None
 
 
@@ -612,6 +604,9 @@ def _sync_fetch(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, An
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     client = DouyinAPIClient.from_config(args.account)
+    saved_cookie = cookie_header("douyin", read_session("douyin", ROOT, args.account), "https://www.douyin.com/")
+    if saved_cookie:
+        client.cookie = saved_cookie
     try:
         if creator_json := os.getenv("SOCIAL_IMAGE_CREATOR_REQUEST"):
             request = CreatorFetchRequest.model_validate_json(creator_json)

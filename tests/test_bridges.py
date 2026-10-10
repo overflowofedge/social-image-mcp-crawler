@@ -270,6 +270,52 @@ def test_media_bridge_uses_explicit_browser_in_native_cdp_mode(tmp_path: Path):
     assert config.SAVE_LOGIN_STATE is True
 
 
+def test_weibo_bridge_imports_desktop_session_before_building_native_client(monkeypatch, tmp_path):
+    from social_image_mcp.accounts import save_session
+    monkeypatch.setenv("WEIBO_BROWSER_STORAGE_STATE", str(tmp_path / "session.json"))
+    save_session("weibo", {"cookies": [{"name": "SUB", "value": "new-login", "domain": ".weibo.cn", "path": "/", "expires": -1}]}, tmp_path)
+    (tmp_path / "main.py").write_text("")
+    seen = []
+
+    class Context:
+        async def add_cookies(self, cookies):
+            seen.extend(cookies)
+
+    class Crawler:
+        browser_context = Context()
+        async def create_weibo_client(self, *_args):
+            assert seen and seen[0]["value"] == "new-login"
+            return "client"
+
+    class Client:
+        async def pong(self):
+            return True
+
+    original = Crawler.create_weibo_client
+    core = ModuleType("media_platform.weibo.core")
+    core.WeiboCrawler = Crawler
+    client = ModuleType("media_platform.weibo.client")
+    client.WeiboClient = Client
+    main = ModuleType("main")
+
+    async def run():
+        assert await Crawler().create_weibo_client(None) == "client"
+
+    async def cleanup():
+        pass
+
+    main.main, main.async_cleanup = run, cleanup
+    for name, module in (("config", ModuleType("config")), ("main", main), (core.__name__, core), (client.__name__, client)):
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(_MEDIA_MODULE, "_configure_vendor_browser", lambda *_: None)
+    monkeypatch.setattr(_MEDIA_MODULE, "_install_capture", lambda *_: None)
+    monkeypatch.delenv("SOCIAL_IMAGE_CREATOR_REQUEST", raising=False)
+    monkeypatch.delenv("SOCIAL_IMAGE_SEARCH_REQUEST", raising=False)
+    args = _MEDIA_MODULE._parser().parse_args(["--platform", "weibo", "--query", "test", "--root", str(tmp_path)])
+    assert asyncio.run(_MEDIA_MODULE._run(args)) == []
+    assert Crawler.create_weibo_client is original
+
+
 def test_xhs_bridge_keyword_mode_is_empty_without_importing_vendor():
     script = Path(__file__).parents[1] / "scripts" / "xhs_downloader_bridge.py"
     result = subprocess.run(
