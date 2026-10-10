@@ -34,7 +34,7 @@ LOGIN_PAGE_HOSTS = {
 def _page_belongs_to_login(platform: str, page) -> bool:
     """Return whether a popup can be part of this platform's login flow."""
     url = str(getattr(page, "url", "") or "")
-    if not url:
+    if not url or url == "about:blank":
         return True
     hostname = (urlparse(url).hostname or "").lower().lstrip(".")
     return any(hostname == domain or hostname.endswith("." + domain)
