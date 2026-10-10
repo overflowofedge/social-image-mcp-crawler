@@ -12,6 +12,15 @@ from social_image_mcp.intent import parse_intent
 from social_image_mcp.models import ImageCandidate
 
 
+@pytest.fixture(autouse=True)
+def isolated_gallery_sessions(monkeypatch, tmp_path):
+    from social_image_mcp import sources
+    monkeypatch.setattr(sources, "ACCOUNT_ROOT", tmp_path)
+    for platform in ("x", "instagram"):
+        monkeypatch.setenv(f"{platform.upper()}_BROWSER_STORAGE_STATE", str(tmp_path / f"{platform}.json"))
+        monkeypatch.delenv(f"{platform.upper()}_GALLERY_DL_COOKIES_FILE", raising=False)
+
+
 def test_gallery_dl_json_line_is_normalized_to_candidate():
     output = '[3, "https://cdn.test/photo.jpg", {"id": "p1", "title": "coffee shop", "width": 1800, "height": 1200, "url": "https://x.com/i/status/1"}]\n'
     items = normalize_source_output(Platform.X, output, "gallery-dl", 5)

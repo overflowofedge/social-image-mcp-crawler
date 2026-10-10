@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
 
+from .accounts import ROOT as ACCOUNT_ROOT, gallery_cookie_file, has_auth, read_session, session_path
 from .intent import Intent, expand_token
 from .models import CreatorFetchRequest, CreatorIdentity, ImageCandidate, Platform, SearchRequest
 
@@ -725,7 +726,18 @@ class GalleryDlSource:
         command = [binary, "--dump-json", "--no-download", "-o", "output.jsonl=true", "--range", f"1-{max(1, limit)}"]
         platform_file = self.platform_cookie_files.get(platform)
         platform_browser = self.platform_cookies_from_browser.get(platform)
-        if platform_file:
+        saved_file = None
+        if platform in {Platform.X, Platform.INSTAGRAM}:
+            # New in-app login takes effect without rebuilding the source. Old
+            # exported sessions remain a fallback when no selector is configured.
+            configured = platform_file or platform_browser or self.cookies_file or self.cookies_from_browser
+            if session_path(platform.value, ACCOUNT_ROOT).is_file() or not configured:
+                saved = read_session(platform.value, ACCOUNT_ROOT)
+                if has_auth(platform.value, saved):
+                    saved_file = gallery_cookie_file(platform.value, saved, ACCOUNT_ROOT)
+        if saved_file:
+            command.extend(["--cookies", str(saved_file)])
+        elif platform_file:
             command.extend(["--cookies", platform_file])
         elif platform_browser:
             command.extend(["--cookies-from-browser", platform_browser])
@@ -913,7 +925,7 @@ class SourceHub:
     def session_updated(self, platform: Platform) -> None:
         """Allow an immediate retry with new credentials without claiming a crawl succeeded."""
         source = self._platform_sources.get(platform)
-        if isinstance(source, ExternalJsonSource):
+        if isinstance(source, (ExternalJsonSource, GalleryDlSource)):
             for key in list(source._cooldown_until):
                 if key == platform.value or key.startswith(platform.value + ":"):
                     source._cooldown_until.pop(key, None)

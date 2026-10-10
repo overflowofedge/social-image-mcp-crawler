@@ -316,6 +316,43 @@ def test_weibo_bridge_imports_desktop_session_before_building_native_client(monk
     assert Crawler.create_weibo_client is original
 
 
+def test_xhs_bridge_uses_saved_login_in_metadata_client(monkeypatch, tmp_path):
+    from social_image_mcp.accounts import save_session
+    monkeypatch.setenv("XHS_BROWSER_STORAGE_STATE", str(tmp_path / "session.json"))
+    save_session("xhs", {"cookies": [{"name": "web_session", "value": "saved-account",
+                 "domain": ".xiaohongshu.com", "path": "/", "expires": -1}]}, tmp_path)
+    (tmp_path / "source").mkdir()
+    seen = []
+
+    class Settings:
+        def __init__(self, **kwargs):
+            pass
+        def run(self):
+            return {"cookie": "legacy-cookie"}
+
+    class XHS:
+        def __init__(self, **options):
+            seen.append(options)
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        async def extract(self, url, **kwargs):
+            assert kwargs == {"download": False, "check_record": False}
+            return [{"作品ID": "note", "下载地址": ["https://sns-img.xhscdn.com/photo.jpg"]}]
+
+    module = ModuleType("source")
+    module.XHS, module.Settings = XHS, Settings
+    monkeypatch.setitem(sys.modules, "source", module)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.setattr(_XHS_MODULE, "_prepare_vendor_imports", lambda: None)
+    args = _XHS_MODULE._parser().parse_args(["--url", "https://www.xiaohongshu.com/explore/note", "--root", str(tmp_path)])
+    items = asyncio.run(_XHS_MODULE._run(args))
+    assert len(items) == 1
+    assert seen[0]["cookie"] == "web_session=saved-account"
+    assert seen[0]["image_download"] is False and seen[0]["video_download"] is False
+
+
 def test_xhs_bridge_keyword_mode_is_empty_without_importing_vendor():
     script = Path(__file__).parents[1] / "scripts" / "xhs_downloader_bridge.py"
     result = subprocess.run(

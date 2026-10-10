@@ -23,10 +23,10 @@ function renderLogin(data) {
   if (!card) return;
   loginStates.set(data.platform, data);
   card.dataset.state = data.state;
-  card.querySelector(".account-status").textContent = data.message || "请点击扫码登录。";
+  card.querySelector(".account-status").textContent = data.message || "请点击登录。";
   const start = card.querySelector(".start-login");
   start.disabled = Boolean(data.active);
-  start.textContent = data.active ? "等待登录…" : data.session_available ? "重新登录" : "扫码登录";
+  start.textContent = data.active ? "等待登录…" : data.session_available ? "重新登录" : data.login_label || "登录";
   const cancel = card.querySelector(".cancel-login");
   cancel.hidden = !data.active;
   cancel.disabled = data.state === "cancelling" || data.state === "saving";

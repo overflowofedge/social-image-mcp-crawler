@@ -49,7 +49,7 @@ button:disabled{opacity:.6;cursor:wait}
 <p class="hint">输入关键词、账号昵称或完整网址，程序会自动选择对应的检索方式。</p>
 <section class="card" aria-labelledby="account_heading">
 <h3 id="account_heading">平台登录</h3>
-<p class="hint">点击扫码登录会打开官方窗口。扫码并在手机上确认后，程序自动保存登录信息；下次使用会复用。</p>
+<p class="hint">点击登录会打开官方窗口。抖音、微博、小红书和 B 站可扫码；X 和 Instagram 按官方页面完成登录。成功后自动保存，下次使用会复用。</p>
 <div class="account-list">
 <div class="account" data-platform="douyin">
 <strong>抖音</strong>
@@ -60,6 +60,26 @@ button:disabled{opacity:.6;cursor:wait}
 <strong>微博</strong>
 <p class="account-status" role="status" aria-live="polite">正在检查登录状态…</p>
 <div class="account-actions"><button type="button" class="start-login" disabled>扫码登录</button><button type="button" class="cancel-login" hidden>取消登录</button></div>
+</div>
+<div class="account" data-platform="xhs">
+<strong>小红书</strong>
+<p class="account-status" role="status" aria-live="polite">正在检查登录状态…</p>
+<div class="account-actions"><button type="button" class="start-login" disabled>扫码登录</button><button type="button" class="cancel-login" hidden>取消登录</button></div>
+</div>
+<div class="account" data-platform="bilibili">
+<strong>B 站</strong>
+<p class="account-status" role="status" aria-live="polite">正在检查登录状态…</p>
+<div class="account-actions"><button type="button" class="start-login" disabled>扫码登录</button><button type="button" class="cancel-login" hidden>取消登录</button></div>
+</div>
+<div class="account" data-platform="x">
+<strong>X</strong>
+<p class="account-status" role="status" aria-live="polite">正在检查登录状态…</p>
+<div class="account-actions"><button type="button" class="start-login" disabled>网页登录</button><button type="button" class="cancel-login" hidden>取消登录</button></div>
+</div>
+<div class="account" data-platform="instagram">
+<strong>Instagram</strong>
+<p class="account-status" role="status" aria-live="polite">正在检查登录状态…</p>
+<div class="account-actions"><button type="button" class="start-login" disabled>网页登录</button><button type="button" class="cancel-login" hidden>取消登录</button></div>
 </div>
 </div>
 </section>
