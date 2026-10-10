@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory = $true)]
     [ValidateSet("douyin", "weibo", "x", "instagram")]
     [string]$Platform,
@@ -6,11 +6,15 @@ param(
     [ValidateSet("edge", "chrome", "firefox")]
     [string]$Browser = "edge",
 
-    [string]$Python = "python"
+    [string]$Python = ""
 )
 
 $ErrorActionPreference = "Stop"
 $ProjectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
+if (-not $Python) {
+    $Python = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
+    if (-not (Test-Path -LiteralPath $Python)) { throw "请先双击 安装桌面版.bat，再配置平台登录。" }
+}
 $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
 
@@ -220,9 +224,10 @@ if ($Platform -eq "weibo") {
     exit 0
 }
 
-$galleryDl = Get-Command gallery-dl -ErrorAction SilentlyContinue
+$galleryBinary = Join-Path (Split-Path -Parent $Python) "gallery-dl.exe"
+$galleryDl = Get-Command $galleryBinary -ErrorAction SilentlyContinue
 if (-not $galleryDl) {
-    throw "gallery-dl is not installed in this PowerShell environment."
+    throw "gallery-dl 未安装到当前项目环境，请重新运行 安装桌面版.bat。"
 }
 
 $loginUrl = if ($Platform -eq "x") { "https://x.com/login" } else { "https://www.instagram.com/accounts/login/" }

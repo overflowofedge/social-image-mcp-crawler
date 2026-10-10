@@ -1,0 +1,7 @@
+{
+  "sources": [
+    {"name": "dy-cli", "repository": "Youhai020616/douyin", "revision": "5267065ed29f3959d4011d32293d8e520f7d6388", "entrypoint": "src/dy_cli/main.py"},
+    {"name": "MediaCrawler", "repository": "NanmiCoder/MediaCrawler", "revision": "156c602c8d689266e6c5e9130b36f0b70495f5f0", "entrypoint": "main.py"},
+    {"name": "XHS-Downloader", "repository": "JoeanAmier/XHS-Downloader", "revision": "3261312721f0b37c705ba6515885bc7f34349f2f", "entrypoint": "source/__init__.py"}
+  ]
+}

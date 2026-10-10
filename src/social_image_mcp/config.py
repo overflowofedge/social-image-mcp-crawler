@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,6 +20,27 @@ def _project_path(value: str | None, default: str) -> str:
 # client remain authoritative because override=False is the default.
 load_dotenv()
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+
+
+def _source_command(variable: str, script: str, platform: bool = False) -> str | None:
+    configured = os.getenv(variable)
+    if configured and "C:/path/to/project" not in configured.replace("\\", "/"):
+        return configured
+    bridge = PROJECT_ROOT / "scripts" / script
+    if not bridge.is_file():
+        return None
+    arguments = '--query "{query}" --item-id "{item_id}" --url "{url}" --limit {limit}'
+    if platform:
+        arguments = "--platform {platform} " + arguments
+    return f'"{sys.executable}" "{bridge}" {arguments}'
+
+
+def _gallery_binary() -> str:
+    configured = os.getenv("GALLERY_DL_BINARY")
+    if configured and configured != "gallery-dl":
+        return configured
+    binary = Path(sys.executable).parent / ("gallery-dl.exe" if os.name == "nt" else "gallery-dl")
+    return str(binary) if binary.is_file() else "gallery-dl"
 
 
 @dataclass(frozen=True)
@@ -54,11 +76,11 @@ class Settings:
     object_model: str | None = os.getenv("OBJECT_MODEL") or None
     object_label_map: str | None = os.getenv("OBJECT_LABEL_MAP") or None
     object_confidence: float = float(os.getenv("OBJECT_CONFIDENCE", "0.35"))
-    media_crawler_command: str | None = os.getenv("MEDIA_CRAWLER_COMMAND") or None
-    xhs_downloader_command: str | None = os.getenv("XHS_DOWNLOADER_COMMAND") or None
-    douyin_source_command: str | None = os.getenv("DOUYIN_SOURCE_COMMAND") or None
-    bilibili_source_command: str | None = os.getenv("BILIBILI_SOURCE_COMMAND") or None
-    gallery_dl_binary: str = os.getenv("GALLERY_DL_BINARY", "gallery-dl")
+    media_crawler_command: str | None = _source_command("MEDIA_CRAWLER_COMMAND", "media_crawler_bridge.py", platform=True)
+    xhs_downloader_command: str | None = _source_command("XHS_DOWNLOADER_COMMAND", "xhs_downloader_bridge.py")
+    douyin_source_command: str | None = _source_command("DOUYIN_SOURCE_COMMAND", "douyin_cli_bridge.py")
+    bilibili_source_command: str | None = _source_command("BILIBILI_SOURCE_COMMAND", "bilibili_cli_bridge.py")
+    gallery_dl_binary: str = _gallery_binary()
     gallery_dl_config: str | None = os.getenv("GALLERY_DL_CONFIG") or None
     gallery_dl_cookies_from_browser: str | None = os.getenv("GALLERY_DL_COOKIES_FROM_BROWSER") or None
     gallery_dl_cookies_file: str | None = _project_path(os.getenv("GALLERY_DL_COOKIES_FILE"), ".cache/gallery-dl-cookies.txt") if os.getenv("GALLERY_DL_COOKIES_FILE") else None

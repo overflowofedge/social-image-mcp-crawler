@@ -6,10 +6,12 @@ aiomysql
 aiosqlite
 alembic
 asyncmy
+asyncpg
 curl-cffi
 emoji
 fastapi
 jieba
+lxml
 matplotlib<3.11
 motor
 opencv-python
@@ -20,6 +22,7 @@ pyexecjs
 pyhumps
 pyperclip
 pywebview
+pyyaml
 redis
 requests
 sqlalchemy

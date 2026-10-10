@@ -46,8 +46,6 @@ def _configure_browser_runtime() -> None:
     """Use an installed Edge channel when Playwright's bundled Chromium is absent."""
     channel = os.getenv("DOUYIN_BROWSER_CHANNEL") or os.getenv("BROWSER_CHANNEL")
     executable = os.getenv("DOUYIN_BROWSER_PATH") or os.getenv("MEDIA_CRAWLER_BROWSER_PATH")
-    if not channel and not (executable and Path(executable).is_file()):
-        return
     try:
         import dy_cli.utils.signature as signature
         from playwright.async_api import async_playwright
@@ -73,7 +71,23 @@ def _configure_browser_runtime() -> None:
         signature._SIGN_PAGE = page
         return page
 
+    async def close_sign_page():
+        page = signature._SIGN_PAGE
+        driver = getattr(signature, "_SIGN_PW", None)
+        signature._SIGN_PAGE = None
+        signature._SIGN_PW = None
+        try:
+            if page and not page.is_closed():
+                browser = page.context.browser
+                await page.close()
+                if browser:
+                    await browser.close()
+        finally:
+            if driver:
+                await driver.stop()
+
     signature.get_sign_page = get_sign_page
+    signature.close_sign_page = close_sign_page
     signature._codex_browser_runtime = True
 
 

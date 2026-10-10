@@ -121,8 +121,34 @@ def _check_browser(python: Path) -> dict[str, Any]:
 def _check_bridge(project_root: Path) -> dict[str, Any]:
     bridge = project_root / "scripts" / "douyin_cli_bridge.py"
     source_root = project_root / "third_party" / "dy-cli"
-    ok = bridge.is_file() and source_root.is_dir()
+    ok = bridge.is_file() and (source_root / "src/dy_cli/main.py").is_file()
     return {"ok": ok, "configured": source_root.is_dir(), "bridge": str(bridge), "source_root": str(source_root), "detail": "ready" if ok else "抖音来源未安装，抖音功能不可用"}
+
+
+def _check_douyin_imports(project_root: Path, python: Path) -> dict[str, Any]:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(project_root / "third_party/dy-cli/src")
+    code = "from dy_cli.engines.api_client import DouyinAPIClient; from dy_cli.utils.signature import close_sign_page; import dy_cli.main; print('ok')"
+    rc, out, err = _run([str(python), "-c", code], 35, env, project_root)
+    return {"ok": rc == 0 and out.endswith("ok"), "detail": (err or out)[-1200:]}
+
+
+def _check_gallery(python: Path) -> dict[str, Any]:
+    rc, out, err = _run([str(python), "-m", "gallery_dl", "--version"], 20)
+    binary = python.parent / ("gallery-dl.exe" if os.name == "nt" else "gallery-dl")
+    return {"ok": rc == 0 and binary.is_file(), "binary": str(binary), "detail": err or out}
+
+
+def _check_xhs_bridge(project_root: Path, python: Path) -> dict[str, Any]:
+    source_root = project_root / "third_party/XHS-Downloader"
+    if not (source_root / "source/__init__.py").is_file():
+        return {"ok": False, "configured": False, "detail": "XHS-Downloader source is not installed"}
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(source_root)
+    bridge = project_root / "scripts/xhs_downloader_bridge.py"
+    code = f"import runpy; m=runpy.run_path({str(bridge)!r}); m['_prepare_vendor_imports'](); from source import XHS, Settings; print('ok')"
+    rc, out, err = _run([str(python), "-c", code], 35, env, source_root)
+    return {"ok": rc == 0 and out.endswith("ok"), "configured": True, "detail": (err or out)[-1200:]}
 
 
 def _check_douyin_health(project_root: Path, python: Path) -> dict[str, Any]:
@@ -162,6 +188,10 @@ def _check_bilibili_bridge(project_root: Path, python: Path) -> dict[str, Any]:
     env = os.environ.copy()
     env.update({"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"})
     timeout = max(8, int(os.getenv("PREFLIGHT_HEALTH_TIMEOUT_SECONDS", "35")))
+    live = os.getenv("PREFLIGHT_LIVE_CHECKS", "false").lower() in {"1", "true", "yes"}
+    if not live:
+        rc, out, err = _run([str(python), str(bridge), "--help"], timeout, env)
+        return {"ok": rc == 0, "configured": True, "deferred": True, "detail": err or "CLI ready; live access checked during collection"}
     rc, stdout, stderr = _run([str(python), str(bridge), "--health-check"], timeout, env)
     response: Any = None
     try:
@@ -229,13 +259,11 @@ def _douyin_health_check_enabled() -> bool:
 
 
 def _douyin_startup_ready(bridge: dict[str, Any], cookie: dict[str, Any]) -> bool:
-    if not bridge.get("configured"):
-        return True
     return bool(bridge.get("ok") and cookie.get("state") == "valid")
 
 
 def _check_or_defer_douyin(project_root: Path, python: Path, checks: dict[str, Any]) -> dict[str, Any]:
-    prerequisites = all(checks[name].get("ok") for name in ("python", "imports", "browser", "bridge"))
+    prerequisites = all(checks[name].get("ok") for name in ("python", "imports", "browser", "bridge", "dy_dependencies"))
     if not prerequisites or checks["cookie"].get("state") != "valid":
         return {"ok": False, "skipped": True, "detail": "local prerequisites or persistent login state are incomplete"}
     if _douyin_health_check_enabled():
@@ -248,7 +276,7 @@ def _check_or_defer_douyin(project_root: Path, python: Path, checks: dict[str, A
     }
 
 
-def run_preflight(project_root: Path, python: Path, *, auto_repair: bool = True) -> dict[str, Any]:
+def run_preflight(project_root: Path, python: Path, *, auto_repair: bool = True, require_sources: bool = False) -> dict[str, Any]:
     project_root, python = project_root.resolve(), python.resolve()
     try:
         from dotenv import load_dotenv
@@ -263,11 +291,15 @@ def run_preflight(project_root: Path, python: Path, *, auto_repair: bool = True)
     checks["python"] = {"ok": python.is_file(), "path": str(python)}
     checks["imports"] = _check_imports(python) if checks["python"]["ok"] else {"ok": False, "detail": "Python executable is missing"}
     checks["bridge"] = _check_bridge(project_root)
+    checks["dy_dependencies"] = _check_douyin_imports(project_root, python) if checks["bridge"].get("ok") else {"ok": False, "detail": "dy-cli source missing or incomplete"}
     checks["cookie"] = inspect_cookie_file(cookie_file_path())
     checks["browser"] = _check_browser(python) if checks["imports"].get("ok") else {"ok": False, "detail": "imports are unavailable"}
     checks["weibo_bridge"] = _check_weibo_bridge(project_root, python) if checks["python"]["ok"] else {"ok": False, "detail": "Python executable is missing"}
+    checks["xhs_bridge"] = _check_xhs_bridge(project_root, python) if checks["python"]["ok"] else {"ok": False, "detail": "Python executable is missing"}
+    checks["gallery"] = _check_gallery(python) if checks["python"]["ok"] else {"ok": False, "detail": "Python executable is missing"}
     checks["bilibili_bridge"] = _check_bilibili_bridge(project_root, python) if checks["python"]["ok"] else {"ok": False, "detail": "Python executable is missing"}
-    checks["weibo_api"] = _check_weibo_api() if checks["imports"].get("ok") else {"ok": False, "detail": "httpx is unavailable"}
+    live = os.getenv("PREFLIGHT_LIVE_CHECKS", "false").lower() in {"1", "true", "yes"}
+    checks["weibo_api"] = _check_weibo_api() if live and checks["imports"].get("ok") else {"ok": False, "skipped": True, "deferred": True, "detail": "Browser session and live access checked during collection"}
     checks["douyin"] = _check_or_defer_douyin(project_root, python, checks)
 
     if auto_repair and not checks["imports"].get("ok") and checks["python"].get("ok"):
@@ -293,43 +325,58 @@ def run_preflight(project_root: Path, python: Path, *, auto_repair: bool = True)
     if checks["bridge"].get("configured") and checks["bridge"].get("ok") and checks["douyin"].get("skipped") and all(checks[name].get("ok") for name in ("python", "imports", "browser")):
         checks["douyin"] = _check_or_defer_douyin(project_root, python, checks)
 
-    if auto_repair and checks["bridge"].get("configured") and not checks["douyin"].get("ok"):
-        detail = str(checks["douyin"].get("detail") or "").lower()
-        if "no module named" in detail or "modulenotfound" in detail or "importerror" in detail:
-            dy_root = project_root / "third_party" / "dy-cli"
-            rc, out, err = _run([str(python), "-m", "pip", "install", "-e", str(dy_root)], 180)
-            report["repairs"].append({"action": "repair dy-cli dependencies", "ok": rc == 0, "detail": (err or out)[-1200:]})
-            if rc == 0:
-                checks["douyin"] = _check_douyin_health(project_root, python)
+    if auto_repair and checks["bridge"].get("ok") and not checks["dy_dependencies"].get("ok"):
+        dy_root = project_root / "third_party" / "dy-cli"
+        rc, out, err = _run([str(python), "-m", "pip", "install", "-e", str(dy_root)], 180)
+        report["repairs"].append({"action": "repair dy-cli dependencies", "ok": rc == 0, "detail": (err or out)[-1200:]})
+        if rc == 0:
+            checks["dy_dependencies"] = _check_douyin_imports(project_root, python)
+            checks["douyin"] = _check_or_defer_douyin(project_root, python, checks)
 
     cookie_state = checks["cookie"].get("state")
     # A transient API/verify failure must not force a new QR login when the
     # persisted auth cookies are still structurally valid. Re-login only when
     # the local session file is actually missing, invalid or expired.
     login_needed = _persistent_login_needed(cookie_state)
-    if auto_repair and login_needed and checks["bridge"].get("ok") and os.getenv("PREFLIGHT_AUTO_LOGIN", "true").lower() in {"1", "true", "yes"}:
+    if auto_repair and login_needed and checks["bridge"].get("ok") and checks["dy_dependencies"].get("ok") and os.getenv("PREFLIGHT_AUTO_LOGIN", "false").lower() in {"1", "true", "yes"}:
         login = _run_login(project_root, python)
         report["repairs"].append({"action": "refresh Douyin login", **login})
         checks["cookie"] = inspect_cookie_file(cookie_file_path())
         if checks["cookie"].get("state") == "valid" and checks["browser"].get("ok"):
             checks["douyin"] = _check_or_defer_douyin(project_root, python, checks)
 
-    local_ok = all(checks[name].get("ok", False) for name in ("python", "imports", "browser"))
-    douyin_configured = bool(checks["bridge"].get("configured"))
+    local_ok = all(checks[name].get("ok", False) for name in ("python", "imports"))
     douyin_session_available = _douyin_startup_ready(checks["bridge"], checks["cookie"])
     # A live API challenge is platform state, not a desktop startup failure.
     # Keep other platforms and the local UI usable whenever the persisted
     # session and local bridge are structurally ready.
-    report["ok"] = local_ok and douyin_session_available
+    report["installation_ready"] = all(checks[name].get("ok", False) for name in ("python", "imports", "browser", "bridge", "dy_dependencies", "weibo_bridge", "xhs_bridge", "gallery", "bilibili_bridge"))
+    report["ok"] = report["installation_ready"] if require_sources else local_ok
     report["douyin_session_available"] = douyin_session_available
     report["douyin_ready"] = bool(checks["douyin"].get("ok"))
     report["weibo_bridge_available"] = bool(checks["weibo_bridge"].get("ok"))
     report["weibo_ready"] = bool(checks["weibo_api"].get("creator_lookup_ok"))
     report["bilibili_ready"] = bool(checks["bilibili_bridge"].get("ok"))
+    report["platforms"] = platform_states(checks)
     report["finished_at"] = time.time()
     report["report_path"] = str(cache_dir / "preflight-latest.json")
     (cache_dir / "preflight-latest.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     return report
+
+
+def platform_states(checks: dict[str, Any]) -> dict[str, dict[str, str]]:
+    states: dict[str, dict[str, str]] = {}
+    for platform, source in (("douyin", "bridge"), ("weibo", "weibo_bridge"), ("xhs", "xhs_bridge"), ("x", "gallery"), ("instagram", "gallery"), ("bilibili", "bilibili_bridge")):
+        check = checks[source]
+        if not check.get("ok") or (platform == "douyin" and not checks["dy_dependencies"].get("ok")):
+            states[platform] = {"state": "missing_or_broken_source", "detail": "采集程序缺失或依赖不完整，请重新运行 安装桌面版.bat。"}
+        elif platform in {"douyin", "weibo", "xhs"} and not checks["browser"].get("ok"):
+            states[platform] = {"state": "browser_unavailable", "detail": "浏览器不可用，请安装 Edge 或重新运行 安装桌面版.bat。"}
+        elif platform == "douyin" and checks["cookie"].get("state") != "valid":
+            states[platform] = {"state": "login_required", "detail": "首次使用或登录态失效，请双击 登录抖音.bat；其它平台可以继续使用。"}
+        else:
+            states[platform] = {"state": "ready_unverified", "detail": "采集程序就绪；账号及接口可用性将在该平台实际采集时核验。"}
+    return states
 
 
 def main() -> int:
@@ -342,16 +389,16 @@ def main() -> int:
     parser.add_argument("--project-root", required=True, type=Path)
     parser.add_argument("--python", required=True, type=Path)
     parser.add_argument("--no-repair", action="store_true")
+    parser.add_argument("--require-sources", action="store_true", help="Fail installation if any local CLI source or dependency is missing; no account login required")
     args = parser.parse_args()
-    report = run_preflight(args.project_root, args.python, auto_repair=not args.no_repair)
+    report = run_preflight(args.project_root, args.python, auto_repair=not args.no_repair, require_sources=args.require_sources)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     if not report["ok"]:
         print("启动前自检未通过：请按上面的检查结果修复后重试。", file=sys.stderr)
         return 1
-    if not report["douyin_ready"]:
-        print("提示：抖音动态检查未通过，但桌面版仍会启动；其它平台不受影响。", file=sys.stderr)
-    if not report["weibo_ready"]:
-        print("提示：微博登录链路尚未验证，请查看 preflight-latest.json 中的 weibo_api 和 weibo_bridge。", file=sys.stderr)
+    for platform, status in report["platforms"].items():
+        if status["state"] != "ready_unverified":
+            print(f"提示：{platform}：{status['detail']}", file=sys.stderr)
     return 0
 
 

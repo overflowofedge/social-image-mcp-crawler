@@ -19,31 +19,28 @@ MCP 版本位于仓库默认的 `master` 分支；本页对应无需 MCP 客户�
 2. 从 GitHub 下载本仓库的 `desktop` 分支 ZIP，解压到本地目录。也可以执行：
 
    ```powershell
-   git clone -b desktop https://github.com/wozhendemeiyou/social-image-mcp-crawler.git
+   git clone -b desktop https://github.com/overflowofedge/social-image-mcp-crawler.git
    ```
 
-3. 双击项目根目录的 **安装桌面版.bat**。它会自动创建 `.venv`、安装桌面版依赖和 Playwright，并生成本地 `.env`；若已有 `third_party\dy-cli`，也会安装该来源的依赖。不需要执行 MCP 注册命令。尚未配置浏览器时，按下面的抖音步骤安装 Chromium。
+3. 双击项目根目录的 **安装桌面版.bat**。默认会创建 `.venv`，下载锁定版本的 dy-cli、MediaCrawler、XHS-Downloader，安装各平台依赖和 gallery-dl，并验证浏览器与实际导入。ZIP 下载用户不需要安装 Git。只有本地组件验证通过才显示安装完成；已有 `.env`、登录缓存、来源修改和下载文件会保留。仅使用普通网页时可运行 `powershell -ExecutionPolicy Bypass -File .\scripts\install_desktop.ps1 -WebOnly`。
 
-只使用“其他平台”网页图片提取，到这里即可开始使用。抖音、微博、小红书和 B 站等平台通过独立 CLI 来源运行，按下面对应平台配置登录态和来源项目即可。
+安装完成后即可启动界面。安装检查不要求用户拥有任何平台账号，也不会自动打开抖音登录窗口。需要登录的平台按下面步骤分别配置；某个平台未登录不影响其它平台。登录态有效时会持续复用。
 
 ### 抖音
 
 ```powershell
-git clone https://github.com/Youhai020616/douyin.git third_party\dy-cli
-.\.venv\Scripts\python.exe -m pip install -e .\third_party\dy-cli
-.\.venv\Scripts\python.exe -m playwright install chromium
-.\scripts\douyin_login.ps1 -Python .\.venv\Scripts\python.exe
+powershell -ExecutionPolicy Bypass -File .\scripts\setup_account.ps1 -Platform douyin
 ```
 
 ### 微博和小红书
 
-在项目目录执行：
+抖音也可以双击 **登录抖音.bat**。微博可以双击 **登录微博.bat**，或在项目目录执行：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\install_desktop.ps1 -InstallSources
+powershell -ExecutionPolicy Bypass -File .\scripts\setup_account.ps1 -Platform weibo
 ```
 
-安装脚本会同时安装 MediaCrawler 的桌面桥接依赖。抖音、小红书、微博和 B 站的检索、账号采集都通过独立 CLI 子进程运行；MediaCrawler 桥接按 `--platform` 隔离小红书/微博，抖音使用独立 dy-cli，B 站使用 `bilibili_cli_bridge.py`。首次采集时，程序会打开来源项目的浏览器窗口，请按提示完成官方登录。登录信息只保存在本机 `.cache`，不会提交到 Git。若微博昵称查询遇到 HTTP 432，可以输入完整主页链接重试；账号会由备用浏览器来源核验。配置 `BILIBILI_COOKIE` 可提高 B 站访问稳定性。
+各平台通过自己的 CLI 子进程运行；MediaCrawler 按 `--platform` 隔离微博和小红书，抖音使用 dy-cli，B 站使用 `bilibili_cli_bridge.py`。微博登录脚本会明确打开登录窗口，请完成官方登录。小红书首次使用需要自己的账号与平台登录；没有账号时可以跳过。登录信息保存在本机，不会提交到 Git。配置 `BILIBILI_COOKIE` 可提高 B 站访问稳定性。
 
 ### X 和 Instagram
 
@@ -58,7 +55,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\setup_account.ps1 -Platform i
 
 ## 启动
 
-双击 **启动应用.bat**。启动时会先检查 Python 依赖、Playwright 浏览器、来源桥接和本机持久 Cookie；默认不额外请求抖音接口，避免每次启动增加风控频率。即使手动启用动态检查且平台临时返回验证，也只影响抖音，不会阻止桌面版和其它平台启动。缺少 MediaCrawler 桥接依赖会尝试修复，检查结果保存在 `.cache\preflight-latest.json`。通过后浏览器打开 `http://127.0.0.1:8765/`。
+双击 **启动应用.bat**。旧安装尚未补齐组件时会执行默认安装；之后启动自检默认只做本地检查，不请求平台接口、不要求登录。报告区分组件缺失、依赖异常、需要登录和组件就绪，保存在 `.cache\preflight-latest.json`。一个平台未登录或验证失败不阻止其它平台和界面启动。浏览器打开 `http://127.0.0.1:8765/` 后即可使用。
 
 ## 使用
 
@@ -78,7 +75,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\setup_account.ps1 -Platform i
 - **启动提示 `init_import_site` 或 `UnicodeDecodeError`**：旧版在中文目录安装时可能写入了 GBK 路径，导致 UTF-8 启动失败。更新桌面版后双击 `启动应用.bat` 会自动修复，原路径文件会备份；无需删除 `.venv`、登录信息或下载文件。重新运行 `安装桌面版.bat` 也会先修复再安装。
 - **采集提示 `No module named 'playwright'`**：旧版虚拟环境缺少浏览器采集组件。更新后重新运行 `安装桌面版.bat`，再重试采集；仅复制 `third_party` 文件夹不会把依赖安装进 `.venv`。抖音接口返回 403 时也需要这些组件才能尝试已登录浏览器采集。
 - **页面打不开**：确认启动窗口仍在运行，或换一个端口执行 `powershell -ExecutionPolicy Bypass -File .\scripts\start_app.ps1 -Port 8766`。
-- **平台显示未配置**：先运行 `install_sources.ps1 -UseGit`，再按平台完成登录；“其他平台”不依赖这些来源项目。
+- **抖音/微博来源未安装**：重新双击 `安装桌面版.bat`，默认会补齐来源与依赖；网络失败的详细原因见 `.cache/source-install-latest.json`。显示“需要登录”时再运行对应平台的登录脚本。
 - **设置了数量但没有下载满**：查看“运行状态”中的找到数量和保存结果。按提示增加“最多检索作品数”或“每个作品最多张数”；若候选仍不足，说明平台当前可访问内容、筛选结果或去重后的文件少于目标。
 - **使用 CLI 是否不会触发风控**：不会。CLI 用来隔离平台实现并稳定传递结构化结果，平台仍能识别账号、Cookie、IP 和访问频率。大批量任务会分页、限速并支持续传；出现验证码、403、412、429 或 Cookie 失效时，按日志建议重新登录或稍后重试。
 
