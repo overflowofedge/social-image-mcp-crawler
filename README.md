@@ -28,19 +28,6 @@
 
 页面会显示等待扫码、确认登录、成功、取消或超时状态；可点击“取消登录”关闭此次窗口，或点击“重新登录”更换账号。取消、超时和失败不会覆盖此前保存的会话。安装和启动不要求任何平台账号，某个平台未登录不影响其它平台。验证码或额外确认仍需按官方窗口提示完成。
 
-### 抖音、微博的备用登录入口
-
-日常使用推荐页面内扫码登录。已有的 `登录抖音.bat`、`登录微博.bat` 和下面的命令仍可使用，同样会自动保存登录信息：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\setup_account.ps1 -Platform douyin
-```
-
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\setup_account.ps1 -Platform weibo
-```
-
 各平台通过自己的 CLI 子进程运行；MediaCrawler 按 `--platform` 隔离微博和小红书，抖音使用 dy-cli，B 站使用 `bilibili_cli_bridge.py`。抖音复用 dy-cli 的账号 Cookie 文件，微博保存到本项目 `.cache/weibo-session.json`，采集时自动读取最新会话；登录信息仅保存在本机，不会提交到 Git。小红书首次使用需要自己的账号与平台登录；没有账号时可以跳过。配置 `BILIBILI_COOKIE` 可提高 B 站访问稳定性。
 
 ### X 和 Instagram
