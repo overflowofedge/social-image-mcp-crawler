@@ -285,7 +285,7 @@ def test_bilibili_login_verifies_official_account_endpoint(payload, expected):
     assert asyncio.run(_bilibili_authenticated(Context())) is expected
 
 
-@pytest.mark.parametrize("platform,confirmed,close_fails", [("xhs", False, False), ("xhs", True, False),
+@pytest.mark.parametrize("platform,confirmed,close_fails", [("douyin", True, False), ("xhs", False, False), ("xhs", True, False),
                                               ("bilibili", False, False), ("bilibili", True, False),
                                               ("x", True, False), ("instagram", True, False),
                                               ("instagram", True, True)])
@@ -294,13 +294,14 @@ def test_browser_worker_saves_only_confirmed_sessions_and_closes_context(monkeyp
     from scripts import account_login
     closed = []
     updates = []
+    clicks = []
 
     class Locator:
         @property
         def first(self):
             return self
         async def click(self, **kwargs):
-            pass
+            clicks.append("login")
         async def is_visible(self):
             return False
 
@@ -373,6 +374,8 @@ def test_browser_worker_saves_only_confirmed_sessions_and_closes_context(monkeyp
             asyncio.run(run)
         assert not session_path(platform, tmp_path).exists()
     assert closed == ["context", "browser"]
+    if platform == "douyin":
+        assert clicks == ["login"]
 
 
 def test_weibo_login_verification_requires_official_logged_in_response():
