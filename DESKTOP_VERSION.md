@@ -20,17 +20,17 @@
 2. 下载 GitHub 的 `desktop` 分支 ZIP 并解压，或使用 Git 获取桌面版：
 
    ```powershell
-   git clone -b desktop https://github.com/wozhendemeiyou/social-image-mcp-crawler.git
+   git clone -b desktop https://github.com/overflowofedge/social-image-mcp-crawler.git
    cd social-image-mcp-crawler
    ```
 
-3. 双击 `安装桌面版.bat`。它会自动创建 `.venv`、安装依赖和 Playwright，并生成 `.env`；如果已有 `third_party\dy-cli`，也会安装该来源的依赖。也可以执行：
+3. 双击 `安装桌面版.bat`。默认会自动下载锁定版本的抖音、微博和小红书来源，安装 `.venv` 内的依赖与 gallery-dl，验证实际导入和浏览器，再生成安装完成记录。ZIP 用户不需要 Git；现有配置、登录缓存、来源修改和下载文件会保留。也可以执行：
 
    ```powershell
    powershell -ExecutionPolicy Bypass -File .\scripts\install_desktop.ps1
    ```
 
-4. 只使用“其他平台”时可以直接启动。需要抖音时，先安装 `third_party\dy-cli`，尚未配置浏览器时执行 `.\.venv\Scripts\python.exe -m playwright install chromium`，然后运行 `scripts\douyin_login.ps1`；需要抖音、小红书、微博或 B 站时，运行 `powershell -ExecutionPolicy Bypass -File .\scripts\install_desktop.ps1 -InstallSources`，安装来源及桌面桥接依赖。四个平台的检索和账号采集都通过独立 CLI 子进程运行，首次采集时按浏览器提示完成登录。
+4. 安装不要求任何平台账号。首次需要抖音时双击 `登录抖音.bat`，需要微博时双击 `登录微博.bat`，按提示完成官方登录。各平台采集通过独立 CLI 子进程运行；未登录的平台不会阻止界面和其它平台启动。仅使用普通网页时可以选择安装参数 `-WebOnly`。
 
 5. X 与 Instagram 使用各自独立的 gallery-dl 浏览器会话。按需要分别运行以下命令，并在打开的对应平台窗口完成官方登录：
 
@@ -43,7 +43,7 @@
 
 ## 启动
 
-双击 `启动应用.bat`。启动前会自动检查 Python 依赖、Playwright 浏览器、来源桥接和本机持久 Cookie。默认不额外请求抖音接口，避免每次启动增加风控频率；即使手动启用动态检查且平台临时返回验证，也只会标记抖音状态，不会阻止桌面版和其它平台启动。详细结果保存在 `.cache\preflight-latest.json`。检查通过后浏览器打开 `http://127.0.0.1:8765/` 即可使用。
+双击 `启动应用.bat`。旧安装缺少组件时会补齐默认安装。之后自检只检查本地依赖、浏览器和登录文件，默认不请求平台接口或打开登录窗口。报告区分组件缺失、依赖异常和需要登录，保存在 `.cache\preflight-latest.json`；平台账号问题不会阻止其它平台和界面启动。浏览器打开 `http://127.0.0.1:8765/` 后即可使用。
 
 如果旧版启动时出现 `init_import_site` / `UnicodeDecodeError`，更新后直接双击启动即可。程序会在 Python 加载依赖前修复中文安装路径的编码，并备份原路径文件；不需要删除 `.venv`、`.env`、登录缓存或已下载的文件。安装脚本也会执行同样的修复。
 

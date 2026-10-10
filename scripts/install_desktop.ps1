@@ -1,5 +1,6 @@
 ﻿param(
-    [switch]$InstallSources
+    [switch]$InstallSources,
+    [switch]$WebOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -41,10 +42,10 @@ if ($LASTEXITCODE -ne 0) { throw "桌面版运行环境修复失败，请查看�
 Write-Host "正在安装桌面版运行依赖..." -ForegroundColor Cyan
 & $venvPython -m pip install --upgrade pip
 if ($LASTEXITCODE -ne 0) { throw "pip 更新失败，请检查网络连接后重新运行 安装桌面版.bat。" }
-& $venvPython -m pip install -e "${ProjectRoot}[browser]"
+& $venvPython -m pip install -e "${ProjectRoot}[browser,gallery]"
 if ($LASTEXITCODE -ne 0) { throw "桌面版依赖安装失败，请查看上面的 pip 错误后重试。" }
-if ($InstallSources) {
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ProjectRoot "scripts\install_sources.ps1") -UseGit
+if (-not $WebOnly -or $InstallSources) {
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ProjectRoot "scripts\install_sources.ps1") -Python $venvPython
     if ($LASTEXITCODE -ne 0) { throw "来源项目安装失败，请查看上面的错误。" }
 }
 # A copied source folder alone does not install dy-cli's dependencies into
@@ -57,7 +58,7 @@ if (Test-Path -LiteralPath (Join-Path $dyCliRoot "pyproject.toml")) {
 }
 $mediaCrawlerRoot = Join-Path $ProjectRoot "third_party\MediaCrawler"
 if (Test-Path -LiteralPath (Join-Path $mediaCrawlerRoot "main.py")) {
-    Write-Host "正在安装微博备用采集依赖..." -ForegroundColor Cyan
+    Write-Host "正在安装微博/小红书采集依赖..." -ForegroundColor Cyan
     & $venvPython -m pip install -r (Join-Path $ProjectRoot "scripts\requirements_media_crawler_bridge.txt")
     if ($LASTEXITCODE -ne 0) { throw "微博采集依赖安装失败，请查看上面的 pip 错误后重试。" }
 }
@@ -71,4 +72,15 @@ if (-not (Test-Path -LiteralPath $envFile)) {
     Write-Host "已创建 .env 配置文件。" -ForegroundColor DarkGray
 }
 
-Write-Host "桌面版安装完成。双击 启动应用.bat 即可启动。" -ForegroundColor Green
+Write-Host "正在验证浏览器和各平台采集依赖（不会要求登录）..." -ForegroundColor Cyan
+$checkArguments = @((Join-Path $ProjectRoot "scripts\preflight.py"), "--project-root", $ProjectRoot, "--python", $venvPython)
+if (-not $WebOnly -or $InstallSources) { $checkArguments += "--require-sources" }
+$env:PREFLIGHT_AUTO_LOGIN = "false"
+$env:PREFLIGHT_DOUYIN_HEALTH_CHECK = "false"
+$env:PREFLIGHT_LIVE_CHECKS = "false"
+& $venvPython @checkArguments
+if ($LASTEXITCODE -ne 0) { throw "安装验证未通过。请查看 .cache\preflight-latest.json 后重试，登录账号不能修复缺失的依赖。" }
+$installMode = if ($WebOnly -and -not $InstallSources) { "web-only" } else { "full" }
+$installRecord = @{ schema = 1; mode = $installMode; project_root = $ProjectRoot } | ConvertTo-Json
+[IO.File]::WriteAllText((Join-Path $ProjectRoot ".cache\desktop-install.json"), $installRecord, (New-Object Text.UTF8Encoding($false)))
+Write-Host "安装验证通过。双击 启动应用.bat；首次使用抖音/微博时，双击对应的登录脚本。" -ForegroundColor Green
