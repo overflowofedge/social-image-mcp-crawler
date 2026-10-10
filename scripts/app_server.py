@@ -679,6 +679,13 @@ class Handler(BaseHTTPRequestHandler):
         if path not in {"/api/search", "/api/login", "/api/login/cancel"}:
             self._send(404, {"error": "not found"}); return
         try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length < 1 or length > 65536:
+                raise ValueError("请求内容长度无效。")
+            # Consume the bounded request before rejecting it. Closing a socket
+            # with an unread body can reset the connection on Windows, hiding
+            # the intended JSON error response from the browser.
+            raw_body = self.rfile.read(length)
             if path.startswith("/api/login"):
                 origin = self.headers.get("Origin")
                 if origin and (urlparse(origin).scheme != "http" or
@@ -687,10 +694,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 if not self.headers.get("Content-Type", "").lower().startswith("application/json"):
                     raise ValueError("登录请求必须使用 JSON。")
-            length = int(self.headers.get("Content-Length", "0"))
-            if length < 1 or length > 65536:
-                raise ValueError("请求内容长度无效。")
-            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            body = json.loads(raw_body.decode("utf-8"))
             if path.startswith("/api/login"):
                 if not isinstance(body, dict) or not isinstance(body.get("force", False), bool):
                     raise ValueError("登录请求格式无效。")
