@@ -17,13 +17,22 @@ const platformLabels = {
 
 const accountCards = [...document.querySelectorAll(".account[data-platform]")];
 const loginStates = new Map();
+const loginStateLabels = {
+  login_required: "未登录", opening: "打开窗口", waiting: "等待确认",
+  verifying: "同步中", saving: "保存中", cancelling: "正在取消",
+  cancelled: "已取消", timeout: "已超时", failed: "需重试",
+  completed: "已登录", logged_in: "已登录"
+};
 
 function renderLogin(data) {
   const card = accountCards.find(row => row.dataset.platform === data.platform);
   if (!card) return;
   loginStates.set(data.platform, data);
   card.dataset.state = data.state;
-  card.querySelector(".account-status").textContent = data.message || "请点击登录。";
+  card.querySelector(".account-state").textContent = loginStateLabels[data.state] || "待处理";
+  card.querySelector(".account-status").textContent = data.state === "login_required"
+    ? "尚未保存登录会话。"
+    : data.message || "请点击登录。";
   const start = card.querySelector(".start-login");
   start.disabled = Boolean(data.active);
   start.textContent = data.active ? "等待登录…" : data.session_available ? "重新登录" : data.login_label || "登录";

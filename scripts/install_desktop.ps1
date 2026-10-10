@@ -39,11 +39,27 @@ if (-not (Test-Path -LiteralPath $venvPython)) {
 & $venvPython -S (Join-Path $ProjectRoot "scripts\repair_python_env.py") --venv (Join-Path $ProjectRoot ".venv")
 if ($LASTEXITCODE -ne 0) { throw "桌面版运行环境修复失败，请查看上面的错误。" }
 
-Write-Host "正在安装桌面版运行依赖..." -ForegroundColor Cyan
-& $venvPython -m pip install --upgrade pip
-if ($LASTEXITCODE -ne 0) { throw "pip 更新失败，请检查网络连接后重新运行 安装桌面版.bat。" }
-& $venvPython -m pip install -e "${ProjectRoot}[browser,gallery]"
-if ($LASTEXITCODE -ne 0) { throw "桌面版依赖安装失败，请查看上面的 pip 错误后重试。" }
+function Test-PythonCode {
+    param([string]$Code)
+    & $venvPython -c $Code *> $null
+    return $LASTEXITCODE -eq 0
+}
+
+$desktopDependencyProbe = @'
+import importlib, importlib.metadata
+for module in ("bs4", "httpx", "imageio_ffmpeg", "mcp", "PIL", "pydantic", "dotenv", "playwright", "gallery_dl"):
+    importlib.import_module(module)
+importlib.metadata.version("social-image-mcp")
+'@
+if (Test-PythonCode $desktopDependencyProbe) {
+    Write-Host "桌面版依赖已存在，跳过重复安装。" -ForegroundColor DarkGray
+} else {
+    Write-Host "正在安装桌面版运行依赖..." -ForegroundColor Cyan
+    & $venvPython -m pip install --upgrade pip
+    if ($LASTEXITCODE -ne 0) { throw "pip 更新失败，请检查网络连接后重新运行 安装桌面版.bat。" }
+    & $venvPython -m pip install -e "${ProjectRoot}[browser,gallery]"
+    if ($LASTEXITCODE -ne 0) { throw "桌面版依赖安装失败，请查看上面的 pip 错误后重试。" }
+}
 if (-not $WebOnly -or $InstallSources) {
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ProjectRoot "scripts\install_sources.ps1") -Python $venvPython
     if ($LASTEXITCODE -ne 0) { throw "来源项目安装失败，请查看上面的错误。" }
@@ -52,15 +68,33 @@ if (-not $WebOnly -or $InstallSources) {
 # this virtual environment. Keep the local source and its patches intact.
 $dyCliRoot = Join-Path $ProjectRoot "third_party\dy-cli"
 if (Test-Path -LiteralPath (Join-Path $dyCliRoot "pyproject.toml")) {
-    Write-Host "正在安装抖音采集依赖..." -ForegroundColor Cyan
-    & $venvPython -m pip install -e $dyCliRoot
-    if ($LASTEXITCODE -ne 0) { throw "抖音采集依赖安装失败，请查看上面的 pip 错误后重试。" }
+    $previousPythonPath = $env:PYTHONPATH
+    $env:PYTHONPATH = Join-Path $dyCliRoot "src"
+    $dyDependencyProbe = 'from dy_cli.engines.api_client import DouyinAPIClient; from dy_cli.utils.signature import close_sign_page; import dy_cli.main'
+    $dyReady = Test-PythonCode $dyDependencyProbe
+    if ($previousPythonPath) { $env:PYTHONPATH = $previousPythonPath } else { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue }
+    if ($dyReady) {
+        Write-Host "抖音采集依赖已存在，跳过重复安装。" -ForegroundColor DarkGray
+    } else {
+        Write-Host "正在安装抖音采集依赖..." -ForegroundColor Cyan
+        & $venvPython -m pip install -e $dyCliRoot
+        if ($LASTEXITCODE -ne 0) { throw "抖音采集依赖安装失败，请查看上面的 pip 错误后重试。" }
+    }
 }
 $mediaCrawlerRoot = Join-Path $ProjectRoot "third_party\MediaCrawler"
 if (Test-Path -LiteralPath (Join-Path $mediaCrawlerRoot "main.py")) {
-    Write-Host "正在安装微博/小红书采集依赖..." -ForegroundColor Cyan
-    & $venvPython -m pip install -r (Join-Path $ProjectRoot "scripts\requirements_media_crawler_bridge.txt")
-    if ($LASTEXITCODE -ne 0) { throw "微博采集依赖安装失败，请查看上面的 pip 错误后重试。" }
+    $previousPythonPath = $env:PYTHONPATH
+    $env:PYTHONPATH = $mediaCrawlerRoot
+    $mediaDependencyProbe = 'import main'
+    $mediaReady = Test-PythonCode $mediaDependencyProbe
+    if ($previousPythonPath) { $env:PYTHONPATH = $previousPythonPath } else { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue }
+    if ($mediaReady) {
+        Write-Host "微博/小红书采集依赖已存在，跳过重复安装。" -ForegroundColor DarkGray
+    } else {
+        Write-Host "正在安装微博/小红书采集依赖..." -ForegroundColor Cyan
+        & $venvPython -m pip install -r (Join-Path $ProjectRoot "scripts\requirements_media_crawler_bridge.txt")
+        if ($LASTEXITCODE -ne 0) { throw "微博采集依赖安装失败，请查看上面的 pip 错误后重试。" }
+    }
 }
 # Keep editable paths readable when users run Python without UTF-8 mode too.
 & $venvPython -S (Join-Path $ProjectRoot "scripts\repair_python_env.py") --venv (Join-Path $ProjectRoot ".venv")

@@ -30,17 +30,32 @@ input:disabled{background:#f1f5f9;color:#94a3b8;cursor:not-allowed;border-color:
 .log-error .log-level{background:#fee2e2;color:#991b1b}
 .log-action{margin-top:4px;color:#475569;font-size:13px}
 .account-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
-.account{border:1px solid #dbe3ee;border-radius:10px;padding:16px}
-.account strong{display:block;margin-bottom:8px}
-.account p{font-size:14px;line-height:1.6;min-height:44px;margin:8px 0 12px}
+.account-section-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:14px}
+.account-section-head h3{margin:0 0 4px}
+.account-section-head p{margin:0}
+.account{border:1px solid #dbe3ee;border-radius:10px;padding:15px 16px;display:flex;flex-direction:column;min-height:142px;align-self:start;transition:border-color .18s,box-shadow .18s,background .18s}
+.account:hover{border-color:#93c5fd;box-shadow:0 4px 14px #1d4ed81a}
+.account-top{display:flex;align-items:center;gap:9px;min-width:0}
+.account-mark{display:grid;place-items:center;width:30px;height:30px;border-radius:8px;background:#eff6ff;color:#1d4ed8;font-size:13px;font-weight:800;flex:none}
+.account strong{font-size:16px;line-height:1.2;white-space:nowrap}
+.account-state{margin-left:auto;color:#64748b;font-size:12px;white-space:nowrap}
+.account-status{font-size:13px;line-height:1.5;min-height:40px;margin:12px 0 11px;color:#475569}
 .account[data-state="completed"] p,.account[data-state="logged_in"] p{color:#166534}
 .account[data-state="failed"] p,.account[data-state="timeout"] p{color:#991b1b}
+.account[data-state="completed"],.account[data-state="logged_in"]{border-color:#86efac;background:#f8fff9}
+.account[data-state="completed"] .account-mark,.account[data-state="logged_in"] .account-mark{background:#dcfce7;color:#15803d}
+.account[data-state="opening"],.account[data-state="waiting"],.account[data-state="verifying"],.account[data-state="saving"]{border-color:#93c5fd;background:#f8fbff}
+.account[data-state="opening"] .account-mark,.account[data-state="waiting"] .account-mark,.account[data-state="verifying"] .account-mark,.account[data-state="saving"] .account-mark{background:#dbeafe;color:#1d4ed8}
+.account[data-state="failed"] .account-state,.account[data-state="timeout"] .account-state{color:#b91c1c}
+.account[data-state="completed"] .account-state,.account[data-state="logged_in"] .account-state{color:#15803d}
 .account-actions{display:flex;gap:8px;flex-wrap:wrap}
 .account button{padding:8px 14px;font-size:14px;cursor:pointer}
 button:disabled{opacity:.6;cursor:wait}
 .account .cancel-login{background:#64748b}
 .account [hidden]{display:none}
-@media(max-width:700px){.account-list{grid-template-columns:1fr}}
+@media(max-width:900px){.account-list{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:600px){.account-list{grid-template-columns:1fr}}
+@media(max-width:600px){.account-section-head{display:block}.account-section-head>.hint{display:block;margin-top:6px}}
 @media(max-width:700px){.media-choice,.media-limits,.search-scope{grid-template-columns:1fr;gap:10px}.image-limits{grid-template-columns:1fr}body{padding:16px}.card{padding:16px}}
 </style>
 </head>
@@ -48,36 +63,35 @@ button:disabled{opacity:.6;cursor:wait}
 <h1>社交媒体图片采集器</h1>
 <p class="hint">输入关键词、账号昵称或完整网址，程序会自动选择对应的检索方式。</p>
 <section class="card" aria-labelledby="account_heading">
-<h3 id="account_heading">平台登录</h3>
-<p class="hint">点击登录会打开官方窗口。抖音、微博、小红书和 B 站可扫码；X 和 Instagram 按官方页面完成登录。成功后自动保存，下次使用会复用。</p>
+<div class="account-section-head"><div><h3 id="account_heading">平台登录</h3><p class="hint">每个平台只需登录一次，成功后会自动保存会话。</p></div><span class="hint">官方窗口 · 自动确认</span></div>
 <div class="account-list">
 <div class="account" data-platform="douyin">
-<strong>抖音</strong>
+<div class="account-top"><span class="account-mark">抖</span><strong>抖音</strong><span class="account-state">未登录</span></div>
 <p class="account-status" role="status" aria-live="polite">正在检查登录状态…</p>
 <div class="account-actions"><button type="button" class="start-login" disabled>扫码登录</button><button type="button" class="cancel-login" hidden>取消登录</button></div>
 </div>
 <div class="account" data-platform="weibo">
-<strong>微博</strong>
+<div class="account-top"><span class="account-mark">博</span><strong>微博</strong><span class="account-state">未登录</span></div>
 <p class="account-status" role="status" aria-live="polite">正在检查登录状态…</p>
 <div class="account-actions"><button type="button" class="start-login" disabled>扫码登录</button><button type="button" class="cancel-login" hidden>取消登录</button></div>
 </div>
 <div class="account" data-platform="xhs">
-<strong>小红书</strong>
+<div class="account-top"><span class="account-mark">红</span><strong>小红书</strong><span class="account-state">未登录</span></div>
 <p class="account-status" role="status" aria-live="polite">正在检查登录状态…</p>
 <div class="account-actions"><button type="button" class="start-login" disabled>扫码登录</button><button type="button" class="cancel-login" hidden>取消登录</button></div>
 </div>
 <div class="account" data-platform="bilibili">
-<strong>B 站</strong>
+<div class="account-top"><span class="account-mark">B</span><strong>B 站</strong><span class="account-state">未登录</span></div>
 <p class="account-status" role="status" aria-live="polite">正在检查登录状态…</p>
 <div class="account-actions"><button type="button" class="start-login" disabled>扫码登录</button><button type="button" class="cancel-login" hidden>取消登录</button></div>
 </div>
 <div class="account" data-platform="x">
-<strong>X</strong>
+<div class="account-top"><span class="account-mark">X</span><strong>X</strong><span class="account-state">未登录</span></div>
 <p class="account-status" role="status" aria-live="polite">正在检查登录状态…</p>
 <div class="account-actions"><button type="button" class="start-login" disabled>网页登录</button><button type="button" class="cancel-login" hidden>取消登录</button></div>
 </div>
 <div class="account" data-platform="instagram">
-<strong>Instagram</strong>
+<div class="account-top"><span class="account-mark">IG</span><strong>Instagram</strong><span class="account-state">未登录</span></div>
 <p class="account-status" role="status" aria-live="polite">正在检查登录状态…</p>
 <div class="account-actions"><button type="button" class="start-login" disabled>网页登录</button><button type="button" class="cancel-login" hidden>取消登录</button></div>
 </div>
