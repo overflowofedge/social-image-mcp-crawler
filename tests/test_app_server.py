@@ -187,6 +187,14 @@ def test_custom_webpage_login_error_does_not_use_platform_login_logic():
     assert "登录状态缺失" not in reason
 
 
+def test_custom_webpage_http_error_does_not_fall_into_platform_security_guidance():
+    reason, action = _error_guidance("网页访问失败：HTTP 403 Forbidden", "other")
+
+    assert reason == "自定义网页访问失败，页面可能需要权限或登录。"
+    assert "平台登录状态" not in action
+    assert "平台登录卡片" in action
+
+
 def test_task_report_separates_each_download_outcome():
     statuses = ["downloaded", "existing", "duplicate", "rejected", "failed"]
     result = {
