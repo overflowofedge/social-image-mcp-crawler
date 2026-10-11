@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import inspect
+import shutil
 import sys
 import threading
 import time
@@ -102,12 +105,15 @@ async def _xhs_authenticated(context, confirmed: bool) -> bool:
 
 
 async def _login_browser(platform: str, root: Path, cancel: threading.Event, update,
-                         timeout: float = 300) -> None:
+                         timeout: float = 300, force: bool = False) -> None:
     async def watch_cancel():
         while not cancel.is_set():
             await asyncio.sleep(0.2)
 
-    login = asyncio.create_task(_login_browser_session(platform, root, cancel, update, timeout))
+    login = asyncio.create_task(
+        # force travels positionally so test doubles with *args signatures
+        # keep working.
+        _login_browser_session(platform, root, cancel, update, timeout, force))
     watch = asyncio.create_task(watch_cancel())
     try:
         done, _ = await asyncio.wait({login, watch}, return_when=asyncio.FIRST_COMPLETED)
@@ -122,24 +128,48 @@ async def _login_browser(platform: str, root: Path, cancel: threading.Event, upd
         await asyncio.gather(login, watch, return_exceptions=True)
 
 
+def _login_profile_dir(platform: str, root: Path) -> Path:
+    """One durable browser profile per platform under .cache."""
+    return Path(root) / ".cache" / "login-profiles" / platform
+
+
+def _page_key(page) -> tuple[str, str]:
+    url = str(getattr(page, "url", "") or "")
+    parsed = urlparse(url)
+    return (parsed.hostname or "").lower().lstrip("."), parsed.path.rstrip("/")
+
+
 async def _login_browser_session(platform: str, root: Path, cancel: threading.Event, update,
-                                 timeout: float) -> None:
+                                 timeout: float, force: bool = False) -> None:
     from playwright.async_api import async_playwright
     from scripts.preflight import _browser_channel
 
+    profile = _login_profile_dir(platform, root)
+    if force:
+        # 重新登录 presents a fresh device so a different account can be
+        # selected; the saved session file is only replaced after a success.
+        shutil.rmtree(profile, ignore_errors=True)
+    profile.mkdir(parents=True, exist_ok=True)
+
     update("opening", "正在打开官方登录窗口…")
     async with async_playwright() as playwright:
-        options = {"headless": False}
+        options = {"headless": False, "viewport": {"width": 1080, "height": 720}}
         channel = _browser_channel()
         if channel:
             options["channel"] = channel
         options["args"] = ["--window-size=1100,760", "--disable-popup-blocking"]
-        browser = await playwright.chromium.launch(**options)
-        context = None
-        try:
-            # A fresh context ensures '重新登录' can select a different account.
-            # Do not use or alter the user's regular browser profile.
+        # The persistent profile keeps this machine's device identity stable.
+        # Platforms challenge every unfamiliar browser with SMS or face
+        # verification, so reusing the profile is what removes the repeated
+        # verification for routine re-logins.
+        browser = None
+        launcher = getattr(playwright.chromium, "launch_persistent_context", None)
+        if callable(launcher):
+            context = await launcher(str(profile), **options)
+        else:
+            browser = await playwright.chromium.launch(**options)
             context = await browser.new_context()
+        try:
             xhs_confirmed = False
 
             async def observe_xhs(response):
@@ -169,10 +199,6 @@ async def _login_browser_session(platform: str, root: Path, cancel: threading.Ev
             if platform == "xhs":
                 context.on("response", observe_xhs)
             page = await context.new_page()
-            try:
-                await page.set_viewport_size({"width": 1080, "height": 720})
-            except Exception:
-                pass
             await page.goto(LOGIN_URLS[platform], wait_until="domcontentloaded", timeout=45000)
             if platform in {"douyin", "xhs"}:
                 for text in ("登录", "扫码登录"):
@@ -190,30 +216,51 @@ async def _login_browser_session(platform: str, root: Path, cancel: threading.Ev
             update("waiting", message)
             deadline = time.monotonic() + timeout
             no_page_since = None
+            state_check_at = 0.0
             while time.monotonic() < deadline:
                 if cancel.is_set():
                     raise asyncio.CancelledError()
-                if not browser.is_connected():
+                try:
+                    connected = context.browser.is_connected() if context.browser else True
+                except Exception:
+                    connected = True
+                if not connected:
                     raise asyncio.CancelledError()
                 for candidate in context.pages:
                     if candidate is not page and candidate not in pending_pages:
                         pending_pages.append(candidate)
-                while pending_pages:
-                    candidate = pending_pages.pop(0)
+                # Popups cause visible tab churn. Decide once per popup:
+                # duplicates of the current page and foreign popups close at
+                # once; a genuinely different login page is adopted only after
+                # it has loaded, so the visible tab never flashes blank.
+                still_pending: list = []
+                for candidate in pending_pages:
                     if candidate is page:
                         continue
-                    if not _page_belongs_to_login(platform, candidate):
-                        try:
-                            await candidate.close()
-                        except Exception:
-                            pass
+                    url = str(getattr(candidate, "url", "") or "")
+                    if not url or url == "about:blank":
+                        still_pending.append(candidate)
                         continue
+                    if not _page_belongs_to_login(platform, candidate):
+                        await candidate.close()
+                        continue
+                    if _page_key(candidate) == _page_key(page):
+                        # The platform re-opened the same page in a new tab
+                        # (verification flows do this repeatedly); folding it
+                        # into the existing tab avoids the flicker entirely.
+                        await candidate.close()
+                        continue
+                    try:
+                        await candidate.wait_for_load_state("domcontentloaded", timeout=5000)
+                    except Exception:
+                        pass
                     previous = page
                     page = candidate
                     try:
                         await previous.close()
                     except Exception:
                         pass
+                pending_pages = still_pending
                 if not context.pages:
                     if no_page_since is None:
                         no_page_since = time.monotonic()
@@ -222,33 +269,37 @@ async def _login_browser_session(platform: str, root: Path, cancel: threading.Ev
                     await asyncio.sleep(0.25)
                     continue
                 no_page_since = None
-                state = await context.storage_state()
-                if has_auth(platform, state):
-                    if platform == "douyin":
-                        web_cookie = cookie_header("douyin", state, "https://www.douyin.com/")
-                        if not any(part.strip().split("=", 1)[0] in {"sessionid", "sessionid_ss"}
-                                   for part in web_cookie.split(";")):
-                            update("verifying", "正在同步抖音登录状态，请完成窗口中的平台验证。")
+                now = time.monotonic()
+                if now >= state_check_at:
+                    state_check_at = now + 1.0
+                    state = await context.storage_state()
+                    if has_auth(platform, state):
+                        if platform == "douyin":
+                            web_cookie = cookie_header("douyin", state, "https://www.douyin.com/")
+                            if not any(part.strip().split("=", 1)[0] in {"sessionid", "sessionid_ss"}
+                                       for part in web_cookie.split(";")):
+                                update("verifying", "正在同步抖音登录状态，请完成窗口中的平台验证。")
+                                await asyncio.sleep(0.25)
+                                continue
+                        if platform == "xhs" and not await _xhs_authenticated(context, xhs_confirmed):
+                            # Keep the guest session in memory until login is
+                            # confirmed. Do not persist it or close the QR window.
                             await asyncio.sleep(0.25)
                             continue
-                    if platform == "xhs" and not await _xhs_authenticated(context, xhs_confirmed):
-                        # Keep the guest session in memory until login is
-                        # confirmed. Do not persist it or close the QR window.
-                        await asyncio.sleep(0.25)
-                        continue
-                    if cancel.is_set():
-                        raise asyncio.CancelledError()
-                    update("saving", "登录已确认，正在保存到本机…")
-                    save_session(platform, await context.storage_state(), root)
-                    return
+                        if cancel.is_set():
+                            raise asyncio.CancelledError()
+                        update("saving", "登录已确认，正在保存到本机…")
+                        save_session(platform, await context.storage_state(), root)
+                        return
                 await asyncio.sleep(0.25)
             raise TimeoutError("登录超时，请点击登录重试；已有登录信息会保留。")
         finally:
             try:
-                if context:
-                    await context.close()
+                await context.close()
             finally:
-                await browser.close()
+                if browser is not None:
+                    with contextlib.suppress(Exception):
+                        await browser.close()
 
 
 class LoginManager:
@@ -291,7 +342,8 @@ class LoginManager:
                 return current
             task_id = uuid.uuid4().hex
             self._jobs[platform] = {"task_id": task_id, "platform": platform,
-                                    "state": "opening", "message": "正在启动官方登录…"}
+                                    "state": "opening", "message": "正在启动官方登录…",
+                                    "force": bool(force)}
             cancel = threading.Event()
             self._cancel[platform] = cancel
             thread = threading.Thread(target=self._run, args=(platform, task_id, cancel), daemon=True)
@@ -309,7 +361,15 @@ class LoginManager:
     def _run(self, platform: str, task_id: str, cancel: threading.Event) -> None:
         update = lambda state, message: self._update(platform, task_id, state, message)
         try:
-            asyncio.run(self.login(platform, self.root, cancel, update))
+            # Fake logins in tests keep the original signature; only pass the
+            # force flag to callables that declare it.
+            kwargs: dict[str, bool] = {}
+            try:
+                if "force" in inspect.signature(self.login).parameters:
+                    kwargs["force"] = bool(self._jobs.get(platform, {}).get("force"))
+            except (TypeError, ValueError):
+                pass
+            asyncio.run(self.login(platform, self.root, cancel, update, **kwargs))
             if not has_auth(platform, read_session(platform, self.root)):
                 raise RuntimeError("登录信息未保存，请重试登录。")
             if self.on_success:

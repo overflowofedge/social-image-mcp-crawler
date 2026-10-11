@@ -25,9 +25,10 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from social_image_mcp.bridge_utils import normalize_native_record
-from social_image_mcp.accounts import platform_cookies, read_session
+from social_image_mcp.accounts import has_auth, platform_cookies, read_session, save_session
 from social_image_mcp.creator_protocol import CreatorCollector, creator_target
 from social_image_mcp.models import CreatorFetchRequest, CreatorIdentity, Platform, SearchRequest
+from social_image_mcp.bridge_utils import emit_bridge_result
 
 DY_ROOT = Path(os.getenv("DY_CLI_ROOT") or ROOT / "third_party" / "dy-cli").expanduser().resolve()
 DY_SRC = DY_ROOT / "src"
@@ -178,6 +179,12 @@ async def _fetch_weibo_creator(client: Any, request: CreatorFetchRequest) -> dic
                 raise
             collector.warnings.append(str(exc))
             break
+    # Weibo serves exactly one profile page to restricted/visitor sessions and
+    # stops returning since_id. Say so instead of reporting a silent shortfall.
+    if collector.pages_fetched <= 1 and collector.posts_fetched and collector.posts_fetched < request.max_posts:
+        collector.warnings.append(
+            "weibo creator listing stopped after the first page; re-login on the platform card to read older posts"
+        )
     return collector.result()
 
 
@@ -210,6 +217,77 @@ async def _weibo_search_session_ready(client: Any, query: str) -> bool:
         return isinstance(data, dict) and isinstance(data.get("cards"), list)
     except Exception:
         return False
+
+
+async def _xhs_session_ready(client: Any) -> bool:
+    """The saved cookie set is usable when the self-info API reports success."""
+    try:
+        info = await client.query_self()
+        return bool(info and info.get("data", {}).get("result", {}).get("success"))
+    except Exception:
+        return False
+
+
+async def _fetch_xhs_creator(client: Any, request: CreatorFetchRequest) -> dict[str, Any]:
+    """Collect one XHS creator's notes through the vendor signed client.
+
+    The user_posted API returns covers only; each note detail carries the
+    full image gallery and video URL, so rows are enriched one by one up to
+    the post budget — the same trade MediaCrawler's own creator walker makes.
+    """
+    requested = request.profile_url or request.creator_id or ""
+    target = creator_target("xhs", requested)
+    identity = CreatorIdentity(
+        platform=Platform.XHS, requested_id=requested, canonical_id=target,
+        profile_url=f"https://www.xiaohongshu.com/user/profile/{target}",
+        source="media-crawler", matched_by="profile_url",
+    )
+    collector = CreatorCollector(identity, request)
+    detail_limit = min(200, max(10, request.max_posts + 10))
+    cursor = ""
+    seen_notes: set[str] = set()
+    while True:
+        try:
+            page = await client.get_notes_by_creator(target, cursor)
+            notes = page.get("data", {}).get("notes") if isinstance(page.get("data"), dict) else None
+            if not isinstance(notes, list):
+                raise ValueError("XHS creator response did not contain notes; check account access")
+            for row in notes:
+                note_id = str(row.get("note_id") or "")
+                if not note_id or note_id in seen_notes:
+                    continue
+                seen_notes.add(note_id)
+                if collector.posts_fetched >= request.max_posts:
+                    break
+                detail = await client.get_note_by_id(
+                    note_id, "pc_feed", str(row.get("xsec_token") or ""),
+                )
+                data = detail.get("data") if isinstance(detail.get("data"), dict) else {}
+                items = data.get("items") if isinstance(data.get("items"), list) else []
+                record = items[0].get("noteCard") if items and isinstance(items[0], dict) else row
+                if isinstance(record, dict) and not isinstance(record.get("user"), dict):
+                    record = {**record, "user": row.get("user")}
+                collector.consume([record], note_id, True)
+                collector.native = note_id
+                await asyncio.sleep(max(0.1, float(os.getenv("MEDIA_CRAWLER_SLEEP_SECONDS", "0.25"))))
+            if collector.posts_fetched >= request.max_posts or len(seen_notes) >= detail_limit:
+                collector.next_cursor = None if collector.posts_fetched >= request.max_posts else collector.next_cursor
+                break
+            next_cursor = str(page.get("data", {}).get("cursor") or "") if isinstance(page.get("data"), dict) else ""
+            if not next_cursor or next_cursor == cursor:
+                collector.next_cursor = None
+                break
+            cursor = next_cursor
+        except Exception as exc:
+            if not collector.pages_fetched:
+                raise
+            collector.warnings.append(str(exc))
+            break
+    if collector.pages_fetched <= 1 and collector.posts_fetched and collector.posts_fetched < request.max_posts:
+        collector.warnings.append(
+            "xhs creator listing stopped after the first page; a valid login reads more history"
+        )
+    return collector.result()
 
 
 def _resolve_douyin_identity(request: CreatorFetchRequest) -> CreatorIdentity:
@@ -292,6 +370,11 @@ async def _run(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, Any
     WeiboCrawler = None
     WeiboClient = None
     DouYinCrawler = None
+    refreshed_cookies: list[dict[str, Any]] = []
+    XiaoHongShuClient = None
+    XiaoHongShuCrawler = None
+    original_xhs_client = None
+    original_xhs_pong = None
     creator_cli_target = ""
     try:
         # MediaCrawler imports its JS signing files using relative paths.
@@ -324,10 +407,32 @@ async def _run(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, Any
 
             original_weibo_pong = WeiboClient.pong
             WeiboClient.pong = weibo_session_pong
+        if platform == "xhs":
+            # Inject the desktop app's saved XHS session into the vendor
+            # browser before its client snapshots cookies, and answer the
+            # vendor's login probe from that session so a crawl never blocks
+            # on an unexpected QR window.
+            from media_platform.xhs.client import XiaoHongShuClient
+            from media_platform.xhs.core import XiaoHongShuCrawler
+
+            original_xhs_client = XiaoHongShuCrawler.create_xhs_client
+
+            async def desktop_xhs_client(crawler, *client_args, **client_kwargs):
+                cookies = platform_cookies("xhs", read_session("xhs", ROOT))
+                if cookies:
+                    await crawler.browser_context.add_cookies(cookies)
+                return await original_xhs_client(crawler, *client_args, **client_kwargs)
+
+            XiaoHongShuCrawler.create_xhs_client = desktop_xhs_client
+
+            async def xhs_session_pong(client):
+                return await _xhs_session_ready(client)
+
+            original_xhs_pong = XiaoHongShuClient.pong
+            XiaoHongShuClient.pong = xhs_session_pong
         if creator_request:
-            if platform not in {"weibo", "douyin"} or creator_request.platform.value != platform:
-                raise ValueError("MediaCrawler creator bridge supports only matching douyin or weibo requests")
-            from media_platform.weibo.core import WeiboCrawler
+            if platform not in {"weibo", "douyin", "xhs"} or creator_request.platform.value != platform:
+                raise ValueError("MediaCrawler creator bridge supports only matching douyin, weibo or xhs requests")
             if platform == "douyin":
                 from media_platform.douyin.core import DouYinCrawler
 
@@ -340,11 +445,24 @@ async def _run(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, Any
 
                 original_creator_method = DouYinCrawler.get_creators_and_videos
                 DouYinCrawler.get_creators_and_videos = bounded_douyin_creator
+            elif platform == "xhs":
+                creator_cli_target = creator_target("xhs", creator_request.profile_url or creator_request.creator_id)
+
+                async def bounded_xhs_creator(crawler):
+                    nonlocal creator_result
+                    creator_result = await _fetch_xhs_creator(crawler.xhs_client, creator_request)
+                    with contextlib.suppress(Exception):
+                        refreshed_cookies.extend(await crawler.browser_context.cookies())
+
+                original_creator_method = XiaoHongShuCrawler.get_creators_and_notes
+                XiaoHongShuCrawler.get_creators_and_notes = bounded_xhs_creator
             else:
                 creator_cli_target = "0" if creator_request.creator_name else creator_target("weibo", creator_request.profile_url or creator_request.creator_id)
                 async def bounded_weibo_creator(crawler):
                     nonlocal creator_result
                     creator_result = await _fetch_weibo_creator(crawler.wb_client, creator_request)
+                    with contextlib.suppress(Exception):
+                        refreshed_cookies.extend(await crawler.browser_context.cookies())
 
                 original_creator_method = WeiboCrawler.get_creators_and_notes
                 WeiboCrawler.get_creators_and_notes = bounded_weibo_creator
@@ -393,9 +511,15 @@ async def _run(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, Any
             WeiboCrawler.create_weibo_client = original_weibo_client
         if original_weibo_pong and WeiboClient:
             WeiboClient.pong = original_weibo_pong
+        if original_xhs_client and XiaoHongShuCrawler:
+            XiaoHongShuCrawler.create_xhs_client = original_xhs_client
+        if original_xhs_pong and XiaoHongShuClient:
+            XiaoHongShuClient.pong = original_xhs_pong
         if original_creator_method:
             if platform == "douyin" and DouYinCrawler:
                 DouYinCrawler.get_creators_and_videos = original_creator_method
+            elif platform == "xhs" and XiaoHongShuCrawler:
+                XiaoHongShuCrawler.get_creators_and_notes = original_creator_method
             elif WeiboCrawler:
                 WeiboCrawler.get_creators_and_notes = original_creator_method
         sys.argv = old_argv
@@ -408,6 +532,14 @@ async def _run(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, Any
     if creator_request:
         if creator_result is None:
             raise RuntimeError("MediaCrawler did not execute creator retrieval")
+        # The platform may rotate session cookies during the run. Persisting
+        # them keeps a login alive for months of occasional use instead of
+        # degrading back to the one-page visitor view.
+        if refreshed_cookies and platform in {"weibo", "xhs"}:
+            with contextlib.suppress(Exception):
+                state = {"cookies": refreshed_cookies, "origins": (read_session(platform, ROOT) or {}).get("origins", [])}
+                if has_auth(platform, state):
+                    save_session(platform, state, ROOT)
         return creator_result
 
     normalized: list[dict[str, Any]] = []
@@ -431,6 +563,8 @@ def main() -> int:
     except Exception as exc:
         print(f"media-crawler bridge failed: {exc}", file=sys.stderr)
         return 2
+    if emit_bridge_result(result):
+        return 0
     if isinstance(result, dict):
         print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
         return 0

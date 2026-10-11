@@ -149,7 +149,7 @@ def test_gallery_dl_directory_and_queue_messages_are_not_images():
 def test_source_hub_reports_recommended_projects_without_platform_credentials():
     statuses = SourceHub(None, None, "definitely-not-installed-gallery-dl", None).statuses()
     names = {status["name"] for status in statuses}
-    assert names == {"dy-cli", "bilibili-cli", "weibo-cli", "xhs-cli", "x-cli", "instagram-cli"}
+    assert names == {"dy-cli", "bilibili-cli", "weibo-cli", "weibo-gallery", "xhs-cli", "x-cli", "instagram-cli"}
     assert all(status["configured"] is False for status in statuses)
     assert all(status["verified"] is False for status in statuses)
 
@@ -245,12 +245,13 @@ def test_gallery_source_uses_bounded_native_search_targets():
     assert "--cookies-from-browser" not in file_command
 
 
-def test_gallery_source_keeps_x_and_instagram_sessions_independent():
+def test_gallery_source_keeps_x_and_instagram_sessions_independent(tmp_path):
+    profile = f"edge/x.com:{tmp_path}"
     source = GalleryDlSource(
         "gallery-dl",
         cookies_from_browser="legacy-browser",
         cookies_file="legacy.txt",
-        platform_cookies_from_browser={Platform.X: "edge/x.com:C:/profiles/x"},
+        platform_cookies_from_browser={Platform.X: profile},
         platform_cookie_files={Platform.INSTAGRAM: "instagram.txt"},
     )
 
@@ -258,7 +259,7 @@ def test_gallery_source_keeps_x_and_instagram_sessions_independent():
     instagram_command = source._command(Platform.INSTAGRAM, parse_intent("instagram:ABC123"), 1)
     weibo_command = source._command(Platform.WEIBO, parse_intent("weibo:Mx123"), 1)
 
-    assert x_command[x_command.index("--cookies-from-browser") + 1] == "edge/x.com:C:/profiles/x"
+    assert x_command[x_command.index("--cookies-from-browser") + 1] == profile
     assert "--cookies" not in x_command
     assert instagram_command[instagram_command.index("--cookies") + 1] == "instagram.txt"
     assert "--cookies-from-browser" not in instagram_command

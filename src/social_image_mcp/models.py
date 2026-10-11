@@ -155,6 +155,7 @@ class DownloadRecord(BaseModel):
     media_type: str = Field(default="image", pattern="^(image|video)$")
     path: str | None = None
     sha256: str | None = None
+    size_bytes: int | None = Field(default=None, ge=0)
     perceptual_hash: str | None = None
     width: int | None = None
     height: int | None = None

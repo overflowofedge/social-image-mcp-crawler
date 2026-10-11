@@ -88,10 +88,14 @@ def timestamp(value: Any) -> float | None:
 
 def native_author_id(platform: str, record: dict[str, Any]) -> str:
     data = record.get("mblog", record) if platform == "weibo" else record
-    author = data.get("user" if platform == "weibo" else "author") or {}
+    author = data.get("user" if platform in ("weibo", "xhs") else "author") or {}
     if not isinstance(author, dict):
         return ""
-    return str((author.get("idstr") or author.get("id")) if platform == "weibo" else author.get("sec_uid") or "")
+    if platform == "xhs":
+        return str(author.get("user_id") or author.get("userId") or author.get("id") or "")
+    if platform == "weibo":
+        return str(author.get("idstr") or author.get("id") or "")
+    return str(author.get("sec_uid") or "")
 
 
 def creator_items(platform: str, record: dict[str, Any], identity: CreatorIdentity, covers: bool, media_type: str = "images") -> list[dict[str, Any]]:
@@ -101,6 +105,8 @@ def creator_items(platform: str, record: dict[str, Any], identity: CreatorIdenti
     data = record.get("mblog", record) if platform == "weibo" else record
     if platform == "weibo" and not data.get("pics") and not data.get("page_info"):
         return []
+    if platform == "xhs" and not (data.get("image_list") or data.get("video")):
+        return []
     items = normalize_native_record(platform, record, identity.source, include_video_covers=covers, media_type=media_type)
     for item in items:
         item["id"] = f"{item['post_id']}:{item['media_index']}"
@@ -108,6 +114,8 @@ def creator_items(platform: str, record: dict[str, Any], identity: CreatorIdenti
         item["creator_name"] = identity.name
         if not item.get("permalink") and platform == "douyin":
             item["permalink"] = f"https://www.douyin.com/note/{item['post_id']}"
+        if not item.get("permalink") and platform == "xhs":
+            item["permalink"] = f"https://www.xiaohongshu.com/explore/{item['post_id']}"
     return items
 
 
@@ -203,7 +211,10 @@ class CreatorCollector:
                 return False
             row = rows[index]
             data = row.get("mblog", row) if self.identity.platform == Platform.WEIBO else row
-            post_id = str(data.get("aweme_id") or data.get("idstr") or data.get("id") or "")
+            post_id = str(
+                data.get("aweme_id") or data.get("note_id") or data.get("noteId")
+                or data.get("idstr") or data.get("id") or ""
+            )
             self.posts_fetched += 1
             if not post_id or native_author_id(self.identity.platform.value, row) != self.identity.canonical_id:
                 self.rejected_posts += 1

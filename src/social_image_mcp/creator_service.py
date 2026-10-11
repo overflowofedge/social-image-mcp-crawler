@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .creator_protocol import creator_target, timestamp
+from .downloader import _file_matches_sha256
 from .intent import parse_intent
 from .object_semantics import parse_content_spec
 from .models import CreatorFetchRequest, CreatorSort, ImageCandidate
@@ -26,26 +27,64 @@ from .storage import StorageAgent
 
 
 class CreatorStore:
+    """Checkpoint storage that keeps large ledgers out of the hot save path.
+
+    ``catalog`` and ``completed_records`` grow with the account history. In a
+    single JSON blob every batch save re-serialized the whole ledger (O(n)
+    per batch, O(n^2) per job); here they live in their own tables and batch
+    saves only upsert the entries created since the previous save.
+    """
+
     def __init__(self, path: str) -> None:
         self.path = path
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(path) as db:
             db.execute("CREATE TABLE IF NOT EXISTS creator_jobs (key TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS creator_ledger ("
+                "key TEXT NOT NULL, ledger TEXT NOT NULL, media_key TEXT NOT NULL, payload TEXT NOT NULL,"
+                " PRIMARY KEY (key, ledger, media_key))"
+            )
 
     def get(self, key: str) -> dict | None:
         with sqlite3.connect(self.path) as db:
             row = db.execute("SELECT payload FROM creator_jobs WHERE key=?", (key,)).fetchone()
+            ledgers: dict[str, dict[str, dict]] = {"catalog": {}, "completed_records": {}}
+            for ledger, media_key, payload in db.execute(
+                "SELECT ledger, media_key, payload FROM creator_ledger WHERE key=?", (key,)
+            ):
+                try:
+                    item = json.loads(payload)
+                except (TypeError, ValueError):
+                    continue
+                if ledger in ledgers:
+                    ledgers[ledger][media_key] = item
         if not row:
             return None
         try:
             value = json.loads(row[0])
-            return value if isinstance(value, dict) else None
         except (TypeError, ValueError):
             return None
+        if not isinstance(value, dict):
+            return None
+        # Legacy checkpoints carried both ledgers inline; the table wins only
+        # when it has content, so an old state survives until its first save.
+        for ledger, items in ledgers.items():
+            if items:
+                value[ledger] = items
+        return value
 
-    def save(self, key: str, state: dict) -> None:
+    def save(self, key: str, state: dict, catalog_new: dict | None = None, records_new: dict | None = None) -> None:
+        payload = {name: value for name, value in state.items() if name not in ("catalog", "completed_records")}
         with sqlite3.connect(self.path) as db:
-            db.execute("INSERT OR REPLACE INTO creator_jobs VALUES (?, ?)", (key, json.dumps(state, ensure_ascii=False)))
+            db.execute("INSERT OR REPLACE INTO creator_jobs VALUES (?, ?)", (key, json.dumps(payload, ensure_ascii=False)))
+            rows: list[tuple[str, str, str, str]] = []
+            for media_key, item in (catalog_new or {}).items():
+                rows.append((key, "catalog", media_key, json.dumps(item, ensure_ascii=False)))
+            for media_key, item in (records_new or {}).items():
+                rows.append((key, "completed_records", media_key, json.dumps(item, ensure_ascii=False)))
+            if rows:
+                db.executemany("INSERT OR REPLACE INTO creator_ledger VALUES (?, ?, ?, ?)", rows)
 
 
 class CreatorImageService:
@@ -95,8 +134,9 @@ class CreatorImageService:
                     path = Path(str(record.get("path") or "")).resolve()
                     if not path.is_relative_to(output_root) or not path.is_file():
                         continue
-                    digest = hashlib.sha256(path.read_bytes()).hexdigest()
-                    if record.get("sha256") and digest != record["sha256"]:
+                    expected = str(record.get("sha256") or "")
+                    size = record.get("size_bytes")
+                    if expected and not _file_matches_sha256(path, expected, int(size) if isinstance(size, (int, float)) else None):
                         continue
                     valid.add(f"{record.get('post_id') or record.get('candidate_id')}:{record.get('media_type') or 'image'}:{record.get('media_index') or 1}")
                 except (OSError, TypeError, ValueError):
@@ -129,7 +169,8 @@ class CreatorImageService:
                 if not path.is_relative_to(root) or not path.is_file():
                     return False
                 expected = str(record.get("sha256") or "")
-                return not expected or hashlib.sha256(path.read_bytes()).hexdigest() == expected
+                size = record.get("size_bytes")
+                return not expected or _file_matches_sha256(path, expected, int(size) if isinstance(size, (int, float)) else None)
             except (OSError, TypeError, ValueError):
                 return False
         # Checkpoints from versions before completed_records/manifest support
@@ -473,7 +514,7 @@ class CreatorImageService:
             state["last_refresh_at"] = timestamp(datetime.now(timezone.utc).isoformat())
             state["refresh_count"] = int(state.get("refresh_count") or 0) + 1
             state["warnings"].extend(warnings)
-            self.store.save(key, state)
+            self.store.save(key, state, catalog_new=catalog)
         elif state["pending"]:
             report_progress("retrieving", f"正在继续处理上次尚未完成的 {len(state['pending'])} 个候选媒体。")
         pending = [ImageCandidate.model_validate(item) for item in state["pending"]]
@@ -513,10 +554,13 @@ class CreatorImageService:
                 attempted.update(item.id for item in batch)
                 concurrency = request.max_concurrency
                 if all(item.media_type == "video" for item in batch):
-                    concurrency = min(
-                        concurrency,
-                        max(1, int(os.getenv("VIDEO_DOWNLOAD_CONCURRENCY", "1"))),
-                    )
+                    # Douyin-style signed CDN links tolerate two parallel
+                    # pulls; higher values need an explicit env override.
+                    try:
+                        video_concurrency = max(1, int(os.getenv("VIDEO_DOWNLOAD_CONCURRENCY", "2")))
+                    except ValueError:
+                        video_concurrency = 2
+                    concurrency = min(concurrency, video_concurrency)
                 batch_records = await self.downloader.download_many(
                     batch, output, concurrency, request.min_width,
                     request.min_height, resume=request.resume or bool(records),
@@ -527,6 +571,7 @@ class CreatorImageService:
                     record.candidate_id for record in batch_records
                     if record.status in {"downloaded", "existing", "duplicate", "rejected"}
                 }
+                new_records: dict[str, dict] = {}
                 for record in batch_records:
                     item = by_id.get(record.candidate_id)
                     if item is None or record.status not in {"downloaded", "existing"}:
@@ -537,10 +582,12 @@ class CreatorImageService:
                         successful_per_post[post] = successful_per_post.get(post, 0) + 1
                     media_key = self._media_key(item)
                     completed.add(media_key)
-                    state.setdefault("completed_records", {})[media_key] = record.model_dump(mode="json")
+                    record_payload = record.model_dump(mode="json")
+                    state.setdefault("completed_records", {})[media_key] = record_payload
+                    new_records[media_key] = record_payload
                 state["completed"] = sorted(completed)
                 state["pending"] = [item for item in state["pending"] if item["id"] not in terminal]
-                self.store.save(key, state)
+                self.store.save(key, state, records_new=new_records)
                 status_counts = {name: 0 for name in ("downloaded", "existing", "duplicate", "rejected", "failed")}
                 for record in records:
                     status_counts[record.status if record.status in status_counts else "failed"] += 1
@@ -735,57 +782,74 @@ class CreatorImageService:
         successful_per_post: dict[str, int],
         budget: int,
     ) -> list[ImageCandidate]:
-        """Choose replacements without letting failed/duplicate candidates consume the quota."""
+        """Choose replacements without letting failed/duplicate candidates consume the quota.
+
+        When the needed type cannot fill a batch — its posts are exhausted or
+        every post sits at the per-post cap — fall through to the other type
+        instead of ending the whole download loop.
+        """
         image_target = request.max_images if request.media_type != "videos" else 0
         video_target = (request.max_videos if request.max_videos is not None else request.max_images) if request.media_type != "images" else 0
-        batch: list[ImageCandidate] = []
-        batch_counts = {"image": 0, "video": 0}
-        batch_per_post: dict[str, int] = {}
-        available_types = {
-            item.media_type for item in items
-            if item.id not in attempted
-            and not (request.media_type == "images" and item.media_type != "image")
-            and not (request.media_type == "videos" and item.media_type != "video")
-        }
-        if successful["image"] < image_target and "image" in available_types:
+
+        def fill(needed_type: str) -> list[ImageCandidate]:
+            batch: list[ImageCandidate] = []
+            batch_counts = {"image": 0, "video": 0}
+            batch_per_post: dict[str, int] = {}
+            available_types = {
+                item.media_type for item in items
+                if item.id not in attempted
+                and not (request.media_type == "images" and item.media_type != "image")
+                and not (request.media_type == "videos" and item.media_type != "video")
+            }
+            if needed_type not in available_types:
+                return []
+            batch_limit = max(1, int(os.getenv(
+                "IMAGE_DOWNLOAD_BATCH_SIZE" if needed_type == "image" else "VIDEO_DOWNLOAD_BATCH_SIZE",
+                "10" if needed_type == "image" else "3",
+            )))
+            for item in items:
+                if item.id in attempted:
+                    continue
+                if request.media_type == "images" and item.media_type != "image":
+                    continue
+                if request.media_type == "videos" and item.media_type != "video":
+                    continue
+                if item.media_type != needed_type:
+                    continue
+                target = image_target if item.media_type == "image" else video_target
+                if successful[item.media_type] + batch_counts[item.media_type] >= target:
+                    continue
+                post = item.post_id or item.id
+                if item.media_type == "image" and request.per_post_limit is not None:
+                    used = successful_per_post.get(post, 0) + batch_per_post.get(post, 0)
+                    if used >= request.per_post_limit:
+                        continue
+                    batch_per_post[post] = batch_per_post.get(post, 0) + 1
+                batch.append(item)
+                batch_counts[item.media_type] += 1
+                if len(batch) >= batch_limit:
+                    break
+                if len(batch) >= budget:
+                    break
+                if (
+                    successful["image"] + batch_counts["image"] >= image_target
+                    and successful["video"] + batch_counts["video"] >= video_target
+                ):
+                    break
+            return batch
+
+        if successful["image"] < image_target:
             needed_type = "image"
-        elif successful["video"] < video_target and "video" in available_types:
+        elif successful["video"] < video_target:
             needed_type = "video"
         else:
             return []
-        batch_limit = max(1, int(os.getenv(
-            "IMAGE_DOWNLOAD_BATCH_SIZE" if needed_type == "image" else "VIDEO_DOWNLOAD_BATCH_SIZE",
-            "10" if needed_type == "image" else "3",
-        )))
-        for item in items:
-            if item.id in attempted:
-                continue
-            if request.media_type == "images" and item.media_type != "image":
-                continue
-            if request.media_type == "videos" and item.media_type != "video":
-                continue
-            if item.media_type != needed_type:
-                continue
-            target = image_target if item.media_type == "image" else video_target
-            if successful[item.media_type] + batch_counts[item.media_type] >= target:
-                continue
-            post = item.post_id or item.id
-            if item.media_type == "image" and request.per_post_limit is not None:
-                used = successful_per_post.get(post, 0) + batch_per_post.get(post, 0)
-                if used >= request.per_post_limit:
-                    continue
-                batch_per_post[post] = batch_per_post.get(post, 0) + 1
-            batch.append(item)
-            batch_counts[item.media_type] += 1
-            if len(batch) >= batch_limit:
-                break
-            if len(batch) >= budget:
-                break
-            if (
-                successful["image"] + batch_counts["image"] >= image_target
-                and successful["video"] + batch_counts["video"] >= video_target
-            ):
-                break
+        batch = fill(needed_type)
+        if not batch:
+            other = "video" if needed_type == "image" else "image"
+            other_needed = successful[other] < (image_target if other == "image" else video_target)
+            if other_needed:
+                batch = fill(other)
         return batch
                 
 

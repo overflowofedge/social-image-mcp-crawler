@@ -7,12 +7,53 @@ only extracts public image/video URLs and descriptive metadata; it never downloa
 """
 
 import html
+import json
+import os
 import re
+import sys
+import time
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 from .media_quality import is_hdr_video, video_stream_score
+
+
+_RESULT_FILE_PREFIX = "SOCIAL_IMAGE_RESULT_FILE="
+_RESULT_MAX_AGE_SECONDS = 24 * 60 * 60
+
+
+def emit_bridge_result(result: "list[dict[str, Any]] | dict[str, Any]") -> bool:
+    """Hand results to the parent through a file instead of stdout.
+
+    Vendor CLIs log to stdout from code a bridge cannot silence reliably;
+    when the parent pre-creates a result directory (SOCIAL_IMAGE_RESULT_DIR),
+    records travel through a file that log noise cannot corrupt. Returns
+    False when the parent did not opt in, so callers keep the legacy stdout
+    JSON contract.
+    """
+    directory = os.environ.get("SOCIAL_IMAGE_RESULT_DIR")
+    if not directory:
+        return False
+    try:
+        folder = Path(directory)
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"result-{os.getpid()}.json"
+        payload = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+        path.write_text(payload, encoding="utf-8")
+        now = time.time()
+        for stale in folder.glob("result-*.json"):
+            try:
+                if now - stale.stat().st_mtime > _RESULT_MAX_AGE_SECONDS:
+                    stale.unlink(missing_ok=True)
+            except OSError:
+                continue
+    except OSError:
+        return False
+    sys.stdout.write(_RESULT_FILE_PREFIX + str(path) + "\n")
+    sys.stdout.flush()
+    return True
 
 
 _URL_RE = re.compile(r"^https?://", re.I)
