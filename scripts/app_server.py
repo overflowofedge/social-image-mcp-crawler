@@ -224,6 +224,38 @@ def _creator_hint(query: str, selected_platform: str | None, detected: str | Non
     return compact.lstrip("@"), None
 
 
+def _expand_post_budget(body: dict) -> int | None:
+    """Grow max_posts until the requested media count is reachable.
+
+    A creator gallery commonly carries several images per post, so asking for
+    200 images at 3 per post needs about 67 posts, not the UI's default 20.
+    Without this link the candidate pool shows hundreds of items while
+    downloads stop at the default traversal cap.
+    """
+    try:
+        media_type = str(body.get("media_type") or "images")
+        image_limit = int(body.get("image_limit") or 0)
+        video_limit = int(body.get("video_limit") or 0)
+        per_post = int(body.get("per_post_limit") or 3)
+        max_posts = int(body.get("max_posts") or 20)
+    except (TypeError, ValueError):
+        return None
+    if media_type == "videos":
+        needed = video_limit
+    elif media_type == "images":
+        needed = -(-max(0, image_limit) // max(1, per_post))
+    else:
+        # Image and video posts are disjoint works on douyin-style feeds, so
+        # the post budget has to cover both sums, not the larger of the two.
+        needed = -(-max(0, image_limit) // max(1, per_post)) + video_limit
+    # Videos ride one per post and not every post is a video, so keep headroom.
+    expanded = min(500, max(max_posts, needed + max(5, needed // 4)))
+    if expanded > max_posts:
+        body["max_posts"] = expanded
+        return expanded
+    return None
+
+
 _PLATFORM_LABELS = {
     "douyin": "抖音", "xhs": "小红书", "weibo": "微博",
     "bilibili": "B站", "x": "X", "instagram": "Instagram", "other": "自定义网页",
@@ -237,6 +269,20 @@ def _error_guidance(message: str, platform: str) -> tuple[str, str]:
     label = _PLATFORM_LABELS.get(platform, platform or "当前平台")
     if "请输入搜索提示词或链接" in raw:
         return "没有填写要采集的账号或网址。", "输入账号昵称、完整主页链接或作品链接后再试。"
+    if "validation error" in lowered and "should match pattern" in lowered:
+        field = ""
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith(('"', "{", "1 ")):
+                field = stripped.split()[0]
+                break
+        field_label = {
+            "media_type": "媒体类型", "filter_mode": "筛选模式", "quality_mode": "质量模式",
+            "platform": "平台", "max_videos": "视频数量", "max_images": "图片数量",
+        }.get(field, field or "请求参数")
+        return f"请求参数无效（{field_label}）。", "请刷新页面后重试；若反复出现，请更新桌面版。"
+    if "validation error" in lowered:
+        return "请求参数不符合要求。", "请刷新页面后重试；若反复出现，请更新桌面版。"
     if any(marker in lowered for marker in (
         "无法从链接提取视频 id", "不是抖音主页链接", "无法从短链接解析抖音主页",
     )):
@@ -269,16 +315,21 @@ def _error_guidance(message: str, platform: str) -> tuple[str, str]:
     )):
         action = "稍后重试，并确认平台登录状态正常。"
         if platform == "douyin":
-            action = "在页面“平台登录”中点击抖音重新登录，完成验证后再试；仍失败时稍后重试或更换网络。"
+            action = "程序会自动尝试浏览器方式恢复；仍失败时在页面“平台登录”中点击抖音重新登录，完成验证后再试。"
         elif platform == "bilibili":
             action = "稍后重试；频繁出现时，在页面“平台登录”中点击 B 站重新登录，完成验证后直接重试。"
         return f"{label}触发了访问频率限制或安全验证，本次请求被平台拒绝。", action
+    if any(marker in lowered for marker in (
+        "userid不合法", "user_id不合法", "获取用户资料失败", "creator_identity_unresolved",
+        "identity_unresolved", "matched 0", "not found", "没有找到",
+    )):
+        return "没有确认到唯一的账号，链接可能无效、昵称可能不准确，或账号未公开。", "核对完整昵称或粘贴该账号的完整主页链接；仍失败时确认账号为公开状态。"
     if any(marker in lowered for marker in ("cookie", "login", "logged in", "登录", "扫码", "unauthorized", "-101")):
         action = ("在页面“平台登录”中点击该平台登录，按官方窗口提示完成登录和验证后直接重试。"
                   if platform in {"douyin", "weibo", "xhs", "bilibili", "x", "instagram"}
                   else "检查该网页的访问权限和登录要求后重试。")
         return f"{label}登录状态缺失或已经失效。", action
-    if any(marker in lowered for marker in ("creator_identity_unresolved", "identity_unresolved", "matched 0", "not found", "没有找到")):
+    if any(marker in lowered for marker in ("matched 0", "not found", "没有找到")):
         return "没有确认到唯一的账号，昵称可能不准确、存在同名账号，或账号未公开。", "核对完整昵称；仍无法识别时粘贴该账号的完整主页链接。"
     if any(marker in lowered for marker in ("timed out", "timeout", "deadline", "超时")):
         return "平台或下载服务器响应超时。", "先减少下载数量和“最多检索作品数”后重试，并检查网络连接。"
@@ -288,7 +339,9 @@ def _error_guidance(message: str, platform: str) -> tuple[str, str]:
         return "文件尺寸低于允许的最小值，已跳过。", "降低最小尺寸要求，或选择包含更高清内容的作品。"
     if any(marker in lowered for marker in ("dependency", "module not found", "no module named", "未安装")):
         return "桌面版缺少运行依赖。", "重新运行“安装桌面版.bat”，完成后再启动应用。"
-    if any(marker in lowered for marker in ("connection", "connect", "network", "dns", "ssl", "request failed")):
+    if any(marker in lowered for marker in ("creator timeline unavailable",)):
+        return f"{label}账号作品列表暂时无法完整读取，已保留其他方式找到的内容。", "稍后重试；频繁出现时更新该平台 Cookie 或重新登录。"
+    if any(marker in lowered for marker in ("connection", "connect", "network", "dns", "ssl", "getaddrinfo", "connecterror")):
         return "访问平台或媒体服务器时网络连接失败。", "检查网络和代理设置后重试；也可减少单次任务数量。"
     if any(marker in lowered for marker in ("content_filter_required", "required object", "no image matched")):
         return "严格内容筛选没有找到符合条件的内容。", "放宽内容筛选条件，或将筛选模式改为“尽量筛选”。"
@@ -304,6 +357,8 @@ def _warning_guidance(message: str, platform: str) -> tuple[str, str]:
     label = _PLATFORM_LABELS.get(platform, platform or "当前平台")
     if "creator timeline unavailable" in lowered:
         return f"{label}账号作品列表暂时无法完整读取，已保留其他方式找到的内容。", "稍后重试；频繁出现时更新该平台 Cookie 或重新登录。"
+    if "stopped after the first page" in lowered:
+        return f"{label}当前会话受限，只能读取账号的第一页作品。", "在页面“平台登录”中重新扫码登录该平台，即可读取更多历史作品。"
     if "fallback search scanned" in lowered:
         return f"{label}主页接口受限，备用搜索已翻页并保留精确匹配该账号的作品。", "若仍未达到目标，请更新该平台 Cookie 后重试；备用搜索不保证覆盖账号全部历史作品。"
     if "pagination stopped" in lowered or "cursor made no progress" in lowered:
@@ -461,6 +516,14 @@ def _task_report(body: dict, result: dict, elapsed_seconds: float) -> dict:
         media: max(0, requested[media] - (successful[media] if body.get("download", True) else found[media]))
         for media in ("images", "videos")
     }
+    if not any(shortfalls.values()):
+        # A session-limited note alongside a fulfilled target is easy to
+        # misread as a failure. Reframe it as planning advice, not a problem.
+        label_text = _PLATFORM_LABELS.get(platform, platform or "当前平台")
+        for issue in issues:
+            if "只能读取" in issue.get("reason", ""):
+                issue["reason"] = f"本次目标已达成。{label_text}当前会话受限，只能读取账号的第一页作品。"
+                issue["action"] = "无需处理；之后要设置更高的采集数量时，先在“平台登录”中重新扫码登录该平台即可。"
     for media, unit in (("images", "张图片"), ("videos", "个视频")):
         if not shortfalls[media] or raw_errors:
             continue
@@ -731,6 +794,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if not isinstance(body, dict) or not str(body.get("query") or "").strip():
                 raise ValueError("请输入搜索提示词或链接")
+            _expand_post_budget(body)
             task = self.tasks.create()
             worker = threading.Thread(
                 target=_run_search_task,

@@ -735,3 +735,28 @@ def test_creator_requeues_completed_media_when_output_file_is_missing(tmp_path):
     assert first["downloads"][0]["status"] == "downloaded"
     assert second["downloads"][0]["status"] == "downloaded"
     assert downloader.calls == 2
+
+
+def test_creator_protocol_accepts_xhs_notes():
+    from social_image_mcp.creator_protocol import CreatorCollector, creator_items, native_author_id
+    from social_image_mcp.models import CreatorFetchRequest, CreatorIdentity, Platform
+
+    identity = CreatorIdentity(
+        platform=Platform.XHS, requested_id="abc123", canonical_id="abc123",
+        source="media-crawler", matched_by="profile_url",
+    )
+    detail = {
+        "note_id": "note1", "title": "穿搭", "user": {"user_id": "abc123", "nickname": "n"},
+        "image_list": [{"url_default": "https://sns-img.example/1.jpg"}],
+        "time": 1730000000000,
+    }
+    assert native_author_id("xhs", detail) == "abc123"
+    items = creator_items("xhs", detail, identity, covers=False)
+    assert items and items[0]["image_url"] == "https://sns-img.example/1.jpg"
+    assert items[0]["creator_id"] == "abc123"
+
+    request = CreatorFetchRequest(platform=Platform.XHS, profile_url="https://www.xiaohongshu.com/user/profile/abc123", download=False)
+    collector = CreatorCollector(identity, request)
+    assert collector.consume([detail], "cursor-1", True)
+    assert collector.posts_fetched == 1
+    assert collector.items and collector.items[0]["post_id"] == "note1"

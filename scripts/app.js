@@ -306,8 +306,23 @@ form.addEventListener("submit", async event => {
   const targets = [];
   if (imageLimitValue) targets.push(`${imageLimitValue} 张图片`);
   if (videoLimitValue) targets.push(`${videoLimitValue} 个视频`);
+  // Walk enough posts to actually hold the requested media count; galleries
+  // carry several images per post, so the default 20 posts cannot fill 100.
+  const perPost = mediaTypeValue !== "videos" ? Math.max(1, Number(perPostLimit.value) || 3) : 1;
+  const neededPosts = mediaTypeValue === "videos"
+    ? (videoLimitValue || 0)
+    : mediaTypeValue === "images"
+      ? Math.ceil((imageLimitValue || 0) / perPost)
+      : Math.ceil((imageLimitValue || 0) / perPost) + (videoLimitValue || 0);
+  const expandedPosts = Math.min(500, Math.max(body.max_posts, neededPosts + Math.max(5, Math.ceil(neededPosts / 4))));
+  const expandedNotice = expandedPosts > body.max_posts;
+  if (expandedNotice) {
+    body.max_posts = expandedPosts;
+    $("max_posts").value = expandedPosts;
+  }
   renderLogEntries([
     {level: "info", message: `开始采集${platformLabels[platform] || platform}，目标为 ${targets.join("、")}。`},
+    ...(expandedNotice ? [{level: "warning", message: `目标数量需要更多作品，已自动把“最多检索作品数”扩展到 ${expandedPosts}。`}] : []),
     {level: "info", message: `本次最多检查 ${body.max_posts} 个作品，请稍候。`}
   ]);
   try {

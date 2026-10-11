@@ -421,3 +421,26 @@ def test_login_http_is_async_deduplicated_and_can_be_cancelled(monkeypatch, tmp_
         post("/api/login/cancel", {"platform": platform})
     manager.close()
     assert manager.status(platform)["state"] == "cancelled"
+
+
+def test_expand_post_budget_links_media_target_to_post_scope():
+    expand = _MODULE._expand_post_budget
+    body = {"media_type": "images", "image_limit": 200, "video_limit": 0,
+            "per_post_limit": 3, "max_posts": 20}
+    expanded = expand(body)
+    # 200 images at 3 per post need 67 posts plus max(5, 67//4) headroom.
+    assert expanded == 83
+    assert body["max_posts"] == 83
+    # A budget that already covers the target stays untouched.
+    body = {"media_type": "images", "image_limit": 30, "video_limit": 0,
+            "per_post_limit": 3, "max_posts": 50}
+    assert expand(body) is None
+    assert body["max_posts"] == 50
+    # Videos ride one per post and need headroom for non-video posts.
+    body = {"media_type": "videos", "image_limit": 0, "video_limit": 100,
+            "per_post_limit": None, "max_posts": 20}
+    assert expand(body) == 125
+    # The hard ceiling of 500 posts is respected.
+    body = {"media_type": "all", "image_limit": 1000, "video_limit": 1000,
+            "per_post_limit": 1, "max_posts": 20}
+    assert expand(body) == 500

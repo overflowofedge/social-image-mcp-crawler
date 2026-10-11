@@ -41,6 +41,35 @@ def _decode_process_output(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+_RESULT_FILE_PREFIX = "SOCIAL_IMAGE_RESULT_FILE="
+
+
+def _bridge_result_dir() -> str:
+    from tempfile import gettempdir
+
+    return str(Path(gettempdir()) / "social-image-bridge-results")
+
+
+def _resolve_bridge_output(stdout: str) -> str:
+    """Prefer the result file a bridge wrote over its possibly noisy stdout.
+
+    Bridges keep printing plain JSON lines unless SOCIAL_IMAGE_RESULT_DIR was
+    exported; when a pointer line exists, the referenced file is the contract
+    and vendor log noise on stdout no longer matters.
+    """
+    pointer = ""
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(_RESULT_FILE_PREFIX):
+            pointer = stripped[len(_RESULT_FILE_PREFIX):].strip()
+    if not pointer:
+        return stdout
+    try:
+        return Path(pointer).read_text(encoding="utf-8")
+    except OSError:
+        return stdout
+
+
 class SourceVerificationStore:
     """Persist real source outcomes without storing credentials or content."""
 
@@ -385,6 +414,7 @@ class ExternalJsonSource:
         self._verified_platforms: set[str] = set()
         self._last_errors: dict[str, str] = {}
         self._cooldown_until: dict[str, float] = {}
+        self._failure_counts: dict[str, int] = {}
         self._verification = verification_store or SourceVerificationStore()
 
     @property
@@ -422,8 +452,14 @@ class ExternalJsonSource:
         self._last_errors[platform.value] = detail
         self._verified = bool(self._verified_platforms)
         self._last_error = detail
+        # Repeated failures back off exponentially (base × 2ⁿ, capped at 30
+        # minutes) so a risk-controlled account is not re-probed every two
+        # minutes for the rest of the session.
+        failures = self._failure_counts.get(cooldown_key, 0) + 1
+        self._failure_counts[cooldown_key] = failures
         if self.failure_cooldown_seconds:
-            self._cooldown_until[cooldown_key] = time.monotonic() + self.failure_cooldown_seconds
+            backoff = min(1800.0, float(self.failure_cooldown_seconds) * (2 ** min(failures - 1, 4)))
+            self._cooldown_until[cooldown_key] = time.monotonic() + backoff
         self._verification.record_failure(self.name, platform.value, detail)
 
     def _succeeded(self, platform: Platform, scope: str | None = None) -> None:
@@ -432,8 +468,11 @@ class ExternalJsonSource:
         self._verified = True
         self._last_error = None
         self._cooldown_until.pop(platform.value, None)
+        self._failure_counts.pop(platform.value, None)
         if scope:
-            self._cooldown_until.pop(f"{platform.value}:{scope}", None)
+            scope_key = f"{platform.value}:{scope}"
+            self._cooldown_until.pop(scope_key, None)
+            self._failure_counts.pop(scope_key, None)
         self._verification.record_success(self.name, platform.value)
 
     def _check_cooldown(self, platform: Platform, scope: str | None = None) -> None:
@@ -466,7 +505,8 @@ class ExternalJsonSource:
         # a shell/template. Existing bridge configuration remains compatible.
         command = self._command(request.platform, Intent("", "", (), ()), request.max_images)
         env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1",
-               "SOCIAL_IMAGE_CREATOR_REQUEST": request.model_dump_json()}
+               "SOCIAL_IMAGE_CREATOR_REQUEST": request.model_dump_json(),
+               "SOCIAL_IMAGE_RESULT_DIR": _bridge_result_dir()}
         process = None
         try:
             process = await asyncio.create_subprocess_exec(
@@ -482,7 +522,7 @@ class ExternalJsonSource:
             if process.returncode:
                 detail = f"{self.name} creator request failed: {_decode_process_output(stderr)[-1500:]}"
                 raise SourceError(detail)
-            result = normalize_creator_source_output(request.platform, _decode_process_output(stdout), self.name, 20000)
+            result = normalize_creator_source_output(request.platform, _resolve_bridge_output(_decode_process_output(stdout)), self.name, 20000)
             if result.identity.platform != request.platform:
                 detail = "creator identity platform mismatch"
                 raise SourceError(detail)
@@ -522,6 +562,7 @@ class ExternalJsonSource:
             "SOCIAL_IMAGE_ITEM_ID": intent.identifier or "",
             "SOCIAL_IMAGE_LIMIT": str(limit),
             "SOCIAL_IMAGE_SEARCH_MAX_POSTS": str(request.max_posts if request else min(limit, 500)),
+            "SOCIAL_IMAGE_RESULT_DIR": _bridge_result_dir(),
             # Windows defaults to the active code page (often GBK).  Source
             # bridges emit JSON metadata that may contain emoji or other
             # Unicode, so force UTF-8 for both Python and compatible CLIs.
@@ -560,7 +601,7 @@ class ExternalJsonSource:
             detail = _decode_process_output(stderr).strip()[-1000:]
             self._failed(platform, detail or f"exited with code {process.returncode}")
             raise SourceError(f"{self.name} exited with code {process.returncode}: {detail}")
-        candidates = normalize_source_output(platform, _decode_process_output(stdout), self.name, limit, request.media_type if request else None)
+        candidates = normalize_source_output(platform, _resolve_bridge_output(_decode_process_output(stdout)), self.name, limit, request.media_type if request else None)
         if not candidates:
             values = _json_values(_decode_process_output(stdout))
             if any(isinstance(value, dict) and value.get("source_status") == "empty" for value in values):
@@ -601,6 +642,7 @@ class GalleryDlSource:
         self._verified_platforms: set[str] = set()
         self._last_errors: dict[str, str] = {}
         self._cooldown_until: dict[str, float] = {}
+        self._failure_counts: dict[str, int] = {}
         self._verification = verification_store or SourceVerificationStore()
 
     @property
@@ -637,8 +679,11 @@ class GalleryDlSource:
         self._last_errors[platform.value] = detail
         self._verified = bool(self._verified_platforms)
         self._last_error = detail
+        failures = self._failure_counts.get(platform.value, 0) + 1
+        self._failure_counts[platform.value] = failures
         if self.failure_cooldown_seconds:
-            self._cooldown_until[platform.value] = time.monotonic() + self.failure_cooldown_seconds
+            backoff = min(1800.0, float(self.failure_cooldown_seconds) * (2 ** min(failures - 1, 4)))
+            self._cooldown_until[platform.value] = time.monotonic() + backoff
         self._verification.record_failure(self.name, platform.value, detail)
 
     def _succeeded(self, platform: Platform) -> None:
@@ -647,6 +692,7 @@ class GalleryDlSource:
         self._verified = True
         self._last_error = None
         self._cooldown_until.pop(platform.value, None)
+        self._failure_counts.pop(platform.value, None)
         self._verification.record_success(self.name, platform.value)
 
     def _check_cooldown(self, platform: Platform) -> None:
@@ -721,13 +767,29 @@ class GalleryDlSource:
     def _target(self, platform: Platform, intent: Intent) -> str:
         return self._targets(platform, intent)[0]
 
+    @staticmethod
+    def _browser_profile_exists(spec: str) -> bool:
+        """``channel[/domain]:path`` selectors break when the profile moved.
+
+        An exported .env often carries an absolute path from the machine or
+        folder the desktop version was configured on. When that profile no
+        longer exists, skip the selector instead of making gallery-dl fail on
+        an unreadable user-data dir.
+        """
+        _, _, path = spec.partition(":")
+        # A bare channel ("edge") carries no profile dir; only an explicit
+        # path has to exist for gallery-dl to consume the selector.
+        return not path or Path(path).exists()
+
     def _command(self, platform: Platform, intent: Intent, limit: int) -> list[str]:
         binary = self.binary if Path(self.binary).exists() else shutil.which(self.binary) or self.binary
         command = [binary, "--dump-json", "--no-download", "-o", "output.jsonl=true", "--range", f"1-{max(1, limit)}"]
         platform_file = self.platform_cookie_files.get(platform)
         platform_browser = self.platform_cookies_from_browser.get(platform)
+        if platform_browser and not self._browser_profile_exists(platform_browser):
+            platform_browser = None
         saved_file = None
-        if platform in {Platform.X, Platform.INSTAGRAM}:
+        if platform in {Platform.X, Platform.INSTAGRAM, Platform.WEIBO, Platform.XHS}:
             # New in-app login takes effect without rebuilding the source. Old
             # exported sessions remain a fallback when no selector is configured.
             configured = platform_file or platform_browser or self.cookies_file or self.cookies_from_browser
@@ -808,7 +870,7 @@ class GalleryDlSource:
         returns authenticated media URLs, so adapt its records into the same
         creator envelope used by the other platforms.
         """
-        if request.platform not in (Platform.X, Platform.INSTAGRAM, Platform.XHS):
+        if request.platform not in (Platform.X, Platform.INSTAGRAM, Platform.XHS, Platform.WEIBO):
             raise SourceUnavailable(f"gallery-dl creator retrieval does not support {request.platform.value}")
         target = request.creator_name or request.creator_id or request.profile_url or ""
         target = target.strip().lstrip("@")
@@ -822,6 +884,18 @@ class GalleryDlSource:
             media_url = profile_url
         elif request.platform == Platform.XHS:
             profile_url = request.profile_url or target
+            media_url = profile_url
+        elif request.platform == Platform.WEIBO:
+            # gallery-dl's Weibo extractor needs the numeric account UID; a
+            # nickname cannot be resolved here, so only URL/UID targets work.
+            uid = request.creator_id or ""
+            if request.profile_url:
+                parts = [part for part in urlparse(request.profile_url).path.split("/") if part]
+                uid = next((part for part in parts if part.isdigit()), uid)
+            if not uid or not uid.isdigit():
+                raise SourceError("weibo gallery fallback needs a numeric account ID or profile URL")
+            target = uid
+            profile_url = f"https://weibo.com/u/{uid}"
             media_url = profile_url
         else:
             profile_url = f"https://x.com/{target}"
@@ -885,7 +959,11 @@ class SourceHub:
         # failures, cookies, cooldowns and verification state, even where two
         # platforms happen to use the same underlying CLI executable.
         self.weibo_source = ExternalJsonSource("weibo-cli", media_crawler_command, (Platform.WEIBO,), timeout_seconds, failure_cooldown_seconds, verification)
-        self.xhs_source = ExternalJsonSource("xhs-cli", xhs_downloader_command, (Platform.XHS,), timeout_seconds, failure_cooldown_seconds, verification)
+        # XHS keyword search and creator timelines run through MediaCrawler's
+        # signed client; XHS-Downloader stays wired for note-detail extraction.
+        # Its bridge intentionally returns nothing for keyword or creator runs.
+        xhs_cli_command = media_crawler_command or xhs_downloader_command
+        self.xhs_source = ExternalJsonSource("xhs-cli", xhs_cli_command, (Platform.XHS,), timeout_seconds, failure_cooldown_seconds, verification)
         self.douyin_source = ExternalJsonSource("dy-cli", douyin_source_command, (Platform.DOUYIN,), douyin_timeout_seconds, failure_cooldown_seconds, verification)
         self.bilibili_source = ExternalJsonSource("bilibili-cli", bilibili_source_command, (Platform.BILIBILI,), timeout_seconds, failure_cooldown_seconds, verification)
         self.x_source = GalleryDlSource(
@@ -910,6 +988,20 @@ class SourceHub:
             name="instagram-cli",
             platforms=(Platform.INSTAGRAM,),
         )
+        # Weibo's primary CLI (MediaCrawler) drives a full browser; when its
+        # login or page shape breaks, the same gallery-dl binary can still read
+        # public timelines with the saved weibo session, so keep a fallback.
+        self.weibo_gallery_source = GalleryDlSource(
+            gallery_dl_binary,
+            gallery_dl_config,
+            timeout_seconds,
+            gallery_dl_cookies_from_browser,
+            failure_cooldown_seconds,
+            verification,
+            gallery_dl_cookies_file,
+            name="weibo-gallery",
+            platforms=(Platform.WEIBO,),
+        )
         self._platform_sources = {
             Platform.DOUYIN: self.douyin_source,
             Platform.WEIBO: self.weibo_source,
@@ -918,14 +1010,23 @@ class SourceHub:
             Platform.XHS: self.xhs_source,
             Platform.BILIBILI: self.bilibili_source,
         }
+        self._gallery_fallbacks: dict[Platform, GalleryDlSource] = {
+            Platform.WEIBO: self.weibo_gallery_source,
+        }
 
     def statuses(self) -> list[dict[str, Any]]:
-        return [{"name": status.name, "configured": status.configured, "verified": status.verified, "verified_platforms": list(status.verified_platforms), "ready_platforms": list(status.ready_platforms), "mode": status.mode, "detail": status.detail, "platforms": list(status.platforms), "platform_status": status.platform_status or {}} for status in (self.douyin_source.status, self.weibo_source.status, self.x_source.status, self.instagram_source.status, self.xhs_source.status, self.bilibili_source.status)]
+        return [{"name": status.name, "configured": status.configured, "verified": status.verified, "verified_platforms": list(status.verified_platforms), "ready_platforms": list(status.ready_platforms), "mode": status.mode, "detail": status.detail, "platforms": list(status.platforms), "platform_status": status.platform_status or {}} for status in (self.douyin_source.status, self.weibo_source.status, self.weibo_gallery_source.status, self.x_source.status, self.instagram_source.status, self.xhs_source.status, self.bilibili_source.status)]
 
     def session_updated(self, platform: Platform) -> None:
         """Allow an immediate retry with new credentials without claiming a crawl succeeded."""
-        source = self._platform_sources.get(platform)
-        if isinstance(source, (ExternalJsonSource, GalleryDlSource)):
+        sources: list[ExternalJsonSource | GalleryDlSource] = []
+        primary = self._platform_sources.get(platform)
+        if isinstance(primary, (ExternalJsonSource, GalleryDlSource)):
+            sources.append(primary)
+        fallback = self._gallery_fallbacks.get(platform)
+        if isinstance(fallback, GalleryDlSource) and fallback not in sources:
+            sources.append(fallback)
+        for source in sources:
             for key in list(source._cooldown_until):
                 if key == platform.value or key.startswith(platform.value + ":"):
                     source._cooldown_until.pop(key, None)
@@ -933,10 +1034,26 @@ class SourceHub:
             source._last_error = next(iter(source._last_errors.values()), None)
 
     async def fetch_creator(self, request: CreatorFetchRequest) -> CreatorSourceResult:
+        errors: list[str] = []
         source = self._platform_sources.get(request.platform)
-        if source is None or not source.status.configured:
-            raise SourceUnavailable(f"No dedicated CLI configured for {request.platform.value}")
-        return await source.fetch_creator(request)
+        if source is not None and source.status.configured:
+            try:
+                return await source.fetch_creator(request)
+            except SourceUnavailable:
+                raise
+            except SourceError as exc:
+                errors.append(str(exc))
+        fallback = self._gallery_fallbacks.get(request.platform)
+        if fallback is not None and fallback.status.configured:
+            try:
+                return await fallback.fetch_creator(request)
+            except SourceUnavailable:
+                pass
+            except SourceError as exc:
+                errors.append(str(exc))
+        if errors:
+            raise SourceError(" | ".join(dict.fromkeys(errors))[-1500:])
+        raise SourceUnavailable(f"No dedicated CLI configured for {request.platform.value}")
 
     async def search(self, platform: Platform, intent: Intent, limit: int, *, request: SearchRequest | None = None) -> list[ImageCandidate]:
         source = self._platform_sources.get(platform)

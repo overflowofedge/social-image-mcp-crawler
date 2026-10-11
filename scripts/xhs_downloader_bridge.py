@@ -19,6 +19,8 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from social_image_mcp.bridge_utils import emit_bridge_result
+
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="XHS-Downloader JSON bridge")
@@ -127,6 +129,8 @@ def main() -> int:
     except Exception as exc:
         print(f"xhs-downloader bridge failed: {exc}", file=sys.stderr)
         return 2
+    if emit_bridge_result(result):
+        return 0
     for item in result:
         print(json.dumps(item, ensure_ascii=False, separators=(",", ":")))
     return 0

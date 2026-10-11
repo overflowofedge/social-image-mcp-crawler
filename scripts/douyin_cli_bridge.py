@@ -28,7 +28,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from social_image_mcp.bridge_utils import normalize_native_record
+from social_image_mcp.bridge_utils import emit_bridge_result, normalize_native_record
 from social_image_mcp.accounts import cookie_header, read_session, session_path
 from social_image_mcp.creator_protocol import CreatorCollector, douyin_identity
 from social_image_mcp.models import CreatorFetchRequest, SearchRequest
@@ -568,19 +568,27 @@ async def _fetch_creator_via_browser(request: CreatorFetchRequest, account: str 
             await browser.close()
 
 
+def _browser_fallback_enabled() -> bool:
+    """Douyin's signed post API is risk-controlled per account/network, so the
+    native route can 403 even with a valid cookie. Browser capture generates
+    fresh signatures inside a real page and recovers those runs, so fallback
+    is automatic unless it is explicitly disabled."""
+    return os.getenv("DOUYIN_BROWSER_FALLBACK", "auto").strip().lower() not in {
+        "0", "false", "no", "off", "never", "native",
+    }
+
+
 def _fetch_creator_with_fallback(client: Any, request: CreatorFetchRequest, account: str | None = None) -> dict[str, Any]:
-    """Use dy-cli's native API route; optional browser capture is explicit."""
+    """Use dy-cli's native API route first, then browser capture when it is blocked."""
     http_error: Exception | None = None
     try:
         return _fetch_creator(client, request)
     except Exception as exc:
         http_error = exc
 
-    if os.getenv("DOUYIN_BROWSER_FALLBACK", "false").lower() not in {"1", "true", "yes"}:
+    if not _browser_fallback_enabled():
         raise RuntimeError(f"dy-cli native creator route failed: {http_error}") from http_error
 
-    # Browser response capture is slower and starts a second browser. Keep it
-    # available for explicit diagnostics, never as a silent production route.
     try:
         result = asyncio.get_event_loop().run_until_complete(_fetch_creator_via_browser(request, account))
         if http_error and result.get("warnings") is None:
@@ -749,6 +757,8 @@ def main() -> int:
     except Exception as exc:
         print(f"dy-cli bridge failed: {exc}", file=sys.stderr)
         return 2
+    if emit_bridge_result(result):
+        return 0
     if isinstance(result, dict):
         print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
         return 0

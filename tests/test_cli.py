@@ -6,6 +6,6 @@ def test_diagnostics_exposes_mcp_tools_and_sources():
     assert "search_images" in result["tools"]
     assert "list_sources" in result["tools"]
     assert {item["name"] for item in result["sources"]} == {
-        "dy-cli", "bilibili-cli", "weibo-cli", "xhs-cli", "x-cli", "instagram-cli",
+        "dy-cli", "bilibili-cli", "weibo-cli", "weibo-gallery", "xhs-cli", "x-cli", "instagram-cli",
     }
     assert set((result["object_filter"] or {})) >= {"configured", "ready", "model"}
