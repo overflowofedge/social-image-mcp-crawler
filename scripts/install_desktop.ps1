@@ -41,7 +41,16 @@ if ($LASTEXITCODE -ne 0) { throw "桌面版运行环境修复失败，请查看�
 
 function Test-PythonCode {
     param([string]$Code)
-    & $venvPython -c $Code *> $null
+    # On a fresh venv the probe fails and prints a traceback to stderr. Under
+    # Windows PowerShell 5.1 with $ErrorActionPreference = "Stop", redirected
+    # native stderr becomes a terminating NativeCommandError, so relax it here.
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $venvPython -c $Code *> $null
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
     return $LASTEXITCODE -eq 0
 }
 
