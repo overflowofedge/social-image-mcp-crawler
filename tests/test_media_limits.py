@@ -51,3 +51,35 @@ def test_large_desktop_limits_are_validated_consistently():
     assert DownloadRequest(items=[item] * 2000).items[-1].id == "one"
     with pytest.raises(ValueError):
         SearchRequest(query="example", media_type="images", max_results=1001)
+
+
+def test_per_post_cap_backfills_until_the_total_quota_is_met():
+    """Douyin hands out about one search page per query, so 4 posts x a
+    3-per-post cap can never reach a 15-image goal; the cap must yield."""
+    items = [
+        ImageCandidate(id=f"p{post}-{index}", platform="douyin",
+                       image_url=f"https://cdn.test/p{post}-{index}",
+                       media_type="image", post_id=f"post-{post}")
+        for post in range(4) for index in range(5)
+    ]
+    request = SearchRequest(query="example", media_type="images",
+                            image_limit=15, max_results=15, per_post_limit=3)
+    selected = SocialImageService._apply_media_limits(items, request)
+    assert len(selected) == 15
+
+
+def test_per_post_cap_still_spreads_when_supply_is_rich():
+    items = [
+        ImageCandidate(id=f"p{post}-{index}", platform="douyin",
+                       image_url=f"https://cdn.test/p{post}-{index}",
+                       media_type="image", post_id=f"post-{post}")
+        for post in range(20) for index in range(5)
+    ]
+    request = SearchRequest(query="example", media_type="images",
+                            image_limit=30, max_results=30, per_post_limit=3)
+    selected = SocialImageService._apply_media_limits(items, request)
+    per_post: dict[str, int] = {}
+    for item in selected:
+        per_post[item.post_id] = per_post.get(item.post_id, 0) + 1
+    assert len(selected) == 30
+    assert max(per_post.values()) == 3

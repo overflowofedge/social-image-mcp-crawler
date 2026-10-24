@@ -253,6 +253,18 @@ class SocialImageService:
                 all_candidates, intent, min(max(target_limit * 3, target_limit), 2000),
                 request.min_width, request.min_height, require_match=True,
             )
+            # Keyword feeds sometimes pad results with broad recommendations,
+            # and the strict text match drops them.  When those drops leave the
+            # pool short of the requested total -- Douyin serves about one page
+            # per query before a verify_check -- append the unmatched
+            # candidates behind the matched ones instead of coming back short.
+            if len(ranked) < target_limit:
+                relaxed = rank_candidates(
+                    all_candidates, intent, min(max(target_limit * 3, target_limit), 2000),
+                    request.min_width, request.min_height, require_match=False,
+                )
+                seen_keys = {item.image_url.split("?", 1)[0].lower() for item in ranked}
+                ranked.extend(item for item in relaxed if item.image_url.split("?", 1)[0].lower() not in seen_keys)
             ranked = [item.model_copy(update={"score": round(item.score + self.feedback.bias(intent, item), 4)}) for item in ranked]
             ranked.sort(key=lambda item: item.score, reverse=True)
             if self.reranker.enabled:
@@ -449,26 +461,45 @@ class SocialImageService:
         counts = {"image": 0, "video": 0}
         posts: dict[str, int] = {}
         selected: list[ImageCandidate] = []
+        deferred: list[ImageCandidate] = []
+
+        def quotas_met() -> bool:
+            if request.media_type == "all":
+                return counts["image"] >= image_limit and counts["video"] >= video_limit
+            return len(selected) >= request.max_results
+
+        def take(item: ImageCandidate) -> bool:
+            limit = image_limit if item.media_type == "image" else video_limit
+            if counts[item.media_type] >= limit:
+                return False
+            post = item.post_id or item.id
+            counts[item.media_type] += 1
+            if item.media_type == "image":
+                posts[post] = posts.get(post, 0) + 1
+            selected.append(item)
+            return True
+
         for item in items:
+            if quotas_met():
+                break
             if request.media_type == "images" and item.media_type != "image":
                 continue
             if request.media_type == "videos" and item.media_type != "video":
                 continue
             post = item.post_id or item.id
-            limit_post = item.media_type == "image"
-            if limit_post and per_post_limit is not None and posts.get(post, 0) >= per_post_limit:
+            if item.media_type == "image" and per_post_limit is not None and posts.get(post, 0) >= per_post_limit:
+                deferred.append(item)
                 continue
-            limit = image_limit if item.media_type == "image" else video_limit
-            if counts[item.media_type] >= limit:
-                continue
-            counts[item.media_type] += 1
-            if limit_post:
-                posts[post] = posts.get(post, 0) + 1
-            selected.append(item)
-            if request.media_type != "all" and len(selected) >= request.max_results:
+            take(item)
+        # The per-post cap is a diversity preference, not a count target. Some
+        # sources (Douyin keyword search) hand out about one result page per
+        # query before a verify_check, so an enforced cap can make the total
+        # unreachable (9 posts x 3 = 27 images against a 50-image goal).
+        # Backfill from the capped pool in ranking order until quotas are met.
+        for item in deferred:
+            if quotas_met():
                 break
-            if request.media_type == "all" and counts["image"] >= image_limit and counts["video"] >= video_limit:
-                break
+            take(item)
         return selected
 
     async def fetch_creator(self, request: CreatorFetchRequest) -> dict:
