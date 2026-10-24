@@ -217,6 +217,58 @@ def test_detail_page_does_not_replace_own_media_with_navigation_cards():
     asyncio.run(run())
 
 
+def test_direct_gallery_page_ignores_per_post_limit():
+    page = '''<main>
+    <img src="/shot-1.jpg" alt="one"><img src="/shot-2.jpg" alt="two"><img src="/shot-3.jpg" alt="three">
+    <img src="/shot-4.jpg" alt="four"><img src="/shot-5.jpg" alt="five">
+    </main>'''
+
+    def handler(request):
+        return html_response(page) if request.url.path == "/post/one" else media_response(request)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            result = await WebPageAdapter(client).search_media(SearchRequest(
+                query="https://example.org/post/one", media_type="images", image_limit=10,
+                per_post_limit=3,
+            ))
+        assert [item.image_url for item in result.items] == [
+            "https://example.org/shot-1.jpg", "https://example.org/shot-2.jpg",
+            "https://example.org/shot-3.jpg", "https://example.org/shot-4.jpg",
+            "https://example.org/shot-5.jpg",
+        ]
+
+    asyncio.run(run())
+
+
+def test_followed_detail_pages_stay_per_post_limited():
+    homepage = '''<main><a href="/post/one"><img src="/thumb1.jpg"></a><a href="/post/two"><img src="/thumb2.jpg"></a></main>'''
+    detail_one = '''<main><img src="/one-1.jpg"><img src="/one-2.jpg"><img src="/one-3.jpg"><img src="/one-4.jpg"><img src="/one-5.jpg"></main>'''
+    detail_two = '''<main><img src="/two-1.jpg"><img src="/two-2.jpg"><img src="/two-3.jpg"><img src="/two-4.jpg"><img src="/two-5.jpg"></main>'''
+
+    def handler(request):
+        if request.url.path == "/":
+            return html_response(homepage)
+        if request.url.path == "/post/one":
+            return html_response(detail_one)
+        if request.url.path == "/post/two":
+            return html_response(detail_two)
+        return media_response(request)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            result = await WebPageAdapter(client).search_media(SearchRequest(
+                query="https://example.org/", media_type="images", image_limit=10,
+                per_post_limit=3, max_posts=5,
+            ))
+        assert [item.image_url for item in result.items] == [
+            "https://example.org/one-1.jpg", "https://example.org/one-2.jpg", "https://example.org/one-3.jpg",
+            "https://example.org/two-1.jpg", "https://example.org/two-2.jpg", "https://example.org/two-3.jpg",
+        ]
+
+    asyncio.run(run())
+
+
 def test_webpage_prefers_original_over_cms_resized_thumbnail():
     html = '''<main>
     <img src="/photo.jpg" alt="original"><img src="/photo-480x640.jpg" alt="thumbnail">

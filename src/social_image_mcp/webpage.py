@@ -285,27 +285,35 @@ class WebPageAdapter(PlatformAdapter):
 
     async def _image_dimensions(self, item: ImageCandidate) -> ImageCandidate | None:
         # Read enough bytes for dimensions, rather than the full original.
-        try:
-            headers = {**_HEADERS, "Referer": item.permalink or "", "Range": "bytes=0-262143"}
-            async with self.client.stream("GET", item.image_url, headers=headers, follow_redirects=True, timeout=5) as response:
-                response.raise_for_status()
-                mime = response.headers.get("content-type", "").split(";", 1)[0]
-                if mime and not (mime.startswith("image/") or mime == "application/octet-stream"):
-                    return None
-                parser = ImageFile.Parser()
-                size = 0
-                async for chunk in response.aiter_bytes(16384):
-                    parser.feed(chunk)
-                    size += len(chunk)
-                    if parser.image:
-                        width, height = parser.image.size
-                        if min(width, height) < MIN_CONTENT_SIDE:
-                            return None
-                        return item.model_copy(update={"width": width, "height": height})
-                    if size >= 262144:
-                        break
-        except Exception:
-            return None
+        # Image CDNs that reject hotlinking answer a page-referred request
+        # with 403, so fall back to a Referer-less fetch before giving up.
+        variants = (
+            {**_HEADERS, "Referer": item.permalink or "", "Range": "bytes=0-262143"},
+            {**_HEADERS, "Range": "bytes=0-262143"},
+        )
+        for index, headers in enumerate(variants):
+            try:
+                async with self.client.stream("GET", item.image_url, headers=headers, follow_redirects=True, timeout=5) as response:
+                    if response.status_code in (401, 403) and index == 0:
+                        continue
+                    response.raise_for_status()
+                    mime = response.headers.get("content-type", "").split(";", 1)[0]
+                    if mime and not (mime.startswith("image/") or mime == "application/octet-stream"):
+                        return None
+                    parser = ImageFile.Parser()
+                    size = 0
+                    async for chunk in response.aiter_bytes(16384):
+                        parser.feed(chunk)
+                        size += len(chunk)
+                        if parser.image:
+                            width, height = parser.image.size
+                            if min(width, height) < MIN_CONTENT_SIDE:
+                                return None
+                            return item.model_copy(update={"width": width, "height": height})
+                        if size >= 262144:
+                            break
+            except Exception:
+                return None
         return None
 
     async def _render_page(self, url: str) -> PageMedia:
@@ -339,20 +347,26 @@ class WebPageAdapter(PlatformAdapter):
                 await browser.close()
 
     async def _video_file(self, item: ImageCandidate) -> ImageCandidate | None:
-        try:
-            headers = {**_HEADERS, "Referer": item.permalink or "", "Range": "bytes=0-255"}
-            async with self.client.stream("GET", item.image_url, headers=headers, follow_redirects=True, timeout=5) as response:
-                response.raise_for_status()
-                mime = response.headers.get("content-type", "").split(";", 1)[0].lower()
-                if mime.startswith("video/") and "mpegurl" not in mime:
-                    return item
-                if mime in {"", "application/octet-stream"}:
-                    async for chunk in response.aiter_bytes(256):
-                        if chunk[4:8] == b"ftyp" or chunk.startswith((b"\x1aE\xdf\xa3", b"OggS")):
-                            return item
-                        break
-        except Exception:
-            return None
+        variants = (
+            {**_HEADERS, "Referer": item.permalink or "", "Range": "bytes=0-255"},
+            {**_HEADERS, "Range": "bytes=0-255"},
+        )
+        for index, headers in enumerate(variants):
+            try:
+                async with self.client.stream("GET", item.image_url, headers=headers, follow_redirects=True, timeout=5) as response:
+                    if response.status_code in (401, 403) and index == 0:
+                        continue
+                    response.raise_for_status()
+                    mime = response.headers.get("content-type", "").split(";", 1)[0].lower()
+                    if mime.startswith("video/") and "mpegurl" not in mime:
+                        return item
+                    if mime in {"", "application/octet-stream"}:
+                        async for chunk in response.aiter_bytes(256):
+                            if chunk[4:8] == b"ftyp" or chunk.startswith((b"\x1aE\xdf\xa3", b"OggS")):
+                                return item
+                            break
+            except Exception:
+                return None
         return None
 
     async def search(self, intent: Intent, limit: int, safe_mode: bool) -> list[ImageCandidate]:
@@ -483,8 +497,17 @@ class WebPageAdapter(PlatformAdapter):
         posts: dict[str, int] = {}
         for item in candidates:
             maximum = image_limit if item.media_type == "image" else video_limit
-            # The per-post image limit must not suppress a post's video.
-            if counts[item.media_type] >= maximum or (item.media_type == "image" and request.per_post_limit and posts.get(item.post_id, 0) >= request.per_post_limit):
+            # The per-post image limit must not suppress a post's video.  A
+            # requested page that is itself a gallery counts as one work only
+            # by URL: honoring the per-post cap there would trim a 100-image
+            # set to the cap, so only followed detail pages stay limited.
+            own_page = item.source_payload.get("content_page") == page_url
+            if counts[item.media_type] >= maximum or (
+                item.media_type == "image"
+                and not own_page
+                and request.per_post_limit
+                and posts.get(item.post_id, 0) >= request.per_post_limit
+            ):
                 continue
             counts[item.media_type] += 1
             if item.media_type == "image":

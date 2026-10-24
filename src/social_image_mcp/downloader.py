@@ -348,6 +348,16 @@ class ImageDownloader:
                     response = await self.client.get(item.image_url, headers=headers, follow_redirects=True, timeout=30)
                     response.raise_for_status()
                     break
+                except httpx.HTTPStatusError as exc:
+                    response = None
+                    last_error = str(exc)
+                    # Hotlink-protected CDNs answer a page-referred request
+                    # with 403; a Referer-less retry is the standard fix.
+                    if exc.response.status_code in (401, 403) and "Referer" in headers:
+                        headers = {key: value for key, value in headers.items() if key != "Referer"}
+                        continue
+                    if attempt < 2:
+                        await asyncio.sleep(_retry_delay(exc.response, attempt))
                 except httpx.HTTPError as exc:
                     response = None
                     last_error = str(exc)
