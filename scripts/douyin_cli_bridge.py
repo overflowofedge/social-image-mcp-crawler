@@ -181,7 +181,7 @@ def _raise_for_empty_search(payload: dict[str, Any], media_type: str = "images")
         raise RuntimeError("抖音触发 verify_check，本次请求未获得候选；请稍后重试或先使用作品 URL/ID")
 
 
-def _search_galleries(client: Any, query: str, media_type: str, limit: int, max_posts: int | None = None) -> tuple[dict[str, Any], list[list[dict[str, Any]]]]:
+def _search_galleries(client: Any, query: str, media_type: str, limit: int, max_posts: int | None = None, attempts_out: list[dict[str, Any]] | None = None) -> tuple[dict[str, Any], list[list[dict[str, Any]]]]:
     """Page one authenticated session until quota or the post budget is exhausted."""
     search_types = {
         "images": ("atlas", "general"),
@@ -201,6 +201,8 @@ def _search_galleries(client: Any, query: str, media_type: str, limit: int, max_
             payload = client.search(query, search_type=search_type, count=count, offset=offset)
             last_payload = payload
             attempts.append(payload)
+            if attempts_out is not None:
+                attempts_out.append(payload)
             records = _records(payload)
             page_had_records = page_had_records or bool(records)
             page_galleries: list[list[dict[str, Any]]] = []
@@ -234,6 +236,201 @@ def _search_galleries(client: Any, query: str, media_type: str, limit: int, max_
     if verification and not galleries:
         _raise_for_empty_search(verification, media_type)
     return last_payload, galleries
+
+
+def _browser_search_endpoint(url: str) -> bool:
+    return "/aweme/v1/web/general/search/single/" in url or "/aweme/v1/web/search/item/" in url
+
+
+def _source_timeout_seconds() -> float:
+    try:
+        return float(os.getenv("DOUYIN_SOURCE_TIMEOUT_SECONDS") or os.getenv("SOURCE_TIMEOUT_SECONDS") or "45")
+    except ValueError:
+        return 45.0
+
+
+async def _search_via_browser(query: str, media_type: str, limit: int, post_budget: int, *, account: str | None = None, known_post_ids: frozenset[str] | set[str] = frozenset(), deadline_seconds: float = 25.0) -> list[list[dict[str, Any]]]:
+    """Recover keyword search inside a real logged-in browser.
+
+    The signed API route can be answered with verify_check while the same
+    search keeps working on the site itself: the real page generates fresh
+    signatures and carries the login context. We only observe the public JSON
+    responses the page emits while scrolling -- no challenge is bypassed.
+    """
+    try:
+        from playwright.async_api import async_playwright
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"playwright", "playwright.async_api"}:
+            raise
+        raise RuntimeError(
+            "浏览器采集依赖 Playwright 未安装；桌面版请重新运行 安装桌面版.bat。"
+            "命令行环境请在当前 Python 环境安装 playwright，"
+            "再执行 python -m playwright install chromium。"
+        ) from exc
+
+    storage_state = _browser_storage_state(account)
+    timeout_ms = max(10_000, int(os.getenv("DOUYIN_BROWSER_TIMEOUT_MS", os.getenv("BROWSER_TIMEOUT_MS", "30000"))))
+    # Recovery defaults to a visible window: when Douyin shows its captcha
+    # intermediate page, a headless browser has no way forward, while a
+    # visible one lets the user complete the challenge and the capture
+    # continues on its own.
+    headless = os.getenv(
+        "DOUYIN_SEARCH_RECOVERY_HEADLESS",
+        os.getenv("DOUYIN_BROWSER_HEADLESS", os.getenv("BROWSER_HEADLESS", "false")),
+    ).lower() in {"1", "true", "yes"}
+    executable = os.getenv("DOUYIN_BROWSER_PATH") or os.getenv("MEDIA_CRAWLER_BROWSER_PATH")
+    budget = max(6.0, min(float(deadline_seconds), timeout_ms / 1000 + 5))
+    goto_timeout = max(6_000, min(timeout_ms, int(budget * 1000) - 2_000))
+
+    launch_options: dict[str, Any] = {"headless": headless}
+    if executable and Path(executable).is_file():
+        launch_options["executable_path"] = executable
+    elif os.getenv("DOUYIN_BROWSER_CHANNEL") or os.getenv("BROWSER_CHANNEL"):
+        launch_options["channel"] = os.getenv("DOUYIN_BROWSER_CHANNEL") or os.getenv("BROWSER_CHANNEL")
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(**launch_options)
+        context_options: dict[str, Any] = {"viewport": {"width": 1440, "height": 1000}}
+        if storage_state:
+            context_options["storage_state"] = str(storage_state)
+        context = await browser.new_context(**context_options)
+        page = await context.new_page()
+        captured: list[dict[str, Any]] = []
+        capture_tasks: set[asyncio.Task[Any]] = set()
+
+        async def capture(response: Any) -> None:
+            if not _browser_search_endpoint(response.url):
+                return
+            try:
+                body = await response.body()
+                payload = json.loads(body.decode("utf-8", errors="replace"))
+            except Exception:
+                return
+            if isinstance(payload, dict):
+                captured.append(payload)
+
+        def schedule_capture(response: Any) -> None:
+            task = asyncio.create_task(capture(response))
+            capture_tasks.add(task)
+            task.add_done_callback(capture_tasks.discard)
+
+        page.on("response", schedule_capture)
+        try:
+            search_url = f"https://www.douyin.com/search/{quote(query, safe='')}"
+            await page.goto(search_url, wait_until="domcontentloaded", timeout=goto_timeout)
+            # The risk control sometimes fronts the whole search page with a
+            # captcha intermediate page. A visible window lets the user solve
+            # it; a headless one can only report and give up quickly.
+            if "验证码" in await page.title():
+                if headless:
+                    print("dy-cli browser recovery hit the captcha intermediate page in headless mode; "
+                          "set DOUYIN_SEARCH_RECOVERY_HEADLESS=0 to solve it manually.", file=sys.stderr)
+                    return []
+                while time.monotonic() < deadline and "验证码" in await page.title():
+                    await page.wait_for_timeout(1500)
+                if "验证码" in await page.title():
+                    print("dy-cli browser recovery: captcha was not solved in time.", file=sys.stderr)
+                    return []
+            galleries: list[list[dict[str, Any]]] = []
+            seen: set[str] = set(known_post_ids)
+            processed = 0
+            stale_rounds = 0
+            deadline = time.monotonic() + budget
+            poll_ms = max(200, int(float(os.getenv("DOUYIN_SEARCH_SLEEP_SECONDS", "0.5")) * 1000))
+            while time.monotonic() < deadline:
+                while processed < len(captured):
+                    payload = captured[processed]
+                    processed += 1
+                    for record in _records(payload):
+                        post_id = str(record.get("aweme_id") or record.get("awemeId") or record.get("id") or "")
+                        if post_id and post_id in seen:
+                            continue
+                        normalized = normalize_native_record(
+                            "douyin", record, "dy-cli", media_type=media_type,
+                            include_video_covers=media_type == "images",
+                        )
+                        if post_id:
+                            seen.add(post_id)
+                        if normalized:
+                            galleries.append(normalized)
+                    if sum(len(gallery) for gallery in galleries) >= limit or len(galleries) >= post_budget:
+                        return galleries
+                # The feed loads more posts as the page scrolls; a few idle
+                # rounds in a row mean the query is exhausted or challenged.
+                if len(captured) == processed and stale_rounds >= 3:
+                    break
+                stale_rounds = 0 if len(captured) != processed else stale_rounds + 1
+                await page.evaluate("window.scrollBy(0, window.innerHeight * 2)")
+                await page.wait_for_timeout(poll_ms)
+            return galleries
+        finally:
+            if capture_tasks:
+                await asyncio.gather(*capture_tasks, return_exceptions=True)
+            await context.close()
+            await browser.close()
+
+
+def _search_with_recovery(client: Any, query: str, media_type: str, limit: int, *, max_posts: int, account: str | None, seconds_left: float) -> list[list[dict[str, Any]]]:
+    """Native search first; browser recovery when challenged or short.
+
+    Douyin answers page two of a keyword search with verify_check while page
+    one still works, so a successful-looking native run can silently stop far
+    below the requested count. The browser route re-issues the same search in
+    a real logged-in page and observes the responses it produces anyway.
+    """
+    attempts: list[dict[str, Any]] = []
+    galleries: list[list[dict[str, Any]]] = []
+    api_error: Exception | None = None
+    try:
+        _, galleries = _search_galleries(client, query, media_type, limit, max_posts=max_posts, attempts_out=attempts)
+    except Exception as exc:  # noqa: BLE001 - the recovery path decides below
+        api_error = exc
+    total_images = sum(len(gallery) for gallery in galleries)
+    challenged = any(
+        isinstance(payload.get("search_nil_info"), dict)
+        and payload["search_nil_info"].get("search_nil_type") == "verify_check"
+        for payload in attempts
+    )
+    if api_error is None and not challenged:
+        return galleries
+    if total_images >= limit:
+        return galleries
+    if not _browser_fallback_enabled():
+        if api_error is not None:
+            raise api_error
+        return galleries
+    budget = seconds_left - 4
+    if budget < 12:
+        if api_error is not None:
+            raise RuntimeError(f"dy-cli 关键词搜索被风控拦截，剩余时间不足以进行浏览器恢复: {api_error}") from api_error
+        return galleries
+    try:
+        known = {str(item.get("post_id") or "") for gallery in galleries for item in gallery if isinstance(item, dict)}
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        extra = loop.run_until_complete(_search_via_browser(
+            query, media_type, limit, max_posts,
+            account=account, known_post_ids=known, deadline_seconds=budget,
+        ))
+        galleries.extend(extra)
+    except Exception as browser_error:
+        if api_error is not None:
+            raise RuntimeError(f"dy-cli 关键词搜索被风控拦截且浏览器恢复失败: {browser_error}") from api_error
+        # Native page-one results remain usable; a blocked recovery must not
+        # discard them.
+        print(f"dy-cli browser search recovery failed, keeping native results: {browser_error}", file=sys.stderr)
+    if api_error is not None and not galleries:
+        # The recovery ran but returned nothing (captcha unsolved, login wall).
+        # Preserve the risk-control context instead of a misleading "no
+        # candidates" message.
+        raise RuntimeError(
+            "dy-cli 关键词搜索被风控拦截，浏览器恢复也未取得结果；"
+            "请在页面“平台登录”中重新扫码登录，或稍后重试。"
+        ) from api_error
+    return galleries
 
 
 def _fetch_creator(client: Any, request: CreatorFetchRequest) -> dict[str, Any]:
@@ -707,9 +904,12 @@ def _sync_fetch(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, An
         # The dedicated atlas/video endpoints can be empty or challenged while
         # the general endpoint still works (and vice versa). Keep each media
         # type on its own bounded fallback sequence.
-        payload, galleries = _search_galleries(
+        started = time.monotonic()
+        galleries = _search_with_recovery(
             client, args.query, media_type, args.limit,
             max_posts=search_request.max_posts if search_request else args.limit,
+            account=args.account,
+            seconds_left=started + _source_timeout_seconds() - time.monotonic(),
         )
 
         # Round-robin preserves post diversity before adding extra frames from

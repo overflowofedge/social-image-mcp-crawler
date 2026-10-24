@@ -366,3 +366,79 @@ def test_large_creator_request_can_continue_beyond_ten_pages():
         assert should_continue is True
 
     assert collector.pages_fetched == 11
+
+
+def test_search_recovery_skips_browser_when_native_run_is_clean(monkeypatch):
+    _search_with_recovery = _MODULE._search_with_recovery
+
+    def native(client, query, media_type, limit, max_posts=None, attempts_out=None):
+        return {"data": []}, [[{"post_id": "post-1"}]]
+
+    def must_not_run(*args, **kwargs):
+        raise AssertionError("browser recovery must not run for a clean native search")
+
+    monkeypatch.setattr(_MODULE, "_search_galleries", native)
+    monkeypatch.setattr(_MODULE, "_search_via_browser", must_not_run)
+    galleries = _search_with_recovery(object(), "关键词", "images", 30,
+                                      max_posts=100, account=None, seconds_left=30)
+    assert galleries == [[{"post_id": "post-1"}]]
+
+
+def test_search_recovery_merges_browser_results_after_challenge(monkeypatch):
+    _search_with_recovery = _MODULE._search_with_recovery
+
+    def native(client, query, media_type, limit, max_posts=None, attempts_out=None):
+        if attempts_out is not None:
+            attempts_out.append({"search_nil_info": {"search_nil_type": "verify_check"}})
+        return {"data": []}, [[{"post_id": "post-1"}]]
+
+    async def browser(query, media_type, limit, post_budget, *, account=None, known_post_ids=frozenset(), deadline_seconds=25):
+        assert "post-1" in known_post_ids
+        assert deadline_seconds <= 26
+        return [[{"post_id": "post-2"}], [{"post_id": "post-3"}]]
+
+    monkeypatch.setattr(_MODULE, "_search_galleries", native)
+    monkeypatch.setattr(_MODULE, "_search_via_browser", browser)
+    monkeypatch.setattr(_MODULE, "_browser_fallback_enabled", lambda: True)
+    galleries = _search_with_recovery(object(), "关键词", "images", 30,
+                                      max_posts=100, account=None, seconds_left=30)
+    assert [[item["post_id"] for item in gallery] for gallery in galleries] == [
+        ["post-1"], ["post-2"], ["post-3"],
+    ]
+
+
+def test_search_recovery_raises_when_browser_recovery_also_fails(monkeypatch):
+    import pytest
+    _search_with_recovery = _MODULE._search_with_recovery
+
+    def native(client, query, media_type, limit, max_posts=None, attempts_out=None):
+        raise RuntimeError("verify_check")
+
+    def browser(*args, **kwargs):
+        raise RuntimeError("browser blocked too")
+
+    monkeypatch.setattr(_MODULE, "_search_galleries", native)
+    monkeypatch.setattr(_MODULE, "_search_via_browser", browser)
+    monkeypatch.setattr(_MODULE, "_browser_fallback_enabled", lambda: True)
+    with pytest.raises(RuntimeError, match="浏览器恢复失败"):
+        _search_with_recovery(object(), "关键词", "images", 30,
+                              max_posts=100, account=None, seconds_left=30)
+
+
+def test_search_recovery_keeps_native_results_when_recovery_fails_late(monkeypatch):
+    _search_with_recovery = _MODULE._search_with_recovery
+
+    def native(client, query, media_type, limit, max_posts=None, attempts_out=None):
+        if attempts_out is not None:
+            attempts_out.append({"search_nil_info": {"search_nil_type": "verify_check"}})
+        return {"data": []}, [[{"post_id": "post-1"}]]
+
+    def browser(*args, **kwargs):
+        raise RuntimeError("browser blocked too")
+
+    monkeypatch.setattr(_MODULE, "_search_galleries", native)
+    monkeypatch.setattr(_MODULE, "_search_via_browser", browser)
+    monkeypatch.setattr(_MODULE, "_browser_fallback_enabled", lambda: True)
+    galleries = _search_with_recovery(object(), "关键词", "images", 30,
+                                      max_posts=100, account=None, seconds_left=30)
+    assert galleries == [[{"post_id": "post-1"}]]
