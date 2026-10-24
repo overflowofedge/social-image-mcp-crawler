@@ -555,13 +555,24 @@ async def _run(args: argparse.Namespace) -> list[dict[str, Any]] | dict[str, Any
     return normalized[: max(1, args.limit)]
 
 
+def _friendly_failure(exc: Exception) -> str:
+    """Translate known vendor failures into guidance the user can act on."""
+    text = f"{type(exc).__name__}: {exc}"
+    if "DataFetchError" in text or "RetryError" in text or "302" in text:
+        return ("来源网站拒绝访问（HTTP 302）：登录状态可能已过期，或因频繁访问触发风控。"
+                "请等几分钟再试；持续失败请到\"平台登录\"重新扫码登录。")
+    if "waiting for scan code login" in text:
+        return ("需要扫码登录。请先在\"平台登录\"里登录对应平台，再重新采集。")
+    return text
+
+
 def main() -> int:
     _configure_stdio()
     args = _parser().parse_args()
     try:
         result = asyncio.run(_run(args))
     except Exception as exc:
-        print(f"media-crawler bridge failed: {exc}", file=sys.stderr)
+        print(f"media-crawler bridge failed: {_friendly_failure(exc)}", file=sys.stderr)
         return 2
     if emit_bridge_result(result):
         return 0
