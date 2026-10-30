@@ -270,14 +270,12 @@ async def _search_via_browser(query: str, media_type: str, limit: int, post_budg
 
     storage_state = _browser_storage_state(account)
     timeout_ms = max(10_000, int(os.getenv("DOUYIN_BROWSER_TIMEOUT_MS", os.getenv("BROWSER_TIMEOUT_MS", "30000"))))
-    # Recovery defaults to a visible window: when Douyin shows its captcha
-    # intermediate page, a headless browser has no way forward, while a
-    # visible one lets the user complete the challenge and the capture
-    # continues on its own.
-    headless = os.getenv(
-        "DOUYIN_SEARCH_RECOVERY_HEADLESS",
-        os.getenv("DOUYIN_BROWSER_HEADLESS", os.getenv("BROWSER_HEADLESS", "false")),
-    ).lower() in {"1", "true", "yes"}
+    # Recovery defaults to a visible window regardless of BROWSER_HEADLESS:
+    # when Douyin fronts the search page with its captcha intermediate page, a
+    # headless browser has no way forward, while a visible one lets the user
+    # solve the challenge and the capture continues on its own. Only the
+    # dedicated variable turns recovery headless (unattended hosts).
+    headless = os.getenv("DOUYIN_SEARCH_RECOVERY_HEADLESS", "false").lower() in {"1", "true", "yes"}
     executable = os.getenv("DOUYIN_BROWSER_PATH") or os.getenv("MEDIA_CRAWLER_BROWSER_PATH")
     budget = max(6.0, min(float(deadline_seconds), timeout_ms / 1000 + 5))
     goto_timeout = max(6_000, min(timeout_ms, int(budget * 1000) - 2_000))
