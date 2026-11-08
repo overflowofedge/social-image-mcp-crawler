@@ -760,3 +760,77 @@ def test_creator_protocol_accepts_xhs_notes():
     assert collector.consume([detail], "cursor-1", True)
     assert collector.posts_fetched == 1
     assert collector.items and collector.items[0]["post_id"] == "note1"
+
+
+def _write_manifest_entry(output, item, status="downloaded"):
+    import hashlib
+    import json
+    path = output / f"{item.post_id or item.id}.jpg"
+    path.write_bytes(b"fake-image-bytes")
+    record = DownloadRecord(
+        candidate_id=item.id, platform=item.platform, image_url=item.image_url,
+        media_type=item.media_type, path=str(path),
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        size_bytes=path.stat().st_size, width=800, height=600,
+        status=status, post_id=item.post_id, media_index=item.media_index,
+    )
+    with (output / "manifest.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record.model_dump(mode="json"), ensure_ascii=False) + "\n")
+    return record
+
+
+def test_incremental_run_skips_owned_media_and_downloads_only_new(tmp_path):
+    class Settings:
+        cache_path = str(tmp_path / "cache.sqlite3")
+        output_dir = str(tmp_path / "out")
+        creator_timeout_seconds = 5
+
+        def ensure_output_dir(self, value=None):
+            from pathlib import Path
+            path = Path(value or self.output_dir)
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+
+    output = tmp_path / "out"
+    first = ImageCandidate(id="p1", platform=Platform.DOUYIN, image_url="https://img.test/1.jpg", creator_id="sec-1", post_id="p1", media_index=1)
+    old = ImageCandidate(id="p1", platform=Platform.DOUYIN, image_url="https://img.test/1.jpg", creator_id="sec-1", post_id="p1", media_index=1)
+    new = ImageCandidate(id="p2", platform=Platform.DOUYIN, image_url="https://img.test/2.jpg", creator_id="sec-1", post_id="p2", media_index=1)
+
+    class Sources:
+        def __init__(self, items):
+            self.items = items
+
+        async def fetch_creator(self, request):
+            return CreatorSourceResult(identity=_identity(), items=self.items, posts_fetched=len(self.items), post_ids=tuple(item.post_id for item in self.items), pages_fetched=1)
+
+    class Downloader:
+        def __init__(self):
+            self.batches = []
+
+        async def download_many(self, items, *args, **kwargs):
+            self.batches.append([item.id for item in items])
+            records = []
+            for item in items:
+                records.append(_write_manifest_entry(output, item))
+            return records
+
+    async def run():
+        downloader = Downloader()
+        service = CreatorImageService(Settings(), Sources([first]), downloader)
+        first_result = await service.fetch(CreatorFetchRequest(
+            platform=Platform.DOUYIN, creator_id="Gracebb0722", max_images=1,
+            download=True, output_dir=str(output), resume=False))
+        assert first_result["error"] is None
+        assert downloader.batches == [["p1"]]
+
+        downloader = Downloader()
+        service = CreatorImageService(Settings(), Sources([old, new]), downloader)
+        second_result = await service.fetch(CreatorFetchRequest(
+            platform=Platform.DOUYIN, creator_id="Gracebb0722", max_images=2,
+            download=True, output_dir=str(output), resume=True))
+        assert second_result["error"] is None
+        # The already-owned p1 must not re-enter the queue or consume quota.
+        assert downloader.batches == [["p2"]]
+        assert [item["id"] for item in second_result["items"]] == ["p2"]
+
+    asyncio.run(run())
