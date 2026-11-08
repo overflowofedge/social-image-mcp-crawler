@@ -509,6 +509,22 @@ class CreatorImageService:
                 report_progress("filtering", f"正在筛选 {len(valid)} 个候选媒体。")
                 valid, filter_meta = await self._filter_content(valid, request)
                 state.update(filter_meta)
+            # Incremental runs must not let already-owned media crowd out new
+            # work: the durable completed set is file-validated above, so
+            # items still on disk are dropped from the rebuilt queue and the
+            # requested count is filled with fresh candidates first.
+            fresh = [
+                item for item in valid
+                if self._media_key(item) not in valid_completed
+                and self._legacy_media_key(item) not in valid_completed
+            ]
+            skipped_existing = len(valid) - len(fresh)
+            if skipped_existing:
+                report_progress(
+                    "retrieving",
+                    f"已跳过 {skipped_existing} 个此前已下载的媒体，继续寻找新内容。",
+                )
+            valid = fresh
             state.update({"seen": list(seen), "catalog": catalog, "pending": [item.model_dump(mode="json") for item in valid],
                           "cursor": source_result.next_cursor, "exhausted": source_result.next_cursor is None})
             state["last_refresh_at"] = timestamp(datetime.now(timezone.utc).isoformat())
