@@ -15,6 +15,25 @@ const platformLabels = {
   bilibili: "B站", instagram: "Instagram", other: "自定义网页"
 };
 
+// "其他平台" treats a directly pasted page as one gallery: its own images
+// only answer to the total cap, while the per-post cap keeps followed
+// detail pages bounded. Reflect that in the form hint as the platform flips.
+const perPostHintTexts = {
+  other: "直接粘贴的网页本身按一个图库页采集：页面里的图片只受“图片总上限”约束，“每个作品最多”仅限制从主页跟随打开的其他详情页。"
+};
+const perPostHint = $("per_post_hint");
+const defaultPerPostHint = perPostHint ? perPostHint.textContent : "";
+function syncPerPostHint() {
+  const platform = document.querySelector('input[name="platform"]:checked');
+  if (perPostHint) {
+    perPostHint.textContent = (platform && perPostHintTexts[platform.value]) || defaultPerPostHint;
+  }
+}
+document.querySelectorAll('input[name="platform"]').forEach(radio => {
+  radio.addEventListener("change", syncPerPostHint);
+});
+syncPerPostHint();
+
 const accountCards = [...document.querySelectorAll(".account[data-platform]")];
 const loginStates = new Map();
 const loginStateLabels = {
