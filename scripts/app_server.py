@@ -432,6 +432,18 @@ def _task_report(body: dict, result: dict, elapsed_seconds: float) -> dict:
     if identity:
         account = str(identity.get("name") or identity.get("canonical_id") or "已确认账号")
         logs.append({"level": "success", "message": f"已确认账号：{account}。"})
+    elif platform == "other":
+        page_title = ""
+        for item in items:
+            payload = item.get("source_payload") if isinstance(item.get("source_payload"), dict) else {}
+            candidate_title = str(payload.get("page_title") or "").strip()
+            if candidate_title:
+                page_title = candidate_title
+                break
+        if page_title:
+            if len(page_title) > 40:
+                page_title = page_title[:40] + "…"
+            logs.append({"level": "success", "message": f"已确认页面：{page_title}。"})
 
     actual_parts = []
     if requested["images"]:
