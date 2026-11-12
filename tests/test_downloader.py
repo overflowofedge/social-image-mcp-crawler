@@ -363,3 +363,42 @@ def test_webpage_download_rejects_tiny_images_even_without_user_size_filter(tmp_
         assert not list(tmp_path.glob("*.png"))
 
     asyncio.run(run())
+
+
+def test_webpage_gallery_batches_never_report_false_existing(tmp_path):
+    """All webpage assets share one page hash; distinct media_index must keep
+    each asset's resume key unique or later batches get swallowed as existing."""
+    payloads = {}
+    for index in range(1, 16):
+        buffer = io.BytesIO()
+        Image.new("RGB", (200, 200), (index * 12 % 255, 10, 10)).save(buffer, format="PNG")
+        payloads[f"https://img.test/page/{index}.png"] = buffer.getvalue()
+
+    def handler(request):
+        return httpx.Response(200, headers={"content-type": "image/png"}, content=payloads[str(request.url)], request=request)
+
+    def item(index):
+        return ImageCandidate(
+            id=f"web-{index}", platform=Platform.OTHER,
+            image_url=f"https://img.test/page/{index}.png",
+            post_id="e2eedd3552c7e571", media_index=index,
+        )
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            downloader = ImageDownloader(client)
+            first = await downloader.download_many([item(i) for i in range(1, 11)], tmp_path)
+            second = await downloader.download_many([item(i) for i in range(11, 16)], tmp_path)
+        assert [record.status for record in first] == ["downloaded"] * 10
+        assert [record.status for record in second] == ["downloaded"] * 5
+        paths = {record.path for record in first + second}
+        assert len(paths) == 15
+
+    asyncio.run(run())
+
+
+def test_webpage_items_without_media_index_stay_distinct_after_fix_regression():
+    candidate_a = ImageCandidate(id="web-a", platform=Platform.OTHER, image_url="https://img.test/1.png", post_id="pagehash", media_index=3)
+    candidate_b = ImageCandidate(id="web-b", platform=Platform.OTHER, image_url="https://img.test/2.png", post_id="pagehash", media_index=7)
+    from social_image_mcp.downloader import _item_key
+    assert _item_key(candidate_a) != _item_key(candidate_b)
