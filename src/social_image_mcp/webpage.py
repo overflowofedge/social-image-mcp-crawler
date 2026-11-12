@@ -150,11 +150,15 @@ def extract_page(html: str, page_url: str) -> PageMedia:
         seen.add(absolute)
         digest = hashlib.sha1(absolute.encode()).hexdigest()[:16]
         post = post_url or page_url
+        # Downloads resume per (page, media_index): every asset on the page
+        # needs its own index or batched downloads will treat the rest of the
+        # gallery as already-owned copies of the first file.
         result.items.append(ImageCandidate(
             id=f"web-{digest}", platform=Platform.OTHER, image_url=absolute,
             media_type=kind, permalink=page_url, thumbnail_url=_url(base, poster),
             title=alt or title or page_url, description=alt or title, alt_text=alt,
             post_id=hashlib.sha1(post.encode()).hexdigest()[:16],
+            media_index=max(1, len(result.items) + 1),
             source_payload={"source": "webpage", "page_url": page_url, "content_page": post, "original_image": original, "page_title": title},
         ))
 
