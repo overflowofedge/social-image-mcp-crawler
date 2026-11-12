@@ -324,14 +324,54 @@ class WebPageAdapter(PlatformAdapter):
             options["executable_path"] = self.browser_path
         elif self.browser_channel:
             options["channel"] = self.browser_channel
+
+        async def launch_browser(preferred: dict):
+            # Fresh installs may not have Playwright's bundled Chromium yet,
+            # and empty BROWSER_CHANNEL leaves no channel configured. The site
+            # itself renders fine in a real browser, so fall back to the
+            # system Edge/Chrome before reporting the page as undynamic.
+            candidates = [dict(preferred)]
+            if "executable_path" not in preferred:
+                candidates += [{**preferred, "channel": "msedge"}, {**preferred, "channel": "chrome"}]
+            errors = []
+            for candidate in candidates:
+                tag = candidate.get("channel") or "bundled"
+                try:
+                    return await playwright.chromium.launch(**candidate), tag
+                except Exception as exc:
+                    message = str(exc)
+                    if "Executable doesn't exist" not in message and "channel" not in message.lower():
+                        raise
+                    errors.append(f"{tag}: {message.splitlines()[0][:120]}")
+            raise AdapterError("动态页面读取未完成；未找到可用的浏览器。请运行 安装桌面版.bat 补齐浏览器组件，或确认本机已安装 Edge/Chrome。" + ("；".join(errors[-1:])))
+
         async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(**options)
+            browser, _used = await launch_browser(options)
             try:
                 page = await browser.new_page(viewport={"width": 1440, "height": 1000})
-                await page.goto(url, wait_until="domcontentloaded", timeout=6000)
-                for _ in range(3):
-                    await page.wait_for_timeout(500)
-                    await page.evaluate("window.scrollBy(0, window.innerHeight)")
+                await page.goto(url, wait_until="domcontentloaded", timeout=8000)
+                # SPA shells fetch their data after hydration; networkidle is
+                # the reliable signal that the feed request finished and the
+                # post content has mounted into the DOM.
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
+                # Lazy galleries and SPA feeds populate media over several
+                # scroll rounds at network speed, so keep scrolling until the
+                # loaded-media count stops growing instead of betting on a
+                # fixed number of rounds.
+                loaded_count = """() => Array.from(document.images).filter(i => (i.currentSrc || i.src) && !String(i.src).startsWith('data:')).length + Array.from(document.querySelectorAll('video[src]')).length"""
+                previous, stable, rounds = -1, 0, 0
+                while rounds < 14 and not (previous > 0 and stable >= 2):
+                    await page.evaluate("window.scrollBy(0, window.innerHeight * 2)")
+                    await page.wait_for_timeout(700)
+                    current = await page.evaluate(loaded_count)
+                    # SPA hydration starts with an empty DOM; an all-zero
+                    # count must never satisfy the stability exit.
+                    stable = stable + 1 if current > 0 and current <= previous else 0
+                    previous = current
+                    rounds += 1
                 # Preserve lazy-loaded media selected by the browser itself.
                 await page.evaluate("""() => {
                     for (const el of document.querySelectorAll('img, video')) {
@@ -383,11 +423,14 @@ class WebPageAdapter(PlatformAdapter):
         except asyncio.TimeoutError as exc:
             raise AdapterError("主页访问超时，请稍后重试。") from exc
         warnings = list(root.warnings)
-        needs_render = not root.items and not root.links
+        # Render whenever the static HTML had no content images: SPA shells
+        # (Nuxt/Discuz-next and friends) still expose navigation links, so a
+        # non-empty links list does not prove the media was server-rendered.
+        needs_render = not root.items
         needs_render |= request.media_type != "images" and not root.links and not any(item.media_type == "video" for item in root.items)
         if self.render_pages and needs_render:
             try:
-                rendered = await asyncio.wait_for(self._render_page(page_url), timeout=9)
+                rendered = await asyncio.wait_for(self._render_page(page_url), timeout=26)
                 root.items.extend(rendered.items)
                 root.links.extend(link for link in rendered.links if link not in root.links)
                 warnings.extend(rendered.warnings)
@@ -418,7 +461,7 @@ class WebPageAdapter(PlatformAdapter):
                         missing = not media.items or (request.media_type != "images" and not any(item.media_type == "video" for item in media.items))
                         if self.render_pages and missing and url in links[:2]:
                             try:
-                                rendered = await asyncio.wait_for(self._render_page(resolved), timeout=8)
+                                rendered = await asyncio.wait_for(self._render_page(resolved), timeout=12)
                                 media.items.extend(rendered.items)
                                 media.warnings.extend(rendered.warnings)
                             except Exception:
