@@ -33,6 +33,12 @@ def test_unknown_url_is_routed_to_other_platform():
     assert intent.identifier_platform == "other"
 
 
+def test_extract_page_stamps_the_page_title_for_the_desktop_log():
+    html = "<html><head><title>【寫真】桃良阿宅 - 黑珍珠</title></head><body><main><img src=\"/a.jpg\"></main></body></html>"
+    result = extract_page(html, "https://example.org/thread-1-1.html")
+    assert result.items and result.items[0].source_payload["page_title"] == "【寫真】桃良阿宅 - 黑珍珠"
+
+
 def test_combined_media_limits_accept_the_desktop_total():
     request = SearchRequest(query="https://example.org/", max_results=2000, image_limit=1000, video_limit=1000, media_type="all")
     assert request.max_results == 2000

@@ -155,7 +155,7 @@ def extract_page(html: str, page_url: str) -> PageMedia:
             media_type=kind, permalink=page_url, thumbnail_url=_url(base, poster),
             title=alt or title or page_url, description=alt or title, alt_text=alt,
             post_id=hashlib.sha1(post.encode()).hexdigest()[:16],
-            source_payload={"source": "webpage", "page_url": page_url, "content_page": post, "original_image": original},
+            source_payload={"source": "webpage", "page_url": page_url, "content_page": post, "original_image": original, "page_title": title},
         ))
 
     def content_link(node: Tag) -> str | None:
