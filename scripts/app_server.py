@@ -717,6 +717,14 @@ def _run_search_task(task_id: str, body: dict, runner: _Loop, tasks: TaskRegistr
         }
         error_result["task_report"] = _task_report(body, error_result, time.monotonic() - started)
         tasks.finish(task_id, error_result, failed=True)
+    finally:
+        # A finished webpage job must not leave the site-login window open:
+        # it looks like the run is still going.
+        if str((body.get("platforms") or [""])[0] or "") == "other":
+            try:
+                Handler.web_logins.close(str(body.get("query") or ""))
+            except Exception:
+                pass
 
 
 def _login_session_updated(platform: str) -> None:
@@ -818,6 +826,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if not isinstance(body, dict) or not str(body.get("query") or "").strip():
                 raise ValueError("请输入搜索提示词或链接")
+            platforms = body.get("platforms") or []
+            if "other" in platforms and body.get("download"):
+                # Login state is saved in real time; the site-login window is
+                # no longer needed once the user starts the collection.
+                self.web_logins.close(str(body.get("query") or ""), only_if_saved=True)
             _expand_post_budget(body)
             task = self.tasks.create()
             worker = threading.Thread(

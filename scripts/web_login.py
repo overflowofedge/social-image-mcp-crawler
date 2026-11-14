@@ -101,6 +101,23 @@ class WebLoginManager:
             thread.start()
             return self.status(url)
 
+    def close(self, url: str, only_if_saved: bool = False) -> dict:
+        """Ask an active login window to finish saving and close itself.
+
+        Called when a collection starts (login already captured) and again
+        when it ends, so no stray window lingers after the job is done.
+        """
+        session = web_session_path(self.root, url)
+        if session is None:
+            return {"ok": False, "state": "invalid", "message": "网址无效。"}
+        with self._lock:
+            job = self._jobs.get(session.stem)
+            active = bool(job and job.get("state") in {"opening", "waiting", "saving"})
+        if not active or (only_if_saved and not session.is_file()):
+            return self.status(url)
+        self._cancel[session.stem].set()
+        return self.status(url)
+
     def _update(self, key: str, state: str, message: str) -> None:
         with self._lock:
             job = self._jobs.get(key)
@@ -117,7 +134,7 @@ class WebLoginManager:
         try:
             asyncio.run(self.login(url, session, cancel, update, self.timeout))
             if session.is_file():
-                update("saved", "站点登录状态已保存。重新运行采集即可获取登录后的内容。")
+                update("saved", "站点登录状态已保存，窗口已关闭。重新运行采集即可获取登录后的内容。")
             else:
                 update("failed", "未检测到登录变化；请在浏览器窗口完成登录后再关闭它。")
         except Exception as exc:
@@ -144,7 +161,7 @@ class WebLoginManager:
                 await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
             except Exception as exc:
                 update("waiting", f"站点页面加载较慢或被拦（{str(exc)[:60]}）；仍可在窗口中继续操作。")
-            update("waiting", "请在浏览器窗口中登录站点；完成后直接关闭浏览器窗口，登录状态会自动保存。")
+            update("waiting", "请在浏览器窗口中登录站点；登录状态会实时保存，开始采集后窗口会自动关闭。")
             deadline = time.monotonic() + timeout
             last_save = 0.0
             while time.monotonic() < deadline and not cancel.is_set():
@@ -154,6 +171,7 @@ class WebLoginManager:
                 if time.monotonic() - last_save >= 2:
                     await _atomic_save(context, session)
                     last_save = time.monotonic()
+            update("saving", "正在保存站点登录状态并关闭浏览器窗口。")
             await _atomic_save(context, session)
             try:
                 await browser.close()
