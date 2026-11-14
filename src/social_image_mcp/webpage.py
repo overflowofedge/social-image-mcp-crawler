@@ -33,6 +33,18 @@ _HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit
 MIN_CONTENT_SIDE = 160
 
 
+def _web_session_for(url: str) -> Path | None:
+    """Attach a saved site login (from 登录站点) so member-only galleries
+    render with the user's own account instead of the visitor view."""
+    parsed = urlparse(url)
+    netloc = (parsed.netloc or "").lower()
+    if not netloc:
+        return None
+    safe = re.sub(r"[^a-z0-9.\-]+", "_", netloc)[:80]
+    session = Path(__file__).resolve().parents[2] / ".cache" / "web-sessions" / f"{safe}.json"
+    return session if session.is_file() else None
+
+
 def _url(base: str, value) -> str | None:
     if not isinstance(value, str) or not value.strip():
         return None
@@ -352,7 +364,13 @@ class WebPageAdapter(PlatformAdapter):
         async with async_playwright() as playwright:
             browser, _used = await launch_browser(options)
             try:
-                page = await browser.new_page(viewport={"width": 1440, "height": 1000})
+                session = _web_session_for(url)
+                if session:
+                    context = await browser.new_context(viewport={"width": 1440, "height": 1000}, storage_state=str(session))
+                    page = await context.new_page()
+                else:
+                    context = None
+                    page = await browser.new_page(viewport={"width": 1440, "height": 1000})
                 await page.goto(url, wait_until="domcontentloaded", timeout=8000)
                 # SPA shells fetch their data after hydration; networkidle is
                 # the reliable signal that the feed request finished and the

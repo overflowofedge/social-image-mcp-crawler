@@ -29,6 +29,60 @@ function syncPerPostHint() {
     perPostHint.textContent = (platform && perPostHintTexts[platform.value]) || defaultPerPostHint;
   }
 }
+
+const webLoginRow = $("web_login_row");
+const webLoginButton = $("web_login");
+const webLoginStatus = $("web_login_status");
+const queryInput = $("query");
+let webLoginPoll = null;
+
+function looksLikeSiteUrl(value) {
+  return /^(https?:\/\/|www\.)/i.test((value || "").trim());
+}
+
+function syncWebLoginRow() {
+  const platform = document.querySelector('input[name="platform"]:checked');
+  const visible = Boolean(platform && platform.value === "other" && looksLikeSiteUrl(queryInput.value));
+  if (webLoginRow) webLoginRow.hidden = !visible;
+}
+
+if (webLoginButton) webLoginButton.addEventListener("click", async () => {
+  const url = queryInput.value.trim();
+  webLoginButton.disabled = true;
+  if (webLoginStatus) webLoginStatus.textContent = "正在打开浏览器，请在窗口里登录站点；完成后关闭浏览器窗口即可保存。";
+  try {
+    const response = await fetch("/api/web-login", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({url})
+    });
+    const data = await response.json();
+    if (data.ok === false) {
+      if (webLoginStatus) webLoginStatus.textContent = data.message || "请先填写完整网址。";
+      webLoginButton.disabled = false;
+      return;
+    }
+    webLoginPoll = setInterval(async () => {
+      try {
+        const statusResponse = await fetch(`/api/web-login?url=${encodeURIComponent(url)}`);
+        const statusData = await statusResponse.json();
+        if (webLoginStatus) webLoginStatus.textContent = statusData.message || "";
+        if (["saved", "failed", "invalid"].includes(statusData.state)) {
+          clearInterval(webLoginPoll);
+          webLoginPoll = null;
+          webLoginButton.disabled = false;
+          if (statusData.state === "saved" && webLoginStatus) {
+            webLoginStatus.textContent = "已保存站点登录状态。重新运行采集即可获取登录后的内容。";
+          }
+        }
+      } catch (error) { /* transient poll errors keep polling */ }
+    }, 2000);
+  } catch (error) {
+    webLoginButton.disabled = false;
+    if (webLoginStatus) webLoginStatus.textContent = `站点登录启动失败：${error}`;
+  }
+});
+queryInput.addEventListener("input", syncWebLoginRow);
+syncWebLoginRow();
 document.querySelectorAll('input[name="platform"]').forEach(radio => {
   radio.addEventListener("change", syncPerPostHint);
 });
