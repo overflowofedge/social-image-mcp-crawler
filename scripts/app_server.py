@@ -27,6 +27,7 @@ from social_image_mcp.models import Platform
 from social_image_mcp.progress import progress_context
 from social_image_mcp.server import search_images, service
 from scripts.account_login import LoginManager
+from scripts.web_login import WebLoginManager
 
 HTML = (ROOT / "scripts" / "app.html").read_text(encoding="utf-8")
 APP_ID = "social-image-mcp-desktop"
@@ -728,6 +729,7 @@ class Handler(BaseHTTPRequestHandler):
     runner: _Loop
     tasks: TaskRegistry = TASKS
     logins = LoginManager(ROOT, on_success=_login_session_updated)
+    web_logins = WebLoginManager(ROOT)
 
     def log_message(self, *_args) -> None:
         return
@@ -760,6 +762,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"platforms": service.statuses(), "sources": service.source_statuses(), "preflight": _preflight_report()})
         elif parsed.path == "/api/login":
             self._send(200, {"platforms": self.logins.statuses()})
+        elif parsed.path == "/api/web-login":
+            query = parse_qs(parsed.query)
+            web_url = str((query.get("url") or [""])[0])
+            self._send(200, self.web_logins.status(web_url))
         elif parsed.path.startswith("/api/tasks/"):
             task_id = parsed.path.removeprefix("/api/tasks/").strip("/")
             task = self.tasks.get(task_id)
@@ -778,7 +784,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
-        if path not in {"/api/search", "/api/login", "/api/login/cancel"}:
+        if path not in {"/api/search", "/api/login", "/api/login/cancel", "/api/web-login"}:
             self._send(404, {"error": "not found"}); return
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -788,7 +794,7 @@ class Handler(BaseHTTPRequestHandler):
             # with an unread body can reset the connection on Windows, hiding
             # the intended JSON error response from the browser.
             raw_body = self.rfile.read(length)
-            if path.startswith("/api/login"):
+            if path.startswith("/api/login") or path == "/api/web-login":
                 origin = self.headers.get("Origin")
                 if origin and (urlparse(origin).scheme != "http" or
                                urlparse(origin).netloc != self.headers.get("Host")):
@@ -797,6 +803,11 @@ class Handler(BaseHTTPRequestHandler):
                 if not self.headers.get("Content-Type", "").lower().startswith("application/json"):
                     raise ValueError("登录请求必须使用 JSON。")
             body = json.loads(raw_body.decode("utf-8"))
+            if path == "/api/web-login":
+                if not isinstance(body, dict) or not str(body.get("url") or "").strip():
+                    raise ValueError("站点登录需要先在输入框填写完整 http(s) 网址。")
+                self._send(200, self.web_logins.start(str(body["url"]).strip()))
+                return
             if path.startswith("/api/login"):
                 if not isinstance(body, dict) or not isinstance(body.get("force", False), bool):
                     raise ValueError("登录请求格式无效。")

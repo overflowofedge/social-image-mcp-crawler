@@ -118,7 +118,11 @@ button:disabled{opacity:.6;cursor:wait}
 <label>
 <input type="radio" name="platform" value="other"> 其他平台</label>
 </div>
-<p class="hint">“其他平台”会检索主页正文及内容卡片的详情页，过滤 Logo、图标和小图，下载内容图片与直接视频文件。</p>
+<p class="hint">“其他平台”会检索主页正文及内容卡片的详情页，过滤 Logo、图标和小图，下载内容图片与直接视频文件。站点需要登录才能看全的内容，先点“登录当前站点”保存登录状态。</p>
+<div id="web_login_row" hidden>
+  <button type="button" id="web_login">登录当前站点</button>
+  <p class="hint" id="web_login_status"></p>
+</div>
 <section class="download-settings" aria-label="下载设置">
 <div class="media-choice">
 <div>
