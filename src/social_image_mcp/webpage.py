@@ -559,24 +559,15 @@ class WebPageAdapter(PlatformAdapter):
         )]
         selected = []
         counts = {"image": 0, "video": 0}
-        posts: dict[str, int] = {}
+        # Webpages are galleries by nature (forum threads,写真 pages): the
+        # total cap is the only quota.  A per-post cap belongs to social
+        # feeds; on gallery pages it just chopped sets arbitrarily, which is
+        # why the direct-page exemption existed in the first place.
         for item in candidates:
             maximum = image_limit if item.media_type == "image" else video_limit
-            # The per-post image limit must not suppress a post's video.  A
-            # requested page that is itself a gallery counts as one work only
-            # by URL: honoring the per-post cap there would trim a 100-image
-            # set to the cap, so only followed detail pages stay limited.
-            own_page = item.source_payload.get("content_page") == page_url
-            if counts[item.media_type] >= maximum or (
-                item.media_type == "image"
-                and not own_page
-                and request.per_post_limit
-                and posts.get(item.post_id, 0) >= request.per_post_limit
-            ):
+            if counts[item.media_type] >= maximum:
                 continue
             counts[item.media_type] += 1
-            if item.media_type == "image":
-                posts[item.post_id] = posts.get(item.post_id, 0) + 1
             selected.append(item)
         if not selected:
             message = "没有找到可下载的正文图片或直接视频文件；已过滤图标、Logo 和小图。页面可能需要登录或动态加载。"

@@ -19,15 +19,17 @@ const platformLabels = {
 // only answer to the total cap, while the per-post cap keeps followed
 // detail pages bounded. Reflect that in the form hint as the platform flips.
 const perPostHintTexts = {
-  other: "直接粘贴的网页本身按一个图库页采集：页面里的图片只受“图片总上限”约束，“每个作品最多”仅限制从主页跟随打开的其他详情页。"
+  other: "其他平台按图库页处理：所有图片只受“图片总上限”约束，本项不参与，无需设置。"
 };
 const perPostHint = $("per_post_hint");
 const defaultPerPostHint = perPostHint ? perPostHint.textContent : "";
 function syncPerPostHint() {
   const platform = document.querySelector('input[name="platform"]:checked');
+  const isOther = Boolean(platform && platform.value === "other");
   if (perPostHint) {
     perPostHint.textContent = (platform && perPostHintTexts[platform.value]) || defaultPerPostHint;
   }
+  if (perPostLimit) perPostLimit.disabled = isOther;
 }
 
 const webLoginRow = $("web_login_row");
