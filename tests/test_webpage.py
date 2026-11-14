@@ -8,6 +8,7 @@ import pytest
 from social_image_mcp.adapters.base import AdapterError
 from social_image_mcp.intent import parse_intent
 from social_image_mcp.models import Platform, SearchRequest
+from social_image_mcp import webpage as webpage_module
 from social_image_mcp.webpage import WebPageAdapter, extract_page
 
 
@@ -369,3 +370,44 @@ def test_dynamic_homepage_uses_rendered_content(monkeypatch):
         assert {item.media_type for item in result.items} == {"image", "video"}
 
     asyncio.run(run())
+
+
+def test_page_fetch_carries_saved_site_cookies(monkeypatch, tmp_path):
+    import json as json_module
+    session_file = tmp_path / "www.lcoser02.cc.json"
+    session_file.write_text(json_module.dumps({
+        "cookies": [{"name": "sessionid", "value": "abc123", "domain": ".lcoser02.cc"}]
+    }), encoding="utf-8")
+    monkeypatch.setattr(
+        webpage_module, "_web_session_for",
+        lambda url: session_file if "lcoser02" in url else None,
+    )
+    captured = {}
+
+    def handler(request):
+        captured["cookie"] = request.headers.get("cookie")
+        return html_response('<main><img src="/gallery/a.jpg"></main>')
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            adapter = WebPageAdapter(client)
+            resolved, media = await adapter._page("https://www.lcoser02.cc/post")
+        assert captured["cookie"] == "sessionid=abc123"
+        assert media.items
+
+    asyncio.run(run())
+
+
+def test_session_cookie_header_filters_by_domain(monkeypatch, tmp_path):
+    import json as json_module
+
+    session = tmp_path / "lcoser02.cc.json"
+    session.write_text(json_module.dumps({"cookies": [
+        {"name": "a", "value": "1", "domain": ".lcoser02.cc"},
+        {"name": "b", "value": "2", "domain": "other.test"},
+    ]}), encoding="utf-8")
+    monkeypatch.setattr(webpage_module, "_web_session_for", lambda url: session)
+    header = webpage_module._session_cookie_header("https://www.lcoser02.cc/post")
+    assert header == "a=1"
+    assert webpage_module._session_cookie_header("https://other.test/page") == "b=2"
+    assert webpage_module._session_cookie_header("https://unset.example/page") is None

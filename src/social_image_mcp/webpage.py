@@ -45,6 +45,31 @@ def _web_session_for(url: str) -> Path | None:
     return session if session.is_file() else None
 
 
+def _session_cookie_header(url: str) -> str | None:
+    """Build a Cookie header from the saved site login for this domain.
+
+    The static fetch must carry the user's identity: member-gated pages
+    render their full gallery server-side for logged-in users, so the very
+    first (cookie-less) request is what misses the content.
+    """
+    session = _web_session_for(url)
+    if not session:
+        return None
+    try:
+        data = json.loads(session.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    host = (urlparse(url).hostname or "").lower()
+    pairs: list[str] = []
+    for cookie in data.get("cookies", []) if isinstance(data, dict) else []:
+        if not isinstance(cookie, dict) or not cookie.get("name") or "value" not in cookie:
+            continue
+        domain = str(cookie.get("domain") or "").lower().lstrip(".")
+        if not domain or host == domain or host.endswith("." + domain):
+            pairs.append(f"{cookie['name']}={cookie['value']}")
+    return "; ".join(pairs) or None
+
+
 def _url(base: str, value) -> str | None:
     if not isinstance(value, str) or not value.strip():
         return None
@@ -291,7 +316,11 @@ class WebPageAdapter(PlatformAdapter):
 
     async def _page(self, url: str) -> tuple[str, PageMedia]:
         try:
-            response = await self.client.get(url, headers=_HEADERS, follow_redirects=True, timeout=12)
+            headers = dict(_HEADERS)
+            cookie_header = _session_cookie_header(url)
+            if cookie_header:
+                headers["Cookie"] = cookie_header
+            response = await self.client.get(url, headers=headers, follow_redirects=True, timeout=12)
             response.raise_for_status()
         except Exception as exc:
             raise AdapterError(f"网页访问失败：{exc}") from exc
