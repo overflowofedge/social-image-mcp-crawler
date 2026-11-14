@@ -247,7 +247,9 @@ def test_direct_gallery_page_ignores_per_post_limit():
     asyncio.run(run())
 
 
-def test_followed_detail_pages_stay_per_post_limited():
+def test_webpage_ignores_per_post_limit_and_answers_to_total_quota():
+    """Forum threads and gallery pages carry whole sets per URL; the total
+    cap is the only quota the user sets for 其他平台."""
     homepage = '''<main><a href="/post/one"><img src="/thumb1.jpg"></a><a href="/post/two"><img src="/thumb2.jpg"></a></main>'''
     detail_one = '''<main><img src="/one-1.jpg"><img src="/one-2.jpg"><img src="/one-3.jpg"><img src="/one-4.jpg"><img src="/one-5.jpg"></main>'''
     detail_two = '''<main><img src="/two-1.jpg"><img src="/two-2.jpg"><img src="/two-3.jpg"><img src="/two-4.jpg"><img src="/two-5.jpg"></main>'''
@@ -267,9 +269,12 @@ def test_followed_detail_pages_stay_per_post_limited():
                 query="https://example.org/", media_type="images", image_limit=10,
                 per_post_limit=3, max_posts=5,
             ))
+        assert len(result.items) == 10
         assert [item.image_url for item in result.items] == [
             "https://example.org/one-1.jpg", "https://example.org/one-2.jpg", "https://example.org/one-3.jpg",
+            "https://example.org/one-4.jpg", "https://example.org/one-5.jpg",
             "https://example.org/two-1.jpg", "https://example.org/two-2.jpg", "https://example.org/two-3.jpg",
+            "https://example.org/two-4.jpg", "https://example.org/two-5.jpg",
         ]
 
     asyncio.run(run())
