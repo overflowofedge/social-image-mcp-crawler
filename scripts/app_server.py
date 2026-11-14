@@ -547,7 +547,8 @@ def _task_report(body: dict, result: dict, elapsed_seconds: float) -> dict:
         else:
             action = "程序已自动读取平台返回的后续页面；若仍不足，请更新平台登录状态后重试。"
         if platform == "other":
-            action = "确认网址指向具体内容页面；必要时开启浏览器动态加载并检查网页访问权限。"
+            action = ("确认网址指向具体内容页面；若站点内容需要登录，"
+                      "先点“登录当前站点”保存登录状态后重试。")
         if media == "images" and requested["per_post_limit"] and requested["max_posts"]:
             capacity = requested["per_post_limit"] * requested["max_posts"]
             if requested["images"] > capacity:
