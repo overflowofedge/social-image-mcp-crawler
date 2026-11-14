@@ -26,7 +26,11 @@ def web_session_path(root: Path, url: str) -> Path | None:
     candidate = url if "://" in url else f"https://{url}"
     parsed = urlparse(candidate)
     netloc = (parsed.netloc or "").lower()
+    host = netloc.split(":", 1)[0]
     if not netloc or parsed.scheme not in {"http", "https"}:
+        return None
+    # Bare words are not domains; every real site has a dot (or is localhost).
+    if "." not in host and host not in {"localhost"}:
         return None
     safe = re.sub(r"[^a-z0-9.\-]+", "_", netloc)[:80] or "site"
     return Path(root) / ".cache" / "web-sessions" / f"{safe}.json"
@@ -42,10 +46,10 @@ def _launch_options() -> dict[str, Any]:
     return options
 
 
-def _atomic_save(context: Any, session: Path) -> bool:
+async def _atomic_save(context: Any, session: Path) -> bool:
     temporary = session.with_suffix(session.suffix + ".tmp")
     try:
-        context.storage_state(path=str(temporary))
+        await context.storage_state(path=str(temporary))
         os.replace(temporary, session)
         return True
     except Exception:
@@ -105,6 +109,7 @@ class WebLoginManager:
 
     def _run(self, url: str, session: Path, cancel: threading.Event) -> None:
         key = session.stem
+        session.parent.mkdir(parents=True, exist_ok=True)
 
         def update(state: str, message: str) -> None:
             self._update(key, state, message)
@@ -147,9 +152,9 @@ class WebLoginManager:
                 if not browser.is_connected() or not context.pages:
                     break
                 if time.monotonic() - last_save >= 2:
-                    _atomic_save(context, session)
+                    await _atomic_save(context, session)
                     last_save = time.monotonic()
-            _atomic_save(context, session)
+            await _atomic_save(context, session)
             try:
                 await browser.close()
             except Exception:
