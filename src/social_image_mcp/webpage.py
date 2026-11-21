@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -469,16 +470,22 @@ class WebPageAdapter(PlatformAdapter):
         page_url = _url(request.query, request.query)
         if not page_url:
             raise AdapterError("其他平台需要输入完整的 http(s) 网页链接")
+        warnings: list[str] = []
         try:
             page_url, root = await asyncio.wait_for(self._page(page_url), timeout=12)
         except asyncio.TimeoutError as exc:
             raise AdapterError("主页访问超时，请稍后重试。") from exc
-        warnings = list(root.warnings)
-        # Render whenever the static HTML had no content images: SPA shells
-        # (Nuxt/Discuz-next and friends) still expose navigation links, so a
-        # non-empty links list does not prove the media was server-rendered.
+        warnings.extend(root.warnings)
+        # Render whenever the static HTML had no content images, OR whenever a
+        # site login is in play: PHP sessions are pinned to one backend node,
+        # so the cookie-bearing static fetch and the logged-in browser render
+        # can disagree about what the page contains (guest vs member view).
+        # Running both and letting the URL dedupe below merge them makes the
+        # result independent of which node answered first.
+        has_session = _web_session_for(page_url) is not None
         needs_render = not root.items
         needs_render |= request.media_type != "images" and not root.links and not any(item.media_type == "video" for item in root.items)
+        needs_render |= has_session
         if self.render_pages and needs_render:
             try:
                 rendered = await asyncio.wait_for(self._render_page(page_url), timeout=26)
@@ -486,7 +493,10 @@ class WebPageAdapter(PlatformAdapter):
                 root.links.extend(link for link in rendered.links if link not in root.links)
                 warnings.extend(rendered.warnings)
             except Exception:
-                warnings.append("动态页面读取未完成；请确认浏览器组件已安装，且页面可公开访问。")
+                if has_session:
+                    warnings.append("带登录态的浏览器读取未完成，已保留直接抓取的结果。")
+                else:
+                    warnings.append("动态页面读取未完成；请确认浏览器组件已安装，且页面可公开访问。")
         # A concrete detail page can contain navigation cards (often with
         # many unrelated thumbnails).  ``content_page`` identifies whether a
         # media item belongs to the page itself or to one of those cards.  If
@@ -564,6 +574,7 @@ class WebPageAdapter(PlatformAdapter):
         videos = [item for item in unique if item.media_type == "video"][: min(200, video_limit * 3)] if request.media_type != "images" else []
         verified: dict[str, ImageCandidate] = {}
         semaphore = asyncio.Semaphore(8)
+        timed_out = False
 
         async def verify(item):
             async with semaphore:
@@ -574,12 +585,29 @@ class WebPageAdapter(PlatformAdapter):
                     verified[item.image_url] = found
 
         if images or videos:
+            # Dimension probes are network-bound: scale the budget with the
+            # candidate count. A fixed slice dropped most of a 111-image
+            # member gallery the moment the CDN slowed down.
             try:
-                budget = max(0.1, min(12, deadline - asyncio.get_running_loop().time()))
+                budget_override = float(os.getenv("WEBPAGE_VERIFY_BUDGET_SECONDS", "0") or 0)
+            except ValueError:
+                budget_override = 0.0
+            scaled = max(12.0, 0.4 * (len(images) + len(videos)))
+            budget = max(0.1, min(budget_override or 30.0, scaled, deadline - asyncio.get_running_loop().time()))
+            try:
                 await asyncio.wait_for(asyncio.gather(*(verify(item) for item in images + videos)), timeout=budget)
             except asyncio.TimeoutError:
-                warnings.append("媒体校验达到时限，已保留验证通过的结果。")
-        candidates = [verified[item.image_url] for item in images + videos if item.image_url in verified]
+                timed_out = True
+                warnings.append("媒体校验达到时限，未校验的候选也已保留，下载时会再做尺寸检查。")
+        candidates = []
+        for item in images + videos:
+            found = verified.get(item.image_url)
+            if found is not None:
+                candidates.append(found)
+            elif timed_out:
+                # The gallery membership itself is the signal here; the
+                # downloader still rejects files below the minimum size.
+                candidates.append(item)
         replaced = {link for link, media in pages.items() if any(
             item.media_type == "image" and item.image_url in verified for item in media.items
         )}
