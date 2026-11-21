@@ -367,6 +367,8 @@ def _warning_guidance(message: str, platform: str) -> tuple[str, str]:
         return f"{label}分页在后续页面中断，已保留中断前取得的内容。", "稍后从断点继续；频繁出现时更新登录状态或降低单次作品数。"
     if "video url unavailable" in lowered:
         return "部分作品没有取得可直接下载的视频地址。", "确认作品可以公开播放后重试，或减少单次检索作品数。"
+    if "媒体校验达到时限" in lowered:
+        return "部分图片未及逐一校验尺寸，已全部保留。", "无需处理；下载时仍会自动跳过尺寸不足的文件。"
     if "missing or mismatched author" in lowered:
         return "部分作品的作者信息与目标账号不一致，已为避免下载错账号而跳过。", "优先使用完整主页链接；用昵称时请确认没有同名账号。"
     if "missing publication date" in lowered:

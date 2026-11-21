@@ -411,3 +411,30 @@ def test_session_cookie_header_filters_by_domain(monkeypatch, tmp_path):
     assert header == "a=1"
     assert webpage_module._session_cookie_header("https://other.test/page") == "b=2"
     assert webpage_module._session_cookie_header("https://unset.example/page") is None
+
+
+def test_verify_timeout_keeps_unverified_gallery_candidates(monkeypatch):
+    async def slow_dimensions(self, item):
+        await asyncio.sleep(5)
+        return None
+
+    monkeypatch.setattr(WebPageAdapter, "_image_dimensions", slow_dimensions)
+    monkeypatch.setenv("WEBPAGE_VERIFY_BUDGET_SECONDS", "1")
+    html = '''<main><img src="/g1.jpg" alt="a"><img src="/g2.jpg" alt="b"><img src="/g3.jpg" alt="c"></main>'''
+
+    def handler(request):
+        if request.url.path.endswith(".jpg"):
+            return httpx.Response(200, headers={"content-type": "image/jpeg"}, content=image_bytes((200, 200)), request=request)
+        return html_response(html)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            adapter = WebPageAdapter(client)
+            result = await adapter.search_media(SearchRequest(
+                query="https://example.org/post", media_type="images", image_limit=10,
+            ))
+        assert len(result.items) == 3
+        assert any("媒体校验达到时限" in warning for warning in result.warnings)
+        assert all(item.width is None for item in result.items)
+
+    asyncio.run(run())
