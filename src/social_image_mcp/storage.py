@@ -47,6 +47,13 @@ class StorageAgent:
             if value and str(value).strip():
                 return cls.safe_name(value, platform_name)
         if platform_name == Platform.OTHER.value:
+            # One folder per page, named by the page title (e.g. the forum
+            # thread or gallery post): users collect many pages from one site
+            # and mixing them in a single domain folder makes them unfindable.
+            payload = candidate_data.get("source_payload")
+            page_title = str(payload.get("page_title") or "").strip() if isinstance(payload, dict) else ""
+            if page_title:
+                return cls.safe_name(page_title, "web")
             url = str(candidate_data.get("permalink") or query or "")
             host = urlparse(url).hostname or "web"
             return cls.safe_name(host.lower().removeprefix("www."), "web")

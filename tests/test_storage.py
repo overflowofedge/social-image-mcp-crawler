@@ -73,3 +73,23 @@ def test_storage_agent_writes_readable_mixed_media_list(tmp_path):
     assert "- 2026-10-01 封面 20261001_cover.jpg" in text
     assert "- 2026-10-02 精彩视频 20261002_work.mp4" in text
 
+
+
+def test_other_platform_uses_page_title_as_folder_name(tmp_path):
+    from social_image_mcp.models import ImageCandidate, Platform
+    from social_image_mcp.storage import StorageAgent
+
+    storage = StorageAgent(tmp_path)
+    titled = ImageCandidate(
+        id="web-1", platform=Platform.OTHER, image_url="https://site.test/1.jpg",
+        permalink="https://www.lcoser02.cc/177000.html",
+        source_payload={"page_title": "No.175 yuuhui玉汇(Kokuhui) – 潜规则2 [130P]"},
+    )
+    folder = storage.account_dir(Platform.OTHER, candidate=titled)
+    assert folder.name == "No.175 yuuhui玉汇(Kokuhui) – 潜规则2 [130P]"
+    assert folder.is_relative_to(tmp_path / "other")
+
+    untitled = ImageCandidate(id="web-2", platform=Platform.OTHER, image_url="https://site.test/2.jpg",
+                              permalink="https://www.lcoser02.cc/177001.html")
+    fallback = storage.account_dir(Platform.OTHER, candidate=untitled)
+    assert fallback.name == "lcoser02.cc"
