@@ -181,3 +181,107 @@ def test_download_images_batches_images_and_videos_per_account(monkeypatch, tmp_
         (["v3"], 1, True, "douyin"),
     ]
     assert len(result["records"]) == 6
+
+
+def test_keyword_search_downloads_the_target_once_across_author_folders(monkeypatch, tmp_path):
+    """A keyword search spreads candidates over many author folders; the
+    media target is one budget for the whole run. Requesting 3 images must
+    not download 3 per folder."""
+    class Settings:
+        image_download_batch_size = 2
+        video_download_batch_size = 2
+        video_download_concurrency = 1
+
+        @staticmethod
+        def ensure_output_dir(value=None):
+            path = tmp_path / "out"
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+
+    class Service:
+        settings = Settings()
+        download_calls = []
+
+        async def search(self, request):
+            # One keyword hit per author: each candidate lands in its own
+            # author folder, which is what made the per-group budget explode.
+            return {"items": [
+                ImageCandidate(
+                    id=f"i{index}", platform=Platform.BILIBILI,
+                    image_url=f"https://cdn.test/{index}.jpg", media_type="image",
+                    creator_name=f"author{index}",
+                ).model_dump(mode="json")
+                for index in range(1, 7)
+            ]}
+
+        async def download(self, items, output_dir, concurrency, min_width, min_height, *, resume=False):
+            self.download_calls.append(([item.id for item in items], concurrency, resume))
+            return [DownloadRecord(
+                candidate_id=item.id, platform=item.platform, image_url=item.image_url,
+                media_type="image", status="downloaded", path=str(output_dir / item.id),
+            ) for item in items]
+
+    fake_service = Service()
+    monkeypatch.setattr(server, "service", fake_service)
+
+    result = asyncio.run(server.search_images(
+        query="风景", platforms=["bilibili"], max_results=3,
+        media_type="images", image_limit=3, max_posts=20,
+        download=True, output_dir=str(tmp_path / "out"),
+    ))
+
+    downloaded_ids = [ids for ids, _, _ in fake_service.download_calls]
+    assert [item for batch in downloaded_ids for item in batch] == ["i1", "i2", "i3"]
+    assert len(result["downloads"]) == 3
+
+
+def test_account_run_still_reaches_its_target(monkeypatch, tmp_path):
+    """An account run keeps filling from one folder until its target, and a
+    failed candidate still pulls in a replacement from the same pool."""
+    class Settings:
+        image_download_batch_size = 2
+        video_download_batch_size = 2
+        video_download_concurrency = 1
+
+        @staticmethod
+        def ensure_output_dir(value=None):
+            path = tmp_path / "out"
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+
+    class Service:
+        settings = Settings()
+        download_calls = []
+
+        async def search(self, request):
+            return {"items": [
+                ImageCandidate(
+                    id=f"i{index}", platform=Platform.DOUYIN,
+                    image_url=f"https://cdn.test/{index}.jpg", media_type="image",
+                    creator_name="同一个作者",
+                ).model_dump(mode="json")
+                for index in range(1, 7)
+            ]}
+
+        async def download(self, items, output_dir, concurrency, min_width, min_height, *, resume=False):
+            self.download_calls.append([item.id for item in items])
+            return [DownloadRecord(
+                candidate_id=item.id, platform=item.platform, image_url=item.image_url,
+                media_type="image",
+                status="failed" if item.id == "i2" else "downloaded",
+                path=str(output_dir / item.id),
+            ) for item in items]
+
+    fake_service = Service()
+    monkeypatch.setattr(server, "service", fake_service)
+
+    result = asyncio.run(server.search_images(
+        query="风景", platforms=["douyin"], max_results=4,
+        media_type="images", image_limit=4, max_posts=20,
+        download=True, output_dir=str(tmp_path / "out"),
+    ))
+
+    batches = [ids for ids in fake_service.download_calls]
+    assert [item for batch in batches for item in batch] == ["i1", "i2", "i3", "i4", "i5"]
+    statuses = [record["status"] for record in result["downloads"]]
+    assert statuses.count("downloaded") == 4

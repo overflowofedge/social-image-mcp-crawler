@@ -132,8 +132,12 @@ async def search_images(query: str, platforms: list[str] | None = None, max_resu
             grouped.setdefault((item.platform.value, str(account_dir)), []).append(item)
         records_by_group: dict[tuple[str, str], list[dict]] = {}
         info_paths: list[str] = []
+        # Media targets are a budget for the whole run, not per folder: a
+        # keyword search fans its candidates out across many author folders,
+        # so a per-group target made one request of 3 images download 189.
+        # Counting across groups keeps an account run (one folder) identical.
+        successful = {"image": 0, "video": 0}
         for (platform_name, account_dir_text), group in grouped.items():
-            successful = {"image": 0, "video": 0}
             account_dir = Path(account_dir_text)
             total_target = image_target + video_target
             for kind in ("image", "video"):
