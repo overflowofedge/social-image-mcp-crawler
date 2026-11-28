@@ -221,6 +221,75 @@ def test_task_report_separates_each_download_outcome():
     assert any("网络连接失败" in issue["reason"] for issue in report["issues"])
 
 
+def _image_record(candidate, url, status, sha256):
+    return {"candidate_id": candidate, "media_type": "image", "status": status, "image_url": url, "sha256": sha256}
+
+
+def test_task_report_explains_when_many_addresses_returned_one_identical_image():
+    """A run saved one placeholder, skipped 81 more as "duplicates" and was
+    shown as a clean success that owed its shortfall to the site login."""
+    downloads = [
+        _image_record(f"real-{n}", f"https://img.test/item/{n}/www.cos01.cc%20%2800{n}%29.jpg", "downloaded", f"sha-{n}")
+        for n in range(3)
+    ]
+    lost = [
+        _image_record(f"lost-{n}", f"https://img.test/item/1{n}/www.cos01.cc%20%2801{n}%29.jpg",
+                      "downloaded" if n == 0 else "duplicate", "placeholder-sha")
+        for n in range(6)
+    ]
+    report = _task_report(
+        {"platforms": ["other"], "media_type": "images", "image_limit": 20, "download": True},
+        {"items": [{"id": record["candidate_id"], "media_type": "image"} for record in downloads + lost],
+         "downloads": downloads + lost},
+        236.0,
+    )
+
+    saved = next(log for log in report["logs"] if log["message"].startswith("保存结果"))
+    assert "失败 0 个" in saved["message"]
+    # Literal counts stay as they are, but the run is no longer a clean success.
+    assert saved["level"] == "warning"
+    repeated = next(issue for issue in report["issues"] if "返回了同一张图" in issue["reason"])
+    assert "有 6 个不同的图片地址" in repeated["reason"]
+    assert "本次实际得到 4 张不同的图片" in repeated["action"]
+    shortfall = next(issue for issue in report["issues"] if "实际可用数量比目标少" in issue["reason"])
+    assert "返回了同一张图" in shortfall["action"]
+    assert "登录当前站点" not in shortfall["action"]
+
+
+def test_task_report_accepts_one_image_served_under_several_paths():
+    downloads = [
+        _image_record(f"real-{n}", f"https://site.test/{n}.jpg", "downloaded", f"sha-{n}") for n in range(3)
+    ] + [
+        # The same file (same name) mirrored under other paths is ordinary.
+        _image_record(f"mirror-{n}", f"https://site.test/cdn/{n}/0.jpg", "duplicate", "sha-0")
+        for n in range(4)
+    ]
+    report = _task_report(
+        {"platforms": ["other"], "media_type": "images", "image_limit": 3, "download": True},
+        {"items": [{"id": record["candidate_id"], "media_type": "image"} for record in downloads],
+         "downloads": downloads},
+        5.0,
+    )
+
+    assert not any("返回了同一张图" in issue["reason"] for issue in report["issues"])
+    assert report["status"] == "success"
+
+
+def test_task_report_does_not_flag_reposted_images_on_social_platforms():
+    downloads = [
+        _image_record(f"post-{n}", f"https://p3.douyinpic.com/~{n}.jpeg", "duplicate", "same-bytes")
+        for n in range(5)
+    ]
+    report = _task_report(
+        {"platforms": ["douyin"], "media_type": "images", "image_limit": 5, "download": True},
+        {"items": [{"id": record["candidate_id"], "media_type": "image"} for record in downloads],
+         "downloads": downloads},
+        5.0,
+    )
+
+    assert not any("返回了同一张图" in issue["reason"] for issue in report["issues"])
+
+
 def test_task_report_explains_incremental_run_with_no_new_files():
     report = _task_report(
         {

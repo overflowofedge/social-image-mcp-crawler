@@ -18,6 +18,7 @@ import httpx
 from PIL import Image
 
 from .models import DownloadRecord, ImageCandidate
+from .media_fetch import get_media, media_request_headers, stream_media
 
 
 def _safe_name(value: str) -> str:
@@ -323,21 +324,7 @@ class ImageDownloader:
 
     async def _download_one(self, item: ImageCandidate, output_dir: Path, seen_hashes: dict[tuple[str, str], set[str]], seen_perceptual: dict[tuple[str, str], _PerceptualIndex], lock: asyncio.Lock, min_width: int, min_height: int) -> DownloadRecord:
         try:
-            headers = {"User-Agent": "Mozilla/5.0 (social-image-mcp)"}
-            if item.platform.value == "x":
-                headers["Referer"] = "https://x.com/"
-            elif item.platform.value == "weibo":
-                headers["Referer"] = item.permalink or "https://m.weibo.cn/"
-            elif item.platform.value == "douyin":
-                headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36"
-                headers["Referer"] = item.permalink or "https://www.douyin.com/"
-                headers["Origin"] = "https://www.douyin.com"
-            elif item.platform.value == "bilibili":
-                headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36"
-                headers["Referer"] = item.permalink or "https://www.bilibili.com/"
-                headers["Origin"] = "https://www.bilibili.com"
-            elif item.platform.value == "other" and item.permalink:
-                headers["Referer"] = item.permalink
+            headers = media_request_headers(item)
             if item.media_type == "video":
                 return await self._download_video(item, output_dir, seen_hashes, lock, headers)
 
@@ -345,15 +332,20 @@ class ImageDownloader:
             last_error = ""
             for attempt in range(3):
                 try:
-                    response = await self.client.get(item.image_url, headers=headers, follow_redirects=True, timeout=30)
+                    response = await get_media(self.client, item.image_url, headers=headers, timeout=30)
                     response.raise_for_status()
                     break
                 except httpx.HTTPStatusError as exc:
                     response = None
                     last_error = str(exc)
-                    # Hotlink-protected CDNs answer a page-referred request
-                    # with 403; a Referer-less retry is the standard fix.
-                    if exc.response.status_code in (401, 403) and "Referer" in headers:
+                    # Some image hosts answer a page-referred request with 403
+                    # and serve the file without one, so retry without the
+                    # Referer, but only when the requested URL itself refused.
+                    # After a redirect the CDN has rejected a browser-like
+                    # request; restarting without the Referer changes what the
+                    # image host answers (a placeholder instead of the file).
+                    if (exc.response.status_code in (401, 403) and "Referer" in headers
+                            and not exc.response.extensions.get("redirect_chain")):
                         headers = {key: value for key, value in headers.items() if key != "Referer"}
                         continue
                     if attempt < 2:
@@ -483,8 +475,8 @@ class ImageDownloader:
                 request_headers = {**headers, "Accept-Encoding": "identity"}
                 if offset:
                     request_headers["Range"] = f"bytes={offset}-"
-                async with self.client.stream(
-                    "GET", item.image_url, headers=request_headers, follow_redirects=True,
+                async with stream_media(
+                    self.client, item.image_url, headers=request_headers,
                     timeout=httpx.Timeout(120.0, connect=10.0),
                 ) as response:
                     response.raise_for_status()
