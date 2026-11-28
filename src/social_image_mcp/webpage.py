@@ -11,10 +11,12 @@ from typing import Any
 from urllib.parse import unquote, urldefrag, urljoin, urlparse
 
 from bs4 import BeautifulSoup, Tag
+import httpx
 from PIL import ImageFile
 
 from .adapters.base import AdapterError, AdapterStatus, PlatformAdapter
 from .intent import Intent
+from .media_fetch import media_request_headers, parse_referrer_policy, stream_media
 from .media_quality import is_hdr_video, video_stream_score
 from .models import ImageCandidate, Platform, SearchRequest
 
@@ -32,6 +34,35 @@ _CHROME = re.compile(r"(?:^|[\W_])(?:navbar|navigation|sidebar|toolbar|social|ad
 _CONTENT = re.compile(r"(?:^|[\W_])(?:post|article|entry|gallery|video|photo|card|portfolio|work|content)(?:$|[\W_])", re.I)
 _HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36"}
 MIN_CONTENT_SIDE = 160
+
+
+def _webp_dimensions(data: bytes | bytearray) -> tuple[int, int] | None:
+    """Canvas size from a WebP file header.
+
+    Pillow reads a whole WebP before it reports a size, so a ranged probe of
+    the first bytes cannot use it and dropped every WebP candidate. The RIFF
+    header carries the canvas size in its first 30 bytes.
+    """
+    if len(data) < 25 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+        return None
+    kind = data[12:16]
+    if kind == b"VP8X":
+        if len(data) < 30:
+            return None
+        # flags(1) + reserved(3), then 24-bit little-endian width-1 and height-1.
+        return int.from_bytes(data[24:27], "little") + 1, int.from_bytes(data[27:30], "little") + 1
+    if kind == b"VP8L":
+        # 1-byte signature, then 14-bit little-endian width-1 and height-1.
+        if data[20] != 0x2F:
+            return None
+        bits = int.from_bytes(data[21:25], "little")
+        return (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+    if kind == b"VP8 ":
+        # 3-byte frame tag, 3-byte start code, then 14-bit width and height.
+        if len(data) < 30 or data[23:26] != b"\x9d\x01\x2a":
+            return None
+        return int.from_bytes(data[26:28], "little") & 0x3FFF, int.from_bytes(data[28:30], "little") & 0x3FFF
+    return None
 
 
 def _web_session_for(url: str) -> Path | None:
@@ -173,8 +204,10 @@ def extract_page(html: str, page_url: str) -> PageMedia:
     result = PageMedia()
     seen: set[str] = set()
     scopes = soup.select("main, [role='main']") or soup.select("article") or [soup.body or soup]
+    meta_referrer = soup.find("meta", attrs={"name": "referrer"})
+    document_policy = parse_referrer_policy(str(meta_referrer.get("content") or "")) if meta_referrer is not None else None
 
-    def add(value, kind="image", alt="", poster=None, post_url=None, original=False) -> None:
+    def add(value, kind="image", alt="", poster=None, post_url=None, original=False, referrer_policy=None) -> None:
         absolute = _url(base, value)
         if not absolute or absolute in seen or _UI.search(_path(absolute)) or _UI.search(alt):
             return
@@ -188,6 +221,12 @@ def extract_page(html: str, page_url: str) -> PageMedia:
         seen.add(absolute)
         digest = hashlib.sha1(absolute.encode()).hexdigest()[:16]
         post = post_url or page_url
+        payload = {"source": "webpage", "page_url": page_url, "content_page": post, "original_image": original, "page_title": title}
+        # Remember how the page says its images should be referred to, so the
+        # download sends what a browser would (e.g. nothing at all for
+        # referrerpolicy="no-referrer").
+        if referrer_policy or document_policy:
+            payload["referrer_policy"] = referrer_policy or document_policy
         # Downloads resume per (page, media_index): every asset on the page
         # needs its own index or batched downloads will treat the rest of the
         # gallery as already-owned copies of the first file.
@@ -197,7 +236,7 @@ def extract_page(html: str, page_url: str) -> PageMedia:
             title=alt or title or page_url, description=alt or title, alt_text=alt,
             post_id=hashlib.sha1(post.encode()).hexdigest()[:16],
             media_index=max(1, len(result.items) + 1),
-            source_payload={"source": "webpage", "page_url": page_url, "content_page": post, "original_image": original, "page_title": title},
+            source_payload=payload,
         ))
 
     def content_link(node: Tag) -> str | None:
@@ -226,7 +265,8 @@ def extract_page(html: str, page_url: str) -> PageMedia:
                 chosen = linked if original else _image_source(node, base)
                 if chosen:
                     original |= any(chosen == _url(base, node.get(key)) for key in ("data-original", "data-full", "data-large"))
-                    add(chosen, alt=alt, post_url=post, original=original)
+                    element_policy = parse_referrer_policy(str(node.get("referrerpolicy") or ""))
+                    add(chosen, alt=alt, post_url=post, original=original, referrer_policy=element_policy)
             elif node.name == "video":
                 sources: list[tuple[Any, dict[str, Any], str]] = [
                     (node.get("data-src"), dict(node.attrs), _label(node)),
@@ -302,6 +342,10 @@ def extract_page(html: str, page_url: str) -> PageMedia:
     return result
 
 
+class _ProbeUnavailable(Exception):
+    """A candidate could not be inspected right now, so nothing is known about it."""
+
+
 class WebPageAdapter(PlatformAdapter):
     platform = Platform.OTHER
 
@@ -330,37 +374,60 @@ class WebPageAdapter(PlatformAdapter):
         return str(response.url), extract_page(response.text, str(response.url))
 
     async def _image_dimensions(self, item: ImageCandidate) -> ImageCandidate | None:
+        """Inspect the first bytes of an image.
+
+        Returns the item with its size, ``None`` when it is definitely not
+        usable content (not an image, or below the minimum side), and raises
+        ``_ProbeUnavailable`` when that is still unknown: a slow or refused
+        request says nothing about the image itself.
+        """
         # Read enough bytes for dimensions, rather than the full original.
-        # Image CDNs that reject hotlinking answer a page-referred request
-        # with 403, so fall back to a Referer-less fetch before giving up.
-        variants = (
-            {**_HEADERS, "Referer": item.permalink or "", "Range": "bytes=0-262143"},
-            {**_HEADERS, "Range": "bytes=0-262143"},
-        )
-        for index, headers in enumerate(variants):
-            try:
-                async with self.client.stream("GET", item.image_url, headers=headers, follow_redirects=True, timeout=5) as response:
-                    if response.status_code in (401, 403) and index == 0:
+        # The probe follows the same redirect rules as the download, so an
+        # image that will download is verified with its real size; a looser
+        # request here measured the image host's placeholder instead.
+        headers = {**media_request_headers(item), "Range": "bytes=0-262143"}
+        try:
+            for attempt in range(2):
+                async with stream_media(self.client, item.image_url, headers=headers, timeout=5) as response:
+                    if (response.status_code in (401, 403) and attempt == 0 and "Referer" in headers
+                            and not response.extensions.get("redirect_chain")):
+                        # The image URL itself refused a page-referred request;
+                        # retry once without the Referer, as the download does.
+                        headers = {key: value for key, value in headers.items() if key != "Referer"}
                         continue
                     response.raise_for_status()
                     mime = response.headers.get("content-type", "").split(";", 1)[0]
                     if mime and not (mime.startswith("image/") or mime == "application/octet-stream"):
                         return None
                     parser = ImageFile.Parser()
-                    size = 0
+                    header = bytearray()
                     async for chunk in response.aiter_bytes(16384):
-                        parser.feed(chunk)
-                        size += len(chunk)
-                        if parser.image:
-                            width, height = parser.image.size
+                        header.extend(chunk)
+                        try:
+                            if header[:4] == b"RIFF":
+                                dimensions = _webp_dimensions(header)
+                            else:
+                                parser.feed(chunk)
+                                dimensions = parser.image.size if parser.image else None
+                        except Exception:
+                            # Undecodable here means undecodable on download as well.
+                            return None
+                        if dimensions:
+                            width, height = dimensions
                             if min(width, height) < MIN_CONTENT_SIDE:
                                 return None
                             return item.model_copy(update={"width": width, "height": height})
-                        if size >= 262144:
+                        if len(header) >= 262144:
                             break
-            except Exception:
-                return None
-        return None
+                    # No size in the first 256KB: unknown, not rejected. The
+                    # download decodes the whole file and applies the minimum.
+                    return item
+            return item
+        except (httpx.HTTPError, OSError, asyncio.TimeoutError) as exc:
+            raise _ProbeUnavailable(str(exc)) from exc
+        except (ValueError, TypeError):
+            # An unusable address never becomes an image.
+            return None
 
     async def _render_page(self, url: str) -> PageMedia:
         from playwright.async_api import async_playwright
@@ -439,14 +506,19 @@ class WebPageAdapter(PlatformAdapter):
                 await browser.close()
 
     async def _video_file(self, item: ImageCandidate) -> ImageCandidate | None:
-        variants = (
-            {**_HEADERS, "Referer": item.permalink or "", "Range": "bytes=0-255"},
-            {**_HEADERS, "Range": "bytes=0-255"},
-        )
-        for index, headers in enumerate(variants):
-            try:
-                async with self.client.stream("GET", item.image_url, headers=headers, follow_redirects=True, timeout=5) as response:
-                    if response.status_code in (401, 403) and index == 0:
+        """Confirm a candidate is a self-contained video file.
+
+        Same three outcomes as ``_image_dimensions``: the item when confirmed,
+        ``None`` when the response is definitely not such a file, and
+        ``_ProbeUnavailable`` when the request itself failed.
+        """
+        headers = {**media_request_headers(item), "Range": "bytes=0-255"}
+        try:
+            for attempt in range(2):
+                async with stream_media(self.client, item.image_url, headers=headers, timeout=5) as response:
+                    if (response.status_code in (401, 403) and attempt == 0 and "Referer" in headers
+                            and not response.extensions.get("redirect_chain")):
+                        headers = {key: value for key, value in headers.items() if key != "Referer"}
                         continue
                     response.raise_for_status()
                     mime = response.headers.get("content-type", "").split(";", 1)[0].lower()
@@ -457,9 +529,17 @@ class WebPageAdapter(PlatformAdapter):
                             if chunk[4:8] == b"ftyp" or chunk.startswith((b"\x1aE\xdf\xa3", b"OggS")):
                                 return item
                             break
-            except Exception:
-                return None
-        return None
+                    if attempt == 0:
+                        # A page-referred request can be answered with an HTML
+                        # refusal; ask once more without the Referer.
+                        headers = {key: value for key, value in headers.items() if key != "Referer"}
+                        continue
+                    return None
+            return None
+        except (httpx.HTTPError, OSError, asyncio.TimeoutError) as exc:
+            raise _ProbeUnavailable(str(exc)) from exc
+        except (ValueError, TypeError):
+            return None
 
     async def search(self, intent: Intent, limit: int, safe_mode: bool) -> list[ImageCandidate]:
         result = await self.search_media(SearchRequest(query=intent.raw, max_results=min(limit, 200), safe_mode=safe_mode))
@@ -573,12 +653,20 @@ class WebPageAdapter(PlatformAdapter):
         images = images[: min(400, image_limit * 3)]
         videos = [item for item in unique if item.media_type == "video"][: min(200, video_limit * 3)] if request.media_type != "images" else []
         verified: dict[str, ImageCandidate] = {}
+        # Candidates whose probe said nothing either way. The download decodes
+        # the whole file and enforces the size minimum, so keeping them costs
+        # one request instead of silently losing a real image.
+        uninspected: set[str] = set()
         semaphore = asyncio.Semaphore(8)
         timed_out = False
 
         async def verify(item):
             async with semaphore:
-                found = await (self._image_dimensions(item) if item.media_type == "image" else self._video_file(item))
+                try:
+                    found = await (self._image_dimensions(item) if item.media_type == "image" else self._video_file(item))
+                except _ProbeUnavailable:
+                    uninspected.add(item.image_url)
+                    return
                 if found and found.media_type == "image" and ((found.width or 0) < request.min_width or (found.height or 0) < request.min_height):
                     found = None
                 if found:
@@ -604,9 +692,9 @@ class WebPageAdapter(PlatformAdapter):
             found = verified.get(item.image_url)
             if found is not None:
                 candidates.append(found)
-            elif timed_out:
-                # The gallery membership itself is the signal here; the
-                # downloader still rejects files below the minimum size.
+            elif timed_out or item.image_url in uninspected:
+                # Gallery membership is the signal here; the downloader still
+                # rejects files below the minimum size.
                 candidates.append(item)
         replaced = {link for link, media in pages.items() if any(
             item.media_type == "image" and item.image_url in verified for item in media.items

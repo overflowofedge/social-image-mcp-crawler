@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import io
 from pathlib import Path
 import re
@@ -402,3 +403,140 @@ def test_webpage_items_without_media_index_stay_distinct_after_fix_regression():
     candidate_b = ImageCandidate(id="web-b", platform=Platform.OTHER, image_url="https://img.test/2.png", post_id="pagehash", media_index=7)
     from social_image_mcp.downloader import _item_key
     assert _item_key(candidate_a) != _item_key(candidate_b)
+
+
+_GALLERY_PAGE = "https://www.site.test/post/123.html"
+
+
+def _gallery_image(index):
+    buffer = io.BytesIO()
+    Image.new("RGB", (600, 900), ((index * 37) % 255, (index * 91) % 255, (index * 53) % 255)).save(buffer, format="JPEG")
+    return buffer.getvalue()
+
+
+def _placeholder_image():
+    # The real one is a 1280x1280 JPEG, so it passes every size check.
+    buffer = io.BytesIO()
+    Image.new("RGB", (1280, 1280), "pink").save(buffer, format="JPEG")
+    return buffer.getvalue()
+
+
+def _image_host(log, *, policy="no-referrer"):
+    """The image host that replaced a whole gallery with one placeholder.
+
+    The image URL needs the page Referer and redirects to a CDN; the redirect
+    names the Referer policy for that next hop, and the CDN refuses any
+    request that carries one. Asked without a Referer, the image URL
+    redirects to a placeholder instead and answers 200.
+    """
+    def handler(request):
+        log.append((request.url.host, request.headers.get("referer")))
+        headers = {"location": f"https://cdn.test{request.url.path}"}
+        if policy:
+            headers["referrer-policy"] = policy
+        if request.url.host == "lost.test":
+            return httpx.Response(200, headers={"content-type": "image/jpeg"}, content=_placeholder_image(), request=request)
+        if request.url.host == "img.test":
+            if request.headers.get("referer"):
+                return httpx.Response(302, headers=headers, request=request)
+            return httpx.Response(302, headers={**headers, "location": "https://lost.test/lost.jpg"}, request=request)
+        if request.headers.get("referer"):
+            return httpx.Response(403, text="forbidden", request=request)
+        index = int(request.url.path.strip("/").split(".")[0])
+        return httpx.Response(200, headers={"content-type": "image/jpeg"}, content=_gallery_image(index), request=request)
+    return handler
+
+
+def _gallery(count, **extra):
+    return [
+        ImageCandidate(id=f"web-{number}", platform=Platform.OTHER, image_url=f"https://img.test/{number}.jpg",
+                       post_id="page", media_index=number + 1, permalink=_GALLERY_PAGE, **extra)
+        for number in range(count)
+    ]
+
+
+def test_gallery_behind_a_referrer_policy_redirect_downloads_every_image(tmp_path):
+    """A run reported one saved placeholder and 81 "duplicates" for 109 images."""
+    log = []
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_image_host(log))) as client:
+            downloader = ImageDownloader(client)
+            records = []
+            # The desktop app downloads in batches and resumes between them.
+            for start in range(0, 25, 10):
+                records.extend(await downloader.download_many(_gallery(25)[start:start + 10], tmp_path, 3, resume=True))
+        assert [record.status for record in records] == ["downloaded"] * 25
+        files = sorted(tmp_path.rglob("*.jpg"))
+        assert len(files) == 25
+        assert len({path.read_bytes() for path in files}) == 25
+        placeholder = hashlib.sha256(_placeholder_image()).hexdigest()
+        assert placeholder not in {record.sha256 for record in records}
+        # The image URL is always asked with the page Referer, so it never
+        # redirects to the placeholder host.
+        assert all(referer == _GALLERY_PAGE for host, referer in log if host == "img.test")
+        assert ("lost.test", None) not in log
+
+    asyncio.run(run())
+
+
+def test_a_refused_redirect_target_is_a_failure_not_a_placeholder(tmp_path):
+    """Dropping the Referer from the start would turn a visible refusal into a
+    saved placeholder image, which is how the gallery loss went unnoticed."""
+    log = []
+
+    def handler(request):
+        log.append((request.url.host, request.headers.get("referer")))
+        if request.url.host == "img.test":
+            target = "https://cdn.test/0.jpg" if request.headers.get("referer") else "https://lost.test/lost.jpg"
+            return httpx.Response(302, headers={"location": target}, request=request)
+        if request.url.host == "lost.test":
+            return httpx.Response(200, headers={"content-type": "image/jpeg"}, content=_placeholder_image(), request=request)
+        return httpx.Response(403, text="forbidden", request=request)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            record = (await ImageDownloader(client).download_many(_gallery(1), tmp_path))[0]
+        assert record.status == "failed"
+        assert "403" in record.error
+        # Every attempt keeps the page Referer on the image URL; none is
+        # retried without it once a redirect was involved.
+        assert log == [("img.test", _GALLERY_PAGE), ("cdn.test", _GALLERY_PAGE)] * 3
+        assert not list(tmp_path.rglob("*.jpg"))
+
+    asyncio.run(run())
+
+
+def test_an_image_url_that_refuses_a_referer_is_retried_without_one(tmp_path):
+    log = []
+
+    def handler(request):
+        log.append(request.headers.get("referer"))
+        if request.headers.get("referer"):
+            return httpx.Response(403, text="forbidden", request=request)
+        return httpx.Response(200, headers={"content-type": "image/jpeg"}, content=_gallery_image(0), request=request)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            record = (await ImageDownloader(client).download_many(_gallery(1), tmp_path))[0]
+        assert record.status == "downloaded"
+        assert log == [_GALLERY_PAGE, None]
+
+    asyncio.run(run())
+
+
+def test_a_page_declared_no_referrer_policy_is_honoured_from_the_first_request(tmp_path):
+    log = []
+
+    def handler(request):
+        log.append(request.headers.get("referer"))
+        return httpx.Response(200, headers={"content-type": "image/jpeg"}, content=_gallery_image(0), request=request)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            item = _gallery(1, source_payload={"referrer_policy": "no-referrer"})[0]
+            record = (await ImageDownloader(client).download_many([item], tmp_path))[0]
+        assert record.status == "downloaded"
+        assert log == [None]
+
+    asyncio.run(run())

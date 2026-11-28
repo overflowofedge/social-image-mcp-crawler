@@ -1,5 +1,6 @@
 import asyncio
 import io
+import os
 
 import httpx
 from PIL import Image
@@ -7,7 +8,7 @@ import pytest
 
 from social_image_mcp.adapters.base import AdapterError
 from social_image_mcp.intent import parse_intent
-from social_image_mcp.models import Platform, SearchRequest
+from social_image_mcp.models import ImageCandidate, Platform, SearchRequest
 from social_image_mcp import webpage as webpage_module
 from social_image_mcp.webpage import WebPageAdapter, extract_page
 
@@ -438,3 +439,166 @@ def test_verify_timeout_keeps_unverified_gallery_candidates(monkeypatch):
         assert all(item.width is None for item in result.items)
 
     asyncio.run(run())
+
+
+def _webp(size, **options):
+    buffer = io.BytesIO()
+    Image.new("RGB", size, "red").save(buffer, format="WEBP", **options)
+    return buffer.getvalue()
+
+
+@pytest.mark.parametrize(("options", "chunk"), [
+    ({}, b"VP8 "),            # lossy
+    ({"lossless": True}, b"VP8L"),   # lossless
+    ({"icc_profile": b"x" * 20}, b"VP8X"),  # extended
+])
+def test_webp_size_comes_from_the_file_header(options, chunk):
+    data = _webp((641, 483), **options)
+    assert data[12:16] == chunk
+    with Image.open(io.BytesIO(data)) as image:
+        assert image.size == (641, 483)
+    assert webpage_module._webp_dimensions(data) == (641, 483)
+    # A ranged probe only has the first bytes.
+    assert webpage_module._webp_dimensions(data[:30]) == (641, 483)
+
+
+def test_webp_header_parser_ignores_anything_else():
+    assert webpage_module._webp_dimensions(b"RIFF\x00\x00\x00\x00WAVEfmt ") is None
+    assert webpage_module._webp_dimensions(b"RIFF\x00\x00\x00\x00WEBPVP8 ") is None
+
+
+def test_size_probe_reads_a_webp_from_its_first_bytes():
+    """Pillow reads a whole WebP before it reports a size, so every WebP used
+    to fail the ranged probe and vanish from the results."""
+    noisy = Image.frombytes("RGB", (900, 1200), os.urandom(900 * 1200 * 3))
+    buffer = io.BytesIO()
+    noisy.save(buffer, format="WEBP")
+    data = buffer.getvalue()
+    assert len(data) > 262144
+
+    def handler(request):
+        partial = data[:262144]
+        return httpx.Response(206, content=partial, headers={
+            "content-type": "image/webp", "content-range": f"bytes 0-262143/{len(data)}",
+        }, request=request)
+
+    item = ImageCandidate(id="web-a", platform=Platform.OTHER, image_url="https://cdn.test/a.webp",
+                          permalink="https://www.site.test/post/1.html")
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            found = await WebPageAdapter(client)._image_dimensions(item)
+        assert (found.width, found.height) == (900, 1200)
+
+    asyncio.run(run())
+
+
+def _placeholder_host(real):
+    """The image host that replaced a whole gallery with one placeholder: the
+    image URL needs the page Referer, redirects with ``no-referrer`` to a CDN
+    that refuses a Referer, and answers a Referer-less request with the
+    placeholder instead."""
+    def handler(request):
+        headers = {"location": "https://cdn.test/a.jpg", "referrer-policy": "no-referrer"}
+        if request.url.host == "img.test":
+            if request.headers.get("referer"):
+                return httpx.Response(302, headers=headers, request=request)
+            return httpx.Response(302, headers={**headers, "location": "https://lost.test/lost.jpg"}, request=request)
+        if request.url.host == "lost.test":
+            body = image_bytes((1280, 1280))
+            return httpx.Response(200, content=body, headers={"content-type": "image/png"}, request=request)
+        if request.headers.get("referer"):
+            return httpx.Response(403, text="forbidden", request=request)
+        return httpx.Response(200, content=real, headers={"content-type": "image/png"}, request=request)
+    return handler
+
+
+def test_size_probe_measures_the_real_image_not_the_hosts_placeholder():
+    item = ImageCandidate(id="web-a", platform=Platform.OTHER, image_url="https://img.test/a.jpg",
+                          permalink="https://www.site.test/post/1.html")
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_placeholder_host(image_bytes((600, 900))))) as client:
+            found = await WebPageAdapter(client)._image_dimensions(item)
+        # The placeholder is 1280x1280; measuring that made every image look
+        # verified and left the gallery with the wrong sizes.
+        assert (found.width, found.height) == (600, 900)
+
+    asyncio.run(run())
+
+
+def test_probe_retries_without_a_referer_when_the_image_url_refuses_it():
+    def handler(request):
+        if request.headers.get("referer"):
+            return httpx.Response(403, text="forbidden", request=request)
+        return httpx.Response(200, content=image_bytes((600, 900)), headers={"content-type": "image/png"}, request=request)
+
+    item = ImageCandidate(id="web-a", platform=Platform.OTHER, image_url="https://cdn.test/a.jpg",
+                          permalink="https://www.site.test/post/1.html")
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            found = await WebPageAdapter(client)._image_dimensions(item)
+        assert (found.width, found.height) == (600, 900)
+
+    asyncio.run(run())
+
+
+def test_a_probe_that_cannot_reach_the_image_keeps_the_candidate():
+    """The probe exists to filter small icons; a slow response must not make a
+    real image disappear from the results."""
+    html = '''<main><img src="/g1.jpg" alt="a"><img src="/g2.jpg" alt="b"><img src="/g3.jpg" alt="c"></main>'''
+    attempts = []
+
+    def handler(request):
+        if request.url.path.endswith(".jpg"):
+            attempts.append(request.url.path)
+            raise httpx.ReadTimeout("slow", request=request)
+        return html_response(html)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            result = await WebPageAdapter(client).search_media(SearchRequest(
+                query="https://example.org/post", media_type="images", image_limit=10,
+            ))
+        assert len(attempts) == 3
+        assert len(result.items) == 3
+        assert all(item.width is None for item in result.items)
+        # Nothing timed out as a whole; no caveat is needed for the user.
+        assert not any("媒体校验达到时限" in warning for warning in result.warnings)
+
+    asyncio.run(run())
+
+
+def test_a_definitive_non_image_is_still_dropped():
+    html = '''<main><img src="/a.jpg" alt="a"><img src="/b.jpg" alt="b"></main>'''
+    size = {"/a.jpg": (600, 900), "/b.jpg": (20, 20)}
+
+    def handler(request):
+        if request.url.path == "/":
+            return html_response(html)
+        return httpx.Response(200, content=image_bytes(size[request.url.path]), headers={"content-type": "image/png"}, request=request)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            result = await WebPageAdapter(client).search_media(SearchRequest(query="https://example.org/", max_results=5))
+        assert [item.image_url for item in result.items] == ["https://example.org/a.jpg"]
+
+    asyncio.run(run())
+
+
+def test_extract_page_remembers_the_referrer_policy_the_page_declares():
+    html = '''<html><head><meta name="referrer" content="strict-origin"></head><body><main>
+    <img src="/a.jpg" referrerpolicy="no-referrer"><img src="/b.jpg"><img src="/c.jpg" referrerpolicy="bogus">
+    </main></body></html>'''
+    policies = {
+        item.image_url.rsplit("/", 1)[-1]: item.source_payload.get("referrer_policy")
+        for item in extract_page(html, "https://example.org/p").items
+    }
+    # An image's own policy wins; an unknown value falls back to the page's.
+    assert policies == {"a.jpg": "no-referrer", "b.jpg": "strict-origin", "c.jpg": "strict-origin"}
+
+
+def test_pages_without_a_referrer_policy_store_none():
+    result = extract_page('<main><img src="/a.jpg" alt="a"></main>', "https://example.org/p")
+    assert "referrer_policy" not in result.items[0].source_payload

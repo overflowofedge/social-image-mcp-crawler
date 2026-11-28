@@ -23,6 +23,7 @@ if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
 from social_image_mcp.intent import parse_intent
+from social_image_mcp.media_fetch import get_media
 from social_image_mcp.models import Platform
 from social_image_mcp.progress import progress_context
 from social_image_mcp.server import search_images, service
@@ -382,6 +383,23 @@ def _warning_guidance(message: str, platform: str) -> tuple[str, str]:
     return f"{label}返回了部分结果：{raw}", "查看实际数量；如未达到目标，可稍后重试或减少单次任务数量。"
 
 
+# Three or more differently named addresses collapsing onto one identical
+# file is an image host answering with a placeholder, not a real gallery.
+_REPEATED_IMAGE_MINIMUM = 3
+
+
+def _repeated_image_count(downloads: list[dict]) -> int:
+    """Largest number of differently named image addresses that returned one identical file."""
+    names_by_hash: dict[str, set[str]] = {}
+    for record in downloads:
+        if record.get("status") not in {"downloaded", "existing", "duplicate"} or not record.get("sha256"):
+            continue
+        name = urlparse(str(record.get("image_url") or "")).path.rsplit("/", 1)[-1].lower()
+        if name:
+            names_by_hash.setdefault(str(record["sha256"]), set()).add(name)
+    return max((len(names) for names in names_by_hash.values()), default=0)
+
+
 def _task_report(body: dict, result: dict, elapsed_seconds: float) -> dict:
     """Build a stable, user-facing account of requested and actual results."""
     platform = str((body.get("platforms") or [""])[0] or "")
@@ -480,9 +498,14 @@ def _task_report(body: dict, result: dict, elapsed_seconds: float) -> dict:
     duplicate_total = sum(status_counts["duplicate"].values())
     rejected_total = sum(status_counts["rejected"].values())
     failed_total = sum(status_counts["failed"].values())
+    # A gallery does not repeat bytes across differently named files. When it
+    # happens on a webpage job the image host is answering with one
+    # placeholder, and those records must not read as a clean success.
+    repeated = _repeated_image_count(downloads) if platform == "other" else 0
+    repeated_images = repeated >= _REPEATED_IMAGE_MINIMUM
     if downloads:
         logs.append({
-            "level": "success" if not failed_total and not rejected_total else "warning",
+            "level": "success" if not failed_total and not rejected_total and not repeated_images else "warning",
             "message": (
                 f"保存结果：新下载 {new_total} 个，已存在 {existing_total} 个，"
                 f"重复跳过 {duplicate_total} 个，规则拒绝 {rejected_total} 个，失败 {failed_total} 个。"
@@ -551,6 +574,8 @@ def _task_report(body: dict, result: dict, elapsed_seconds: float) -> dict:
         if platform == "other":
             action = ("确认网址指向具体内容页面；若站点内容需要登录，"
                       "先点“登录当前站点”保存登录状态后重试。")
+            if repeated_images:
+                action = "数量不足的原因见下方“返回了同一张图”的说明，与站点登录无关。"
         if media == "images" and requested["per_post_limit"] and requested["max_posts"]:
             capacity = requested["per_post_limit"] * requested["max_posts"]
             if requested["images"] > capacity:
@@ -560,6 +585,18 @@ def _task_report(body: dict, result: dict, elapsed_seconds: float) -> dict:
             reason = "没有新增文件；该账号已发现的作品之前已经处理过。"
             action = "这是增量采集的正常结果，等待账号发布新作品后再次运行。"
         issues.append({"reason": reason, "action": action, "technical_message": "requested quantity was not fulfilled"})
+
+    if repeated_images:
+        distinct_files = len({
+            str(record["sha256"]) for record in downloads
+            if record.get("sha256") and record.get("status") in {"downloaded", "existing", "duplicate"}
+        })
+        issues.append({
+            "reason": f"有 {repeated} 个不同的图片地址返回了同一张图，它们多半不是真正的图片，而是图床的占位图或防盗链提示图。",
+            "action": (f"本次实际得到 {distinct_files} 张不同的图片。请打开保存目录确认那张重复的图的内容；"
+                       "若确为占位图，请把运行日志和保存目录路径反馈给开发者。"),
+            "technical_message": "image host returned one identical file for many addresses",
+        })
 
     error_messages = set(raw_errors)
     for issue in issues:
@@ -610,7 +647,7 @@ async def _fetch_preview(image_url: str, referer: str = "") -> tuple[str, bytes]
     }
     if chosen := _preview_referer(image_url, referer):
         headers["Referer"] = chosen
-    response = await service.client.get(image_url, headers=headers, follow_redirects=True, timeout=30)
+    response = await get_media(service.client, image_url, headers=headers, timeout=30)
     response.raise_for_status()
     content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
     if not content_type.startswith("image/"):
